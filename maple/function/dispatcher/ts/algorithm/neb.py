@@ -6,6 +6,19 @@ NEB implementation with:
 - Improved tangent NEB forces (true_perp + spring_parallel)
 - L-BFGS optimizer on projected NEB forces
 - ORCA-style dynamic spring constants
+
+OPT-IN additive upgrades (the single-band path above is kept as the fallback
++ parity oracle; new features are opt-in and do not alter it):
+- Multi-band NEB (NEB.run_multiband): B independent bands, every image of
+  every band in ONE batched forward (image-as-batch; CatTSunami / OCPNEB,
+  Wander et al. arXiv:2405.02078, ACS Catal. 2024, DOI 10.1021/acscatal.4c04272).
+- DyNEB image freezing (Lindgren, Kastlunger & Peterson, JCTC 2019, 15, 5787,
+  DOI 10.1021/acs.jctc.9b00633).
+- Force upgrades: improved tangent (Henkelman & Jonsson, JCP 2000, 113, 9978,
+  DOI 10.1063/1.1323224); climbing image F-2(F.tau)tau (Henkelman, Uberuaga &
+  Jonsson, JCP 2000, 113, 9901, DOI 10.1063/1.1329672); energy-weighted
+  variable springs (Asgeirsson et al., JCTC 2021, 17, 4929,
+  DOI 10.1021/acs.jctc.1c00462).
 """
 from __future__ import annotations
 from lib2to3.pgen2 import driver
@@ -264,8 +277,8 @@ def compute_dynamic_k(energies: List[float], k_min: float, k_max: float, k_decay
 
 def improved_tangent(Rm1, R, Rp1, Em1, E, Ep1):
     """
-    Energy-weighted (Henkelman-Jonsson) improved tangent.
-    Always returns a normalized (3N,) vector.
+    Energy-weighted improved tangent of Henkelman & Jonsson, JCP 2000, 113,
+    9978 (DOI: 10.1063/1.1323224). Always returns a normalized (3N,) vector.
     """
     dm = vec1d(R - Rm1)
     dp = vec1d(Rp1 - R)
@@ -462,6 +475,116 @@ def rms_force(forces_list: List[np.ndarray]) -> float:
         return 0.0
     v = np.concatenate(arrs)
     return float(np.sqrt(np.mean(v * v)))
+
+def compute_energy_weighted_k(energies: List[float], k_min: float, k_max: float) -> List[float]:
+    """
+    Energy-weighted variable spring constants (OPT-IN spring scheme).
+
+    Asgeirsson, Birgisson, Bjornsson, Becker & Jonsson, JCTC 2021, 17, 4929
+    (DOI: 10.1021/acs.jctc.1c00462); original variable-spring form: Henkelman,
+    Uberuaga & Jonsson, JCP 2000, 113, 9901 (DOI: 10.1063/1.1329672), Appendix.
+
+    Springs are made STIFFER near the barrier (higher-energy images) and softer
+    in the flat reactant/product wings, so image density stays high around the
+    saddle (this is the OPPOSITE mapping to compute_dynamic_k's ORCA scheme):
+
+        k_i = k_max - (k_max - k_min) * (E_max - E_i) / (E_max - E_ref),  E_i > E_ref
+        k_i = k_min,                                                      E_i <= E_ref
+
+    E_ref = max(E_first, E_last) (higher endpoint); E_max = max band energy.
+    Returns one k per image (length = len(energies)); endpoints get k_min but
+    their spring force is never used (endpoint NEB forces are zeroed).
+    """
+    n_img = len(energies)
+    k_springs = [k_max] * n_img
+    if n_img < 3:
+        return k_springs
+    E = [float(e) for e in energies]
+    E_ref = max(E[0], E[-1])
+    E_max = max(E)
+    denom = E_max - E_ref
+    for i in range(n_img):
+        if denom > 1e-10 and E[i] > E_ref:
+            k_springs[i] = k_max - (k_max - k_min) * (E_max - E[i]) / denom
+        else:
+            k_springs[i] = k_min
+    return k_springs
+
+
+def neb_band_forces(images: List[Atoms], energies: List[float],
+                    raw_forces: List[np.ndarray], k_springs: List[float],
+                    climbing: bool = False, hei_fixed: Optional[int] = None,
+                    active_mask: Optional[List[bool]] = None
+                    ) -> Tuple[List[np.ndarray], float, int]:
+    """
+    Per-band NEB projected forces with OPT-IN climbing image and DyNEB freezing.
+
+    With climbing=False and active_mask=None this reproduces neb_forces() exactly
+    (improved-tangent perpendicular true force + parallel variable-k spring), so
+    it is a drop-in that leaves the single-band fallback path untouched. (A unit
+    parity check against neb_forces() is run in the validation harness.)
+
+    Improved tangent:  Henkelman & Jonsson, JCP 2000, 113, 9978
+        (DOI: 10.1063/1.1323224).
+    Climbing image (climbing=True, applied to the HEI):  F_CI = F - 2 (F.tau) tau,
+        Henkelman, Uberuaga & Jonsson, JCP 2000, 113, 9901
+        (DOI: 10.1063/1.1329672).
+    DyNEB freezing (active_mask):  Lindgren, Kastlunger & Peterson, JCTC 2019,
+        15, 5787 (DOI: 10.1021/acs.jctc.9b00633) -- internal images already below
+        fmax (active_mask[i] False) get a zeroed NEB force so the optimizer
+        concentrates on the saddle region. The current HEI is never frozen.
+
+    raw_forces : list of (N_i,3) true calculator forces, one per image (the
+        batched-forward result). Endpoints included; their entries may be stale
+        (their NEB force is zeroed anyway).
+    """
+    n_img = len(images)
+    forces_proj = [None] * n_img
+    coords = [to_numpy_f64(at.get_positions()) for at in images]
+    Es = [float(e) for e in energies]
+    raw = [to_numpy_f64(f) for f in raw_forces]
+
+    inner_indices = list(range(1, n_img - 1))
+    if (hei_fixed is not None) and (hei_fixed in inner_indices):
+        hei_idx = hei_fixed
+    else:
+        hei_idx = max(inner_indices, key=lambda i: Es[i])
+
+    max_fp = 0.0
+    for i in inner_indices:
+        Rm1, R, Rp1 = coords[i - 1], coords[i], coords[i + 1]
+        Em1, E, Ep1 = Es[i - 1], Es[i], Es[i + 1]
+
+        tau = improved_tangent(Rm1, R, Rp1, Em1, E, Ep1)
+        tau_resh = tau.reshape(-1, 3)
+        F_true = vec1d(raw[i])
+
+        if climbing and (i == hei_idx):
+            # Climbing image: invert the parallel component of the TRUE force and
+            # drop the spring force -> the image is driven UP to the saddle.
+            ft = float(np.dot(F_true, tau))
+            Fp = (F_true - 2.0 * ft * tau).reshape(-1, 3)
+        else:
+            c = float(np.dot(F_true, tau))
+            F_true_perp = (F_true - c * tau).reshape(-1, 3)
+            k_i = k_springs[i]
+            d_next = float(np.linalg.norm(Rp1 - R))
+            d_prev = float(np.linalg.norm(R - Rm1))
+            F_spring_par = k_i * (d_next - d_prev) * tau_resh
+            Fp = F_true_perp + F_spring_par
+
+        # DyNEB freeze: zero the NEB force of converged (inactive) images so the
+        # optimizer leaves them in place (never freeze the climbing/HEI image).
+        if (active_mask is not None) and (not active_mask[i]) and (i != hei_idx):
+            Fp = np.zeros_like(Fp)
+
+        forces_proj[i] = Fp
+        max_fp = max(max_fp, float(np.abs(Fp).max()))
+
+    forces_proj[0] = np.zeros_like(coords[0])
+    forces_proj[-1] = np.zeros_like(coords[-1])
+    return forces_proj, max_fp, hei_idx
+
 
 # =============================================================================
 # ------------------------------- L-BFGS --------------------------------------
@@ -776,6 +899,327 @@ class NEB(JobABC):
         return [float(at.get_potential_energy(force_consistent=True)) for at in imgs]
 
 
+    # =====================================================================
+    # OPT-IN MULTI-BAND NEB  (additive; single-band run() stays the fallback
+    # + parity oracle).  Image-as-batch over ALL bands: every image of every
+    # still-active band is packed into ONE calc.prepare() + get_ef_gpu() per
+    # iteration. UMA's per-atom mol_idx keeps each image block-diagonal, so the
+    # batched forward yields each image's E/F independently (CatTSunami /
+    # OCPNEB mechanic, Wander et al. arXiv:2405.02078, ACS Catal. 2024,
+    # DOI 10.1021/acscatal.4c04272). Per-band L-BFGS state is NOT shared.
+    # =====================================================================
+
+    def _eval_flat_batched(self, flat_images: List[Atoms]):
+        """ONE calc.prepare() + ONE get_ef_gpu() over an ARBITRARY flat list of
+        images (multi-band path packs every image of every band here). Returns
+        (Es, raw_F) aligned to ``flat_images``. Does NOT touch the single-band
+        oracle cache (self._band_nmax / self._band_cache_*), keeping the
+        fallback path independent."""
+        import torch
+        calc = self._mol_calc
+        calc.prepare(flat_images, fixed_nmax=None)
+        E_Ha, F_Ha = calc.get_ef_gpu()          # E (B,), F (B, nmax_dof)
+        if isinstance(E_Ha, torch.Tensor):
+            E_np = E_Ha.detach().to("cpu", torch.float64).numpy()
+        else:
+            E_np = np.asarray(E_Ha, dtype=np.float64)
+        if isinstance(F_Ha, torch.Tensor):
+            F_np = F_Ha.detach().to("cpu", torch.float64).numpy()
+        else:
+            F_np = np.asarray(F_Ha, dtype=np.float64)
+        Es, raw_F = [], []
+        for i, at in enumerate(flat_images):
+            n_i = len(at)
+            Es.append(float(E_np[i]))
+            raw_F.append(F_np[i, :3 * n_i].reshape(n_i, 3).astype(np.float64, copy=True))
+        return Es, raw_F
+
+    def _prepare_band(self, band: List[Atoms]) -> List[Atoms]:
+        """Build one ready NEB band (length n_required, endpoints included) from
+        an input band, mirroring run()'s alignment + interpolation + IDPP so a
+        multi-band band is prepared identically to the single-band path.
+
+        Accepts either exactly n_required images (used as-is, only re-aligned) or
+        exactly 2 endpoints (linear insertion plan + optional IDPP smoothing)."""
+        n_required = self.params.n_images   # already includes the +2 endpoints
+        band = list(band)
+        if len(band) < 2:
+            raise ValueError("each band needs >= 2 images (reactant + product)")
+        if len(band) > n_required:
+            raise ValueError(f"band has {len(band)} images > n_required={n_required}")
+
+        atoms_R = band[0]
+        atoms_P = band[-1]
+        R_ref = to_numpy_f64(atoms_R.get_positions())
+        P_aligned, _, _, _ = kabsch_align(R_ref, to_numpy_f64(atoms_P.get_positions()))
+        atoms_P.set_positions(P_aligned)
+        band[-1] = atoms_P
+        for i in range(1, len(band) - 1):
+            Q_aligned, _, _, _ = kabsch_align(R_ref, to_numpy_f64(band[i].get_positions()))
+            band[i].set_positions(Q_aligned)
+
+        if len(band) == n_required:
+            images = band
+        else:
+            distances = self._compute_distances(band)
+            plan = self._determine_insertion_plan(distances, n_required - len(band))
+            images = self._insert_images_by_plan(band, plan)
+            if self.params.ifidpp == 1:
+                images = self._run_idpp_smoothing(images)
+
+        self._align_path(images, ref_mode="reactant")
+        if not self._use_batch:
+            for img in images:
+                if img.calc is None:
+                    img.calc = self._mol_calc
+        return images
+
+    @staticmethod
+    def _grad_from_fp(Fp_list, n_img, x_like):
+        """Flatten -Fp over internal images into the L-BFGS gradient vector
+        (identical packing to _pack_internal / run()'s eval_grad)."""
+        grads = [(-Fp_list[i]).reshape(-1) for i in range(1, n_img - 1)]
+        return np.concatenate(grads) if grads else np.zeros_like(x_like)
+
+    def _update_frozen(self, st, Fp_list, fmax_th):
+        """DyNEB: freeze any internal image (except the current HEI) whose NEB
+        force max-component has dropped below fmax. Monotone (once frozen, stays
+        frozen). Lindgren, Kastlunger & Peterson, JCTC 2019, 15, 5787,
+        DOI 10.1021/acs.jctc.9b00633."""
+        hei = st["hei"]
+        # Keep the saddle neighbourhood {hei-1, hei, hei+1} ALWAYS active (the
+        # point of DyNEB is to concentrate effort ON the saddle): re-activate any
+        # of those that were frozen earlier, and never freeze them. Outer wing
+        # images freeze monotonically once below fmax.
+        protect = {hei - 1, hei, hei + 1}
+        for i in list(st["frozen"]):
+            if i in protect:
+                st["frozen"].discard(i)
+        for i in range(1, st["n_img"] - 1):
+            if i in protect or i in st["frozen"]:
+                continue
+            if float(np.abs(Fp_list[i]).max()) < fmax_th:
+                st["frozen"].add(i)
+
+    def _project_frozen(self, st, x_new):
+        """Hold the Cartesian DOFs of frozen internal images fixed at their
+        current values (DyNEB), independent of any L-BFGS cross terms. Block
+        layout matches _pack_internal / _unpack_internal."""
+        x_old = st["x"]
+        x_proj = x_new.copy()
+        offset = 0
+        for i in range(1, st["n_img"] - 1):
+            n = len(st["images"][i]) * 3
+            if i in st["frozen"]:
+                x_proj[offset:offset + n] = x_old[offset:offset + n]
+            offset += n
+        return x_proj
+
+    def run_multiband(self, bands: List[List[Atoms]],
+                      dyneb: bool = False, climbing: bool = False,
+                      spring_mode: str = "dynamic", verbose: bool = True):
+        """
+        OPT-IN multi-band NEB: optimise B independent NEB bands concurrently,
+        packing every image of every still-active band into ONE batched
+        calc.prepare() + get_ef_gpu() per iteration (image-as-batch over bands;
+        Wander et al. arXiv:2405.02078, ACS Catal. 2024,
+        DOI 10.1021/acscatal.4c04272). Each band carries its OWN L-BFGS state
+        (not shared across bands) and its own convergence test; the per-band
+        update mirrors run() exactly, so with the defaults (spring_mode='dynamic',
+        dyneb=False, climbing=False) each band reproduces the single-band run()
+        trajectory (the parity oracle).
+
+        Opt-in upgrades:
+          dyneb=True     DyNEB image freezing (Lindgren, Kastlunger & Peterson,
+                         JCTC 2019, 15, 5787, DOI 10.1021/acs.jctc.9b00633):
+                         internal images already below fmax are frozen (zero NEB
+                         force AND skipped in the batched forward -> fewer force
+                         evals), concentrating MLIP calls on the saddle region.
+          climbing=True  climbing-image force F - 2(F.tau)tau on the HEI
+                         (Henkelman, Uberuaga & Jonsson, JCP 2000, 113, 9901,
+                         DOI 10.1063/1.1329672).
+          spring_mode    'dynamic' (ORCA, = run() default) | 'energy_weighted'
+                         (Asgeirsson 2021, DOI 10.1021/acs.jctc.1c00462, stiffer
+                         near barrier) | 'fixed' (constant k_max).
+
+        bands : List[List[Atoms]]   B input bands (see _prepare_band).
+
+        Returns (results, stats):
+          results : list of dict (one per band) with keys images, energies, hei,
+                    barrier_Eh, iterations, converged, force_evals, n_img.
+          stats   : dict forwards, total_image_evals, wall_time_s, n_bands,
+                    max_iter_reached.
+        """
+        if not self._use_batch:
+            raise ValueError("run_multiband requires a batched calculator "
+                             "(prepare + get_ef_gpu) on the Molecules object")
+        if spring_mode not in ("dynamic", "energy_weighted", "fixed"):
+            raise ValueError(f"unknown spring_mode={spring_mode!r}")
+
+        p = self.params
+        base_case = (not dyneb) and (not climbing) and (spring_mode == "dynamic")
+
+        def k_for(Es):
+            if spring_mode == "dynamic":
+                return compute_dynamic_k(Es, p.k_min, p.k_max, p.k_decay)
+            if spring_mode == "energy_weighted":
+                return compute_energy_weighted_k(Es, p.k_min, p.k_max)
+            return [p.k_max] * len(Es)
+
+        # ---- build + init per-band states ----
+        states = []
+        for b_idx, band in enumerate(bands):
+            images = self._prepare_band(band)
+            states.append(dict(
+                idx=b_idx, images=images, n_img=len(images),
+                driver=LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0),
+                x=self._pack_internal(images),
+                Es=None, raw_F=None, g=None, Fp_list=None, x_new=None,
+                k_springs=None, hei=1, converged=False, iters=0,
+                frozen=set(), force_evals=0,
+            ))
+
+        # ---- one batched forward over a chosen subset of images per band ----
+        def batched_forward(eval_plan):
+            flat, owner = [], []
+            for st, idxs in eval_plan:
+                for j in idxs:
+                    flat.append(st["images"][j])
+                    owner.append((st, j))
+            if not flat:
+                return 0
+            Es_flat, F_flat = self._eval_flat_batched(flat)
+            for (st, j), e, f in zip(owner, Es_flat, F_flat):
+                st["Es"][j] = e
+                st["raw_F"][j] = f
+                st["force_evals"] += 1
+            return len(flat)
+
+        def band_forces(st):
+            if base_case:
+                # IDENTICAL call to run()'s eval_grad (dynamic-k recomputed from
+                # the current energies inside neb_forces) -> per-band parity.
+                return neb_forces(
+                    st["images"], st["Es"], k_spring=None, k_springs=None,
+                    use_dynamic_k=True, k_min=p.k_min, k_max=p.k_max,
+                    k_decay=p.k_decay, raw_forces=st["raw_F"])
+            ks = k_for(st["Es"])
+            st["k_springs"] = ks
+            mask = None
+            if dyneb:
+                mask = [True] * st["n_img"]
+                for fi in st["frozen"]:
+                    mask[fi] = False
+            return neb_band_forces(
+                st["images"], st["Es"], st["raw_F"], ks,
+                climbing=climbing, hei_fixed=None, active_mask=mask)
+
+        # ---- INITIAL forward (full band for every band) ----
+        for st in states:
+            st["Es"] = [0.0] * st["n_img"]
+            st["raw_F"] = [None] * st["n_img"]
+        forwards = 0
+        total_image_evals = 0
+        t0 = time.time()
+        total_image_evals += batched_forward(
+            [(st, list(range(st["n_img"]))) for st in states])
+        forwards += 1
+
+        for st in states:
+            Fp_list, _, hei = band_forces(st)
+            st["hei"] = hei
+            st["Fp_list"] = Fp_list
+            g = self._grad_from_fp(Fp_list, st["n_img"], st["x"])
+            st["g"] = g
+            if st["driver"].should_stop(g, p.neb_f_max_th, p.neb_f_rms_th):
+                st["converged"] = True
+            if dyneb:
+                self._update_frozen(st, Fp_list, p.neb_f_max_th)
+
+        if verbose:
+            log_info([
+                f"\n{'='*70}\n",
+                f"Multi-band NEB: B={len(states)} bands  spring_mode={spring_mode}  "
+                f"dyneb={dyneb}  climbing={climbing}\n",
+                f"{'='*70}\n",
+                "Image-as-batch over all bands (UMA mol_idx block-diagonal); "
+                "per-band L-BFGS; single-band run() kept as fallback + oracle.\n"
+            ], self.output)
+
+        # ---- main loop: one batched forward per iteration over all bands ----
+        it = 0
+        while it < p.max_iter and not all(st["converged"] for st in states):
+            it += 1
+            active = [st for st in states if not st["converged"]]
+
+            # 1) propose x_new for every active band (no forward needed)
+            for st in active:
+                drv = st["driver"]
+                step = drv.step_limit(drv.two_loop(st["g"]))
+                x_new = st["x"] + step
+                if dyneb and st["frozen"]:
+                    x_new = self._project_frozen(st, x_new)
+                self._unpack_internal(x_new, st["images"])
+                st["x_new"] = x_new
+
+            # 2) ONE batched forward over the images that actually moved
+            plan = []
+            for st in active:
+                if dyneb:
+                    idxs = [j for j in range(1, st["n_img"] - 1)
+                            if (j not in st["frozen"]) or (j == st["hei"])]
+                else:
+                    idxs = list(range(st["n_img"]))   # full band (matches oracle)
+                plan.append((st, idxs))
+            total_image_evals += batched_forward(plan)
+            forwards += 1
+
+            # 3) per-band gradient update + convergence
+            for st in active:
+                Fp_list, _, hei = band_forces(st)
+                st["hei"] = hei
+                st["Fp_list"] = Fp_list
+                g_new = self._grad_from_fp(Fp_list, st["n_img"], st["x_new"])
+                st["driver"].update(st["x_new"] - st["x"], g_new - st["g"])
+                st["x"] = st["x_new"]
+                st["g"] = g_new
+                st["iters"] += 1
+                if st["driver"].should_stop(g_new, p.neb_f_max_th, p.neb_f_rms_th):
+                    st["converged"] = True
+                if dyneb:
+                    self._update_frozen(st, Fp_list, p.neb_f_max_th)
+
+        wall = time.time() - t0
+
+        # ---- finalize ----
+        results = []
+        for st in states:
+            Es = st["Es"]
+            hei = st["hei"]
+            results.append(dict(
+                idx=st["idx"], images=st["images"], energies=Es, hei=hei,
+                barrier_Eh=float(Es[hei] - Es[0]),
+                iterations=st["iters"], converged=st["converged"],
+                force_evals=st["force_evals"], n_img=st["n_img"],
+            ))
+            if verbose:
+                extra = (f" frozen={len(st['frozen'])}/{st['n_img']-2}" if dyneb else "")
+                log_info([
+                    f"band {st['idx']:>3d}: iters={st['iters']:>4d}  "
+                    f"converged={st['converged']}  HEI={hei}  "
+                    f"barrier={(Es[hei]-Es[0])*627.509:.3f} kcal/mol  "
+                    f"force_evals={st['force_evals']}{extra}\n"
+                ], self.output)
+        stats = dict(forwards=forwards, total_image_evals=total_image_evals,
+                     wall_time_s=wall, n_bands=len(states),
+                     max_iter_reached=(it >= p.max_iter))
+        if verbose:
+            log_info([
+                f"\nMulti-band done: {forwards} batched forwards, "
+                f"{total_image_evals} image-evals, wall={wall:.2f}s, iters={it}\n"
+            ], self.output)
+        return results, stats
+
     def _compute_distances(self, images: List[Atoms]) -> List[float]:
         """
         Compute straight-line distances between consecutive images.
@@ -879,7 +1323,8 @@ class NEB(JobABC):
     # ---------------- Climbing Image NEB (CINEB) -------------------------------
     def cineb_forces(self, images: List[Atoms], energies: List[float], k_spring: float) -> Tuple[List[np.ndarray], float, int]:
             """
-            Climbing Image NEB projected forces:
+            Climbing Image NEB projected forces (Henkelman, Uberuaga &
+            Jonsson, JCP 2000, 113, 9901, DOI: 10.1063/1.1329672):
             - normal NEB force for all non-endpoints except HEI
             - for HEI: remove spring force and reverse parallel component of true force
 
