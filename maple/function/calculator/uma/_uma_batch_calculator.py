@@ -333,10 +333,20 @@ class UMABatchCalc:
 
     # ------------------------------------------------- partial-Hessian helper
     def _movable_key(self, movable_masks):
-        """Hashable cache key for a movable spec (full Hessian == 'full')."""
-        if movable_masks is None:
-            return "full"
-        return tuple(tuple(int(x) for x in mv) for mv in self._resolve_movable(movable_masks))
+        """Hashable cache key for a Hessian plan.
+
+        Includes the FD step ``self._delta`` and chunk budget ``self._h_max_atoms``
+        because the cached plan bakes BOTH in (pert_val = s*delta, fac =
+        -s/(2*delta), and the chunk boundaries are derived from h_max). An
+        adaptive-delta change (or an h_max change) must therefore invalidate a
+        stale plan -- otherwise get_efh_gpu would silently reuse a plan built for
+        the old step size. The movable spec ('full' or per-structure index
+        tuples) is the third component.
+        """
+        mv = ("full" if movable_masks is None
+              else tuple(tuple(int(x) for x in m)
+                         for m in self._resolve_movable(movable_masks)))
+        return (self._delta, self._h_max_atoms, mv)
 
     def _resolve_movable(self, movable_masks):
         """Per-structure list[int] of atom indices whose DOFs are perturbed.
@@ -363,7 +373,12 @@ class UMABatchCalc:
             if m_arr.dtype == bool:
                 out.append([int(i) for i in _np.nonzero(m_arr)[0]])
             else:
-                out.append([int(i) for i in m_arr.reshape(-1)])
+                idxs = [int(i) for i in m_arr.reshape(-1)]
+                assert all(0 <= a < n_b[b] for a in idxs), (
+                    f"movable index out of range for structure {b} "
+                    f"(n_atoms={n_b[b]}): {idxs}"
+                )
+                out.append(idxs)
         return out
 
     # --------------------------------------------------- Hessian plan builder
