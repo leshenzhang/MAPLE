@@ -9,6 +9,44 @@ FIXES:
 2. Gradient consistency: use same gradient source throughout iteration
 3. Increased SR1 tolerance from 1e-10 to 1e-8
 4. Better step acceptance tracking
+
+===========================================================================
+TRANSITION-STATE-OPTIMIZER UPGRADES (all OPT-IN; default = legacy full-Hessian
+path, which is kept verbatim as both the fallback and the parity oracle).
+Every new method is gated by a constructor flag that defaults to OLD behavior.
+Literature each upgrade is grounded in (cited again at each method):
+
+  [1] Iterative leftmost-eigenpair solver via matrix-free Hessian-vector
+      products (Sella). Hermes, Sargent, Head-Gordon, Slavicek?  -- actually:
+      Hermes, E. D.; Sargsyan, K.; Najm, H. N.; Zador, J. "Accelerated
+      Saddle Point Refinement through Full Exploitation of Partial Hessian
+      Diagonalization", J. Chem. Theory Comput. 2019, 15, 6536.
+      DOI: 10.1021/acs.jctc.9b00869  and the Sella follow-up
+      "Sella, an Open-Source Automation-Friendly Molecular Saddle Point
+      Optimizer", J. Chem. Theory Comput. 2022, 18, 2.
+      DOI: 10.1021/acs.jctc.2c00395
+      => hessian_mode='iterative' (vs default 'full').
+  [2] Trust-radius controller. Nocedal & Wright, "Numerical Optimization",
+      2nd ed., Springer 2006, Ch. 4, Algorithm 4.1.
+      => trust_mode='nw' (vs default 'legacy').
+  [3] Eigenvector-following / mode tracking + negative-eigenvalue guard.
+      Banerjee, Adams, Simons, Shepard, J. Phys. Chem. 1985, 89, 52.
+      DOI: 10.1021/j100247a015 ; Baker, J. Comput. Chem. 1986, 7, 385.
+      DOI: 10.1002/jcc.540070402
+      => mode_follow_guard=True (vs default False).
+  [4] ts_hessian curvature injection (Swart-Bickelhaupt; pysisyphus).
+      DOI: 10.1002/qua.21049  => ts_hessian_inject=True (default False).
+  [5] Lindh model initial Hessian. Lindh et al., Chem. Phys. Lett. 1995,
+      241, 423. DOI: 10.1016/0009-2614(95)00646-L
+      => initial_hessian='lindh' (vs default 'identity'); see initial_hessian.py.
+  [6] Adaptive Hessian recalculation (pysisyphus hessian_recalc_adapt):
+      recompute the exact Hessian once ||g|| drops below 1/n of its initial
+      value, instead of a fixed RecalcFC cadence.
+      => hessian_recalc_adapt=True (default False).
+  [7] Reduced device->host sync: convergence/trust kept on-GPU, convergence +
+      verbose logging only sampled every K iters.
+      => conv_check_interval=K (default 1 = every iter = legacy).
+===========================================================================
 """
 
 from typing import List, Optional
@@ -16,6 +54,18 @@ import os
 import numpy as np
 import torch
 from ase import Atoms
+
+# Opt-in model-Hessian seeds (Lindh + ts_hessian injection). Imported defensively
+# so BPRFO still imports standalone (e.g. kernprof microbench) if the sibling file
+# is missing; the seeds are only reached when their opt-in flags are set.
+try:
+    from .initial_hessian import lindh_initial_hessian, ts_hessian_inject
+except Exception:  # pragma: no cover - standalone import fallback
+    try:
+        from initial_hessian import lindh_initial_hessian, ts_hessian_inject
+    except Exception:
+        lindh_initial_hessian = None
+        ts_hessian_inject = None
 
 # --- profile shim: BPRFO carries @profile (line_profiler/kernprof). Under a plain
 # `python` import, `profile` is undefined -> NameError. Provide a no-op fallback so
@@ -77,7 +127,26 @@ class BatchPRFO:
                  pool_queue: Optional[list] = None,
                  B_target: Optional[int] = None,
                  pool_size_bucket: bool = False,
-                 hessian_update: str = "bofill"):
+                 hessian_update: str = "bofill",
+                 # ---- OPT-IN upgrades (all default to legacy behavior) ----
+                 hessian_mode: str = "full",          # [1] 'full'(default,oracle)|'iterative'
+                 iter_n_leftmost: int = 1,            # [1] # leftmost eigenpairs to resolve
+                 iter_lanczos_m: int = 16,            # [1] max Krylov dim
+                 iter_lanczos_m_min: int = 4,         # [1] min steps before residual early-stop
+                 iter_gamma: float = 0.4,             # [1] loose conv: ||r|| < gamma*|lambda|
+                 iter_fd_eta: float = 1e-3,           # [1] finite-diff HVP step (Angstrom)
+                 hvp_source: str = "fd",              # [1] 'fd'(default)|'auto'|'autograd' HVP backend
+                 trust_mode: str = "legacy",          # [2] 'legacy'(default)|'nw'
+                 nw_eta_accept: float = 0.10,         # [2] accept step if rho > this
+                 nw_rho_lo: float = 0.25,             # [2] rho<lo -> trust x1/4
+                 nw_rho_hi: float = 0.75,             # [2] rho>hi & boundary -> trust x2
+                 mode_follow_guard: bool = False,     # [3] restrict overlap to neg subspace + neg_num==0 guard
+                 ts_hessian_inject: bool = False,     # [4] sign-flip+damp rxn mode of model/identity seed
+                 ts_inject_scale: float = 0.25,       # [4] diag[rxn] = -scale*|diag|
+                 initial_hessian: str = "identity",   # [5] 'identity'(default)|'lindh'
+                 hessian_recalc_adapt: bool = False,  # [6] recalc when ||g|| < ||g0||/n
+                 recalc_adapt_n: float = 10.0,        # [6] the 'n'
+                 conv_check_interval: int = 1):       # [7] check convergence + verbose-log every K iters
         self.trust_init = trust_init
         self.trust_min = trust_min
         self.trust_max = trust_max
@@ -90,7 +159,56 @@ class BatchPRFO:
         self.hessian_update = str(hessian_update).lower()
         if self.hessian_update not in {"bofill", "bfgs"}:
             raise ValueError("hessian_update must be 'bofill' or 'bfgs'.")
-        
+
+        # ---- OPT-IN upgrade config ----
+        self.hessian_mode = str(hessian_mode).lower()
+        if self.hessian_mode not in {"full", "iterative"}:
+            raise ValueError("hessian_mode must be 'full' or 'iterative'.")
+        self.iter_n_leftmost = max(1, int(iter_n_leftmost))
+        self.iter_lanczos_m = max(2, int(iter_lanczos_m))
+        self.iter_lanczos_m_min = max(2, int(iter_lanczos_m_min))
+        self.iter_gamma = float(iter_gamma)
+        self.iter_fd_eta = float(iter_fd_eta)
+        # [1] HVP backend. DEFAULT 'fd' (finite-difference) because UMA's eSCN-MoE backbone
+        # has an INCOMPLETE double-backward: its forces are exact but its autograd Hessian/HVP
+        # are wrong by ~1.2e-2 Ha/A^2 (delta-independent => a real error, not FD truncation),
+        # which would make the eigensolver follow the wrong mode. FD HVP is the accurate path
+        # for UMA. Only switch to 'autograd' for models with a reliable double-backward (e.g.
+        # MACE-OFF). 'auto' = use analytic calc.hvp/hvp_batch IF advertised, else FD.
+        self.hvp_source = str(hvp_source).lower()
+        if self.hvp_source not in {"fd", "auto", "autograd"}:
+            raise ValueError("hvp_source must be 'fd', 'auto' or 'autograd'.")
+        self.trust_mode = str(trust_mode).lower()
+        if self.trust_mode not in {"legacy", "nw"}:
+            raise ValueError("trust_mode must be 'legacy' or 'nw'.")
+        self.nw_eta_accept = float(nw_eta_accept)
+        self.nw_rho_lo = float(nw_rho_lo)
+        self.nw_rho_hi = float(nw_rho_hi)
+        self.mode_follow_guard = bool(mode_follow_guard)
+        self.ts_hessian_inject = bool(ts_hessian_inject)
+        self.ts_inject_scale = float(ts_inject_scale)
+        self.initial_hessian = str(initial_hessian).lower()
+        if self.initial_hessian not in {"identity", "lindh"}:
+            raise ValueError("initial_hessian must be 'identity' or 'lindh'.")
+        self.hessian_recalc_adapt = bool(hessian_recalc_adapt)
+        self.recalc_adapt_n = float(recalc_adapt_n)
+        self.conv_check_interval = max(1, int(conv_check_interval))
+        if (self.initial_hessian == "lindh" or self.ts_hessian_inject) \
+                and lindh_initial_hessian is None:
+            raise ImportError(
+                "initial_hessian.py (lindh/ts_hessian_inject) not importable; "
+                "cannot use initial_hessian='lindh' / ts_hessian_inject=True.")
+        # --- iterative-eigensolver diagnostics ---
+        self._hvp_kind = None             # 'hvp' | 'hvp_batch' | 'fd' (detected lazily)
+        self._hvp_calls = 0               # total HVP evaluations (forwards in FD mode)
+        self._lanczos_calls = 0           # # of _leftmost_eigpairs_mw invocations
+        self._lanczos_steps = 0           # total Lanczos steps (sum of m used)
+        self._lanczos_unconverged = 0     # Ritz pairs that missed gamma*|lambda| at m_max
+        self._neg_guard_hits = 0          # # (system,iter) flagged neg_num==0 by mode guard
+        # adaptive-recalc state (Task 6); scalar batch-level
+        self._g0_norm_mean = None
+        self._adapt_level = 0
+
         self.output = os.path.abspath(output)
         self.out_dir = os.path.dirname(self.output) or "."
         os.makedirs(self.out_dir, exist_ok=True)
@@ -187,6 +305,24 @@ class BatchPRFO:
         self._w("# RS-PRFO batched TS search start\n")
         self._w(f"# RecalcFC interval: {self.recalc}\n")
         self._w(f"# Hessian update method: {self.hessian_update}\n")
+        self._w(f"# hessian_mode={self.hessian_mode} trust_mode={self.trust_mode} "
+                f"initial_hessian={self.initial_hessian} ts_hessian_inject={self.ts_hessian_inject} "
+                f"mode_follow_guard={self.mode_follow_guard} "
+                f"hessian_recalc_adapt={self.hessian_recalc_adapt} "
+                f"conv_check_interval={self.conv_check_interval}\n")
+        if self.hessian_mode == "iterative":
+            self._w(f"# iterative eigensolver: n_leftmost={self.iter_n_leftmost} "
+                    f"lanczos_m<={self.iter_lanczos_m} gamma={self.iter_gamma} "
+                    f"fd_eta={self.iter_fd_eta} hvp_source={self.hvp_source}\n")
+        # reset adaptive-recalc + iterative diagnostics for this run
+        self._g0_norm_mean = None
+        self._adapt_level = 0
+        self._hvp_kind = None
+        self._hvp_calls = 0
+        self._lanczos_calls = 0
+        self._lanczos_steps = 0
+        self._lanczos_unconverged = 0
+        self._neg_guard_hits = 0
 
         self._init_xyz_paths(B0)
         self._symbols_per_batch = _symbols_flat(atoms_list)
@@ -232,12 +368,59 @@ class BatchPRFO:
 
             # Decide whether to rebuild Hessian from calculator (Gaussian RecalcFC-like).
             # A bounded inner restart (straggler control) can force an extra fresh Hessian.
-            need_recalc = ((outer_it == 1)
-                           or ((outer_it - 1) % self.recalc == 0)
-                           or self._force_recalc_next)
+            forced = bool(self._force_recalc_next)
             self._force_recalc_next = False
 
-            if need_recalc:
+            if self.hessian_mode == "iterative":
+                # ---- [1] Matrix-free iterative path: NO full numerical Hessian here.
+                # The working (model) Hessian carries bulk curvature (Lindh/identity seed +
+                # Bofill updates); the leftmost eigenpair(s) of the TRUE Hessian are resolved
+                # exactly each iteration by the Lanczos HVP solver in _eigh_and_track_modes.
+                # The model seed is built ONCE (or on a forced straggler restart) -- the
+                # RecalcFC cadence does NOT re-seed (that would wipe Bofill curvature).
+                E_old, F_now = calc.get_ef_gpu()
+                E_old = E_old.to(dtype=DTYPE)
+                F_now = F_now.to(dtype=DTYPE)
+                g_cart = -F_now * real_mask.to(DTYPE)
+                seed_now = (self._H_work is None) or forced
+                if seed_now:
+                    self._recalc_count = self._recalc_count + 1
+                    self._H_work = self._build_seed_hessian(atoms_list, real_mask)
+                    self._g_cart_prev = g_cart.clone()
+                    if self._g0_norm_mean is None:
+                        self._g0_norm_mean = float(g_cart.norm(dim=-1).mean().item())
+                    self._w(f"[Iter {outer_it}] seeded '{self.initial_hessian}' model Hessian "
+                            f"(ts_hessian_inject={self.ts_hessian_inject})\n")
+                H_cart = self._H_work
+                # gate the post-step Bofill block: skip ONLY on the (re)seed iteration.
+                need_recalc = seed_now
+                E_old_is_set = True
+            else:
+                E_old_is_set = False
+                # [6] adaptive-recalc (opt-in, full mode): trigger when batch-mean ||g|| has
+                # dropped below 1/n of its initial value (one trigger per geometric level),
+                # using the previous committed gradient available at loop top. Replaces cadence.
+                adapt_fire = False
+                if (self.hessian_recalc_adapt
+                        and self._g_cart_prev is not None and self._g0_norm_mean is not None):
+                    cur = float(self._g_cart_prev.norm(dim=-1).mean().item())
+                    thr = self._g0_norm_mean * (1.0 / self.recalc_adapt_n) ** (self._adapt_level + 1)
+                    if cur < thr:
+                        adapt_fire = True
+                        self._adapt_level += 1
+                        self._w(f"[Iter {outer_it}] adaptive recalc: <|g|>={cur:.3e} < "
+                                f"g0/n^{self._adapt_level} ({thr:.3e})\n")
+
+                if self.hessian_recalc_adapt:
+                    need_recalc = ((outer_it == 1) or forced or adapt_fire)
+                else:
+                    need_recalc = ((outer_it == 1)
+                                   or ((outer_it - 1) % self.recalc == 0)
+                                   or forced)
+
+            if E_old_is_set:
+                pass  # iterative path already produced E_old / H_cart / g_cart above
+            elif need_recalc:
                 self._recalc_count = self._recalc_count + 1
                 # Pull EFH (true or numerical) from calculator; pad to nmax
                 E_old, F_tmp, H_tmp, _ = calc.get_efh_gpu()
@@ -263,7 +446,10 @@ class BatchPRFO:
                 # Store exact Hessian and gradient
                 self._H_work = H_cart.clone()
                 self._g_cart_prev = g_cart.clone()
-                
+                # capture the initial batch-mean ||g|| once (adaptive-recalc baseline).
+                if self._g0_norm_mean is None:
+                    self._g0_norm_mean = float(g_cart.norm(dim=-1).mean().item())
+
                 self._w(f"[Iter {outer_it}] Recalculated exact Hessian\n")
 
             else:
@@ -271,14 +457,20 @@ class BatchPRFO:
                 E_old, F_now = calc.get_ef_gpu()
                 E_old = E_old.to(dtype=DTYPE)
                 F_now = F_now.to(dtype=DTYPE)
-                
+
                 # Use working Hessian, compute current gradient
                 H_cart = self._H_work
                 g_cart = -F_now * real_mask.to(DTYPE)
 
             # Mass-weighting and eigen-decomposition
             H_mw, g_mw = self._mass_weight_hg(H_cart, g_cart, real_mask)
-            w, V, gp = self._eigh_and_track_modes(H_mw, g_mw)
+            w, V, gp = self._eigh_and_track_modes(
+                H_mw, g_mw, it=outer_it, calc=calc, g_cart=g_cart, real_mask=real_mask)
+
+            # [7] D2H-sync reduction: sample convergence + verbose logging only every K
+            # iters (and on the last outer iter). Default K=1 -> every iter == legacy.
+            do_check = ((outer_it % self.conv_check_interval == 0)
+                        or (outer_it == self.max_outer_iter))
 
             # Inner RS-PRFO loop
             trust_r, last_step, last_rho, step_accepted = self._inner_rs_prfo_loop(
@@ -290,6 +482,7 @@ class BatchPRFO:
                 last_step=last_step,
                 real_mask=real_mask,
                 E_old=E_old,
+                log=do_check,
             )
 
             # After step: get new gradient at the committed geometry (ONE forward; reused
@@ -323,17 +516,22 @@ class BatchPRFO:
             self._g_cart_prev = g_new_cart.clone()
 
             # Convergence check (reuse committed-geometry E/g instead of recomputing).
-            done = self._check_convergence(
-                it=outer_it,
-                calc=calc,
-                atoms_list=atoms_list,
-                trust_r=trust_r,
-                last_step=last_step,
-                real_mask=real_mask,
-                last_rho=last_rho,
-                E_precomp=E_fin,
-                g_precomp=g_new_cart,
-            )
+            # [7] Only evaluated on sampled iters; on skipped iters done=all-False (no shrink,
+            # no per-B device->host table sync). Default K=1 -> evaluated every iter (legacy).
+            if do_check:
+                done = self._check_convergence(
+                    it=outer_it,
+                    calc=calc,
+                    atoms_list=atoms_list,
+                    trust_r=trust_r,
+                    last_step=last_step,
+                    real_mask=real_mask,
+                    last_rho=last_rho,
+                    E_precomp=E_fin,
+                    g_precomp=g_new_cart,
+                )
+            else:
+                done = torch.zeros(real_mask.shape[0], dtype=torch.bool, device=device)
 
             # ---- Outer/inner robustness: per-structure straggler detection ----
             # rho-bad streak (oscillation / poor model) + trust pinned-at-min streak.
@@ -487,17 +685,28 @@ class BatchPRFO:
                                 torch.zeros((k, self._nmax), dtype=DTYPE, device=device),
                             ])
 
-                        # New working Hessian = identity (Cartesian), prev grad = 0 (like
-                        # the startup init); the RecalcFC schedule replaces it with the
-                        # exact numerical Hessian within `self.recalc` iterations.
+                        # New working Hessian seed, prev grad = 0 (like the startup init);
+                        # the RecalcFC schedule replaces it with the exact numerical Hessian
+                        # within `self.recalc` iterations. [4][5] When a model seed / curvature
+                        # injection is requested, build a Lindh / inject seed for the newcomers
+                        # (fixes the wave-1 degenerate-identity-spectrum issue); otherwise keep
+                        # the legacy identity seed verbatim (parity).
                         if self._H_work is not None:
-                            # cat copies into fresh storage, so the 0-stride expand
-                            # is fine here (no .contiguous() materialization needed).
-                            eye = torch.eye(self._nmax, dtype=DTYPE, device=device)
-                            self._H_work = torch.cat([
-                                self._H_work,
-                                eye.unsqueeze(0).expand(k, -1, -1),
-                            ])
+                            if self.initial_hessian == "lindh" or self.ts_hessian_inject:
+                                Lnew = torch.tensor(
+                                    [3 * len(a) for a in new_atoms],
+                                    dtype=torch.long, device=device)
+                                mask_new = (self._arange_n[None, :] < Lnew[:, None])
+                                H_new_seed = self._build_seed_hessian(new_atoms, mask_new)
+                                self._H_work = torch.cat([self._H_work, H_new_seed])
+                            else:
+                                # cat copies into fresh storage, so the 0-stride expand
+                                # is fine here (no .contiguous() materialization needed).
+                                eye = torch.eye(self._nmax, dtype=DTYPE, device=device)
+                                self._H_work = torch.cat([
+                                    self._H_work,
+                                    eye.unsqueeze(0).expand(k, -1, -1),
+                                ])
                         if self._g_cart_prev is not None:
                             self._g_cart_prev = torch.cat([
                                 self._g_cart_prev,
@@ -544,6 +753,12 @@ class BatchPRFO:
         self._w(f"# Final status: converged={n_conv} evicted_straggler={n_evict} "
                 f"max_iter={n_max} (mu_unbracketed={self._mu_unbracketed}, "
                 f"pool_refilled={self._pool_refilled})\n")
+        if self.hessian_mode == "iterative":
+            self._w(f"# iterative: hvp_kind={self._hvp_kind} hvp_calls={self._hvp_calls} "
+                    f"lanczos_calls={self._lanczos_calls} lanczos_steps={self._lanczos_steps} "
+                    f"unconverged_ritz={self._lanczos_unconverged}\n")
+        if self.mode_follow_guard:
+            self._w(f"# mode_follow_guard: neg_num==0 flags={self._neg_guard_hits}\n")
 
         self._close_log()
 
@@ -646,20 +861,49 @@ class BatchPRFO:
     # EIGEN + TRACKING
     # ===================================================
 
-    def _eigh_and_track_modes(self, H_mw, g_mw):
+    def _eigh_and_track_modes(self, H_mw, g_mw, it=0, calc=None,
+                              g_cart=None, real_mask=None):
         B, n = g_mw.shape
 
         w, V = torch.linalg.eigh(H_mw)
+
+        # ---- [1] Iterative leftmost-eigenpair substitution (opt-in) ----
+        # Rather than trust the (approximate model) Hessian's lowest modes, resolve the
+        # iter_n_leftmost leftmost eigenpairs of the TRUE Hessian matrix-free (Lanczos on
+        # batched Hessian-vector products) and overwrite the corresponding lowest model
+        # eigenpairs. The exact eigvec(s) are then fed to the existing RS-P-RFO eigenvector-
+        # following unchanged -- no full Hessian is built.
+        # Sella: Hermes et al. JCTC 2019 (10.1021/acs.jctc.9b00869) +
+        #        Hermes et al. JCTC 2022 (10.1021/acs.jctc.2c00395).
+        if (self.hessian_mode == "iterative" and calc is not None
+                and g_cart is not None and real_mask is not None):
+            lam_lo, vec_lo = self._leftmost_eigpairs_mw(
+                calc, g_mw, g_cart, real_mask, self.iter_n_leftmost)
+            n_lo = int(lam_lo.shape[1])
+            V = V.clone()
+            w = w.clone()
+            for p in range(n_lo):
+                V[:, :, p] = vec_lo[:, :, p]
+                w[:, p] = lam_lo[:, p]
+
         gp = (V.transpose(-1, -2) @ g_mw.unsqueeze(-1)).squeeze(-1)
 
         tiny = w.abs() < 1e-10
         w = torch.where(tiny, torch.sign(w) * 1e-10, w)
+
+        # ---- [3] negative-eigenvalue ('imaginary subspace') bookkeeping ----
+        # Banerjee et al. JPC 1985 (10.1021/j100247a015); Baker JCC 1986
+        # (10.1002/jcc.540070402).
+        neg = w < -1e-6
+        neg_num = neg.sum(dim=1)
 
         if self.tracked_mode_vec_mw is None:
             neg_idx = torch.argmin(w, dim=1)
             has_neg = w.gather(1, neg_idx[:, None]).squeeze(1) < -1e-6
             alt_idx = torch.argmax(gp.abs(), dim=1)
             tracked_idx = torch.where(has_neg, neg_idx, alt_idx)
+            if self.mode_follow_guard:
+                self._flag_neg_guard(it, neg_num)
 
             self.tracked_mode_idx = tracked_idx
             # gather column tracked_idx[b] from V[b] -> (B, n); avoids python B-loop host sync
@@ -673,7 +917,21 @@ class BatchPRFO:
                 self.tracked_mode_vec_mw.unsqueeze(-1)
             ).squeeze(-1)
 
-            idx = torch.argmax(overlap.abs(), dim=-1)
+            if self.mode_follow_guard:
+                # [3] Restrict the max-overlap mode selection to the negative (imaginary)
+                # subspace wherever one exists; for a structure with NO negative mode, fall
+                # back to the full-spectrum overlap and FLAG it (stricter than pysisyphus,
+                # which has no neg_num==0 guard).
+                ov = overlap.abs()
+                masked_ov = torch.where(neg, ov, torch.full_like(ov, -1.0))
+                idx_neg = torch.argmax(masked_ov, dim=-1)
+                idx_full = torch.argmax(ov, dim=-1)
+                no_neg = (neg_num == 0)
+                idx = torch.where(no_neg, idx_full, idx_neg)
+                self._flag_neg_guard(it, neg_num)
+            else:
+                idx = torch.argmax(overlap.abs(), dim=-1)
+
             signs = torch.sign(overlap.gather(1, idx[:, None]).squeeze(1))
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
 
@@ -684,14 +942,183 @@ class BatchPRFO:
 
         return w, V, gp
 
+    def _flag_neg_guard(self, it, neg_num):
+        """[3] Count + log structures with NO negative Hessian eigenvalue (not yet in a
+        saddle region). Opt-in (mode_follow_guard); the .item() sync is gated by that flag."""
+        no_neg = (neg_num == 0)
+        c = int(no_neg.sum().item())
+        if c > 0:
+            self._neg_guard_hits += c
+            self._w(f"[Iter {it}] mode_follow_guard: {c} structure(s) with NO negative "
+                    f"Hessian eigenvalue (not a saddle region yet)\n")
+
+    # ===================================================
+    # ITERATIVE LEFTMOST-EIGENPAIR SOLVER (matrix-free, Sella) + SEED HESSIAN
+    # ===================================================
+
+    def _build_seed_hessian(self, atoms_list, real_mask):
+        """[4][5] Cartesian seed Hessian for `atoms_list` (padded to nmax). Identity (legacy
+        default) or Lindh model (10.1016/0009-2614(95)00646-L), optionally with ts_hessian
+        curvature injection (10.1002/qua.21049) so the seed has EXACTLY one negative
+        mass-weighted eigenvalue. Self-contained (derives its own mass-weighting) so it serves
+        both the startup batch and pool-newcomer sub-batches before topology rebuild."""
+        B = len(atoms_list)
+        n = self._nmax
+        device = self.device
+        if self.initial_hessian == "lindh":
+            H = lindh_initial_hessian(atoms_list, n, device, DTYPE)
+        else:
+            eye = torch.eye(n, dtype=DTYPE, device=device)
+            H = eye.unsqueeze(0).expand(B, n, n).contiguous()
+        mask_ij = (real_mask.unsqueeze(-1) & real_mask.unsqueeze(-2)).to(DTYPE)
+        H = H * mask_ij
+        if self.ts_hessian_inject:
+            mass = _masses_flat(atoms_list, n, device)
+            D = 1.0 / torch.sqrt(torch.clamp(mass, min=1e-12))
+            H = ts_hessian_inject(H, real_mask, D, scale=self.ts_inject_scale, big=BIG)
+        return H
+
+    @torch.no_grad()
+    def _hvp_cart(self, calc, u_cart, g0_cart, real_mask):
+        """Cartesian Hessian-vector product H @ u (Hartree/Angstrom). Prefers an analytic
+        calculator HVP (``calc.hvp`` / ``calc.hvp_batch``) when exposed; otherwise a forward
+        finite-difference HVP  H@u = ||u|| * [g(x+eta*uhat) - g(x)] / eta  (ONE extra forward).
+        ``g0_cart`` is the gradient (-F) at the current geometry. The base geometry is saved
+        and restored in-place WITHOUT touching the calculator's own backup buffer."""
+        rm = real_mask.to(DTYPE)
+        u = u_cart * rm
+        if self._hvp_kind is None:
+            # DEFAULT 'fd' (UMA double-backward is unreliable -> FD is the accurate HVP).
+            if self.hvp_source == "fd":
+                self._hvp_kind = "fd"
+            else:  # 'auto' or 'autograd': prefer an advertised analytic HVP, else FD
+                if hasattr(calc, "hvp"):
+                    self._hvp_kind = "hvp"
+                elif hasattr(calc, "hvp_batch"):
+                    self._hvp_kind = "hvp_batch"
+                elif self.hvp_source == "autograd":
+                    self._w("# [hvp] hvp_source='autograd' but calc exposes no hvp/hvp_batch; "
+                            "using FD\n")
+                    self._hvp_kind = "fd"
+                else:
+                    self._hvp_kind = "fd"
+        self._hvp_calls += 1
+        if self._hvp_kind in ("hvp", "hvp_batch"):
+            try:
+                out = (calc.hvp(u) if self._hvp_kind == "hvp" else calc.hvp_batch(u))
+                Hu = out[0] if isinstance(out, (tuple, list)) else out
+                return Hu.to(dtype=DTYPE) * rm
+            except Exception as exc:  # permanent fallback to FD on any analytic failure
+                self._w(f"# [hvp] analytic HVP failed ({exc!r}); falling back to FD\n")
+                self._hvp_kind = "fd"
+        # finite-difference HVP (linear in u -> scale a unit-step displacement back up)
+        un = u.norm(dim=-1, keepdim=True)
+        uhat = u / torch.clamp(un, min=1e-30)
+        eta = self.iter_fd_eta
+        d = eta * uhat
+        coord = _get_coord_gpu(calc)
+        save = coord.clone()
+        calc.step_cart_(d)
+        _, F_plus = calc.get_ef_gpu()
+        coord.copy_(save)
+        g_plus = -F_plus.to(dtype=DTYPE) * rm
+        Hu = ((g_plus - g0_cart) / eta) * un
+        return Hu * rm
+
+    @torch.no_grad()
+    def _leftmost_eigpairs_mw(self, calc, g_mw, g_cart, real_mask, n_lo):
+        """[1] The ``n_lo`` leftmost (most-negative) eigenpairs of the mass-weighted TRUE
+        Hessian, via batched Lanczos on matrix-free HVPs (Sella). The operator is confined to
+        the real (non-pad) subspace -- mirroring the +BIG pad penalty of the full-eigh path,
+        pad modes are never leftmost, so they are simply excluded. Full reorthogonalization
+        (twice) keeps the small Krylov basis orthonormal; small m x m Gram (tridiagonal)
+        eigh is batched over systems. Loose stop ||r|| < gamma*|lambda| (gamma~0.4).
+        Returns (lam (B,n_lo) ascending, vec (B,n,n_lo) mass-weighted unit eigvecs)."""
+        device = g_mw.device
+        B, n = g_mw.shape
+        rm = real_mask.to(DTYPE)
+        n_lo = min(int(n_lo), n)
+        m_min_eff = max(self.iter_lanczos_m_min, n_lo)
+        m_max = min(self.iter_lanczos_m, n)
+        m_max = max(m_max, min(n, n_lo + 2))
+        gamma = self.iter_gamma
+
+        def A_mw(v):  # mass-weighted Hessian action, (B,n)->(B,n)
+            v = v * rm
+            u_cart = self._D * v                       # D = 1/sqrt(m): mw-dir -> cart-dir
+            Hu = self._hvp_cart(calc, u_cart, g_cart, real_mask)
+            return (self._D * Hu) * rm
+
+        gen = torch.Generator(device=device)
+        gen.manual_seed(1234)
+        v = torch.randn(B, n, generator=gen, dtype=DTYPE, device=device) * rm
+        v = v / torch.clamp(v.norm(dim=-1, keepdim=True), min=1e-30)
+
+        Vk = []
+        alphas = []
+        betas = []
+        lam_out = None
+        vec_out = None
+        resid_lo = None
+        tol = None
+        for j in range(m_max):
+            Vk.append(v)
+            wv = A_mw(v)
+            alpha = (wv * v).sum(dim=-1)
+            alphas.append(alpha)
+            for _pass in range(2):                     # full reorthogonalization x2
+                for vk in Vk:
+                    wv = wv - (wv * vk).sum(dim=-1, keepdim=True) * vk
+            beta = wv.norm(dim=-1)
+            m_used = j + 1
+
+            if m_used >= 2:
+                T = torch.diag_embed(torch.stack(alphas, dim=1))
+                off = torch.stack(betas, dim=1)        # (B, m_used-1)
+                ar = torch.arange(m_used - 1, device=device)
+                T[:, ar, ar + 1] = off
+                T[:, ar + 1, ar] = off
+            else:
+                T = torch.stack(alphas, dim=1).unsqueeze(-1)
+            theta, S = torch.linalg.eigh(T)            # ascending
+            Vk_stack = torch.stack(Vk, dim=1)          # (B, m_used, n)
+            Y = torch.einsum("bjn,bjp->bnp", Vk_stack, S)   # (B, n, m_used)
+            resid = beta.unsqueeze(1) * S[:, -1, :].abs()   # Ritz residual estimate (B,m_used)
+
+            last = (j == m_max - 1)
+            if (m_used >= n_lo) and ((m_used >= m_min_eff) or last):
+                lam_out = theta[:, :n_lo]
+                vec_out = Y[:, :, :n_lo]
+                resid_lo = resid[:, :n_lo]
+                tol = gamma * lam_out.abs().clamp(min=1e-8)
+                if (m_used >= m_min_eff) and bool((resid_lo < tol).all()):
+                    break
+            if j < m_max - 1:
+                v = wv / torch.clamp(beta, min=1e-30).unsqueeze(-1)
+                v = v * rm
+                betas.append(beta)
+
+        self._lanczos_calls += 1
+        self._lanczos_steps += len(Vk)
+        if resid_lo is not None and tol is not None:
+            self._lanczos_unconverged += int((resid_lo >= tol).sum().item())
+
+        vec_out = vec_out * rm.unsqueeze(-1)
+        vec_out = vec_out / vec_out.norm(dim=1, keepdim=True).clamp(min=1e-30)
+        return lam_out, vec_out
+
     # ===================================================
     # INNER RS-PRFO LOOP
     # ===================================================
     @profile
     def _inner_rs_prfo_loop(self, it, calc, w, V, gp, H, g_cart,
-                            trust_r, last_step, real_mask, E_old):
+                            trust_r, last_step, real_mask, E_old, log=True):
         """
         Optimized inner loop with ~1.5-2x speedup.
+
+        ``log`` (default True == legacy) gates the per-attempt host-side iteration log +
+        the acceptance-rate EMA .item() sync (Task 7 D2H-sync reduction). Step acceptance,
+        trust update, and the actual optimization math are unchanged regardless of ``log``.
         """
         device = self.device
         B, n = gp.shape
@@ -791,8 +1218,14 @@ class BatchPRFO:
             on_boundary = (norm_mw - trust_r).abs() <= (
                 1e-6 * torch.clamp(trust_r, min=1.0)
             )
-            bad = pend & ((~torch.isfinite(rho)) | (rho < self.eta_shrink))
             force_accept = trust_r <= (self.trust_min * 1.000000000001)
+
+            # ---- step acceptance (legacy vs [2] Nocedal-Wright) ----
+            if self.trust_mode == "nw":
+                # accept if rho > nw_eta_accept (or trust pinned at min).
+                bad = pend & ((~torch.isfinite(rho)) | (rho < self.nw_eta_accept))
+            else:
+                bad = pend & ((~torch.isfinite(rho)) | (rho < self.eta_shrink))
             acc = pend & (~bad | force_accept)
             rej = pend & (~acc)
 
@@ -800,33 +1233,42 @@ class BatchPRFO:
                 s_commit = torch.zeros_like(s_cart)
                 s_commit[acc] = s_cart[acc]
                 calc.step_cart_(s_commit)
-
-                grow = (rho > self.eta_expand) & on_boundary & acc
-                trust_r = torch.where(
-                    grow,
-                    torch.clamp(2.0 * trust_r, max=self.trust_max),
-                    trust_r
-                )
                 last_step[acc] = s_commit[acc]
                 step_accepted |= acc
                 self._dump_xyz_subset(calc, acc, it)
 
-            trust_r = torch.where(
-                rej,
-                torch.clamp(0.5 * trust_r, min=self.trust_min),
-                trust_r
-            )
+            # ---- trust-radius update ----
+            if self.trust_mode == "nw":
+                # [2] Nocedal & Wright, Numerical Optimization 2e (2006), Ch.4 Alg.4.1:
+                #   rho < rho_lo                 -> trust x1/4 (floor trust_min)
+                #   rho > rho_hi AND on boundary -> trust x2   (cap   trust_max)
+                #   else                          -> keep
+                shrink = pend & ((~torch.isfinite(rho)) | (rho < self.nw_rho_lo))
+                trust_r = torch.where(
+                    shrink, torch.clamp(0.25 * trust_r, min=self.trust_min), trust_r)
+                grow = (pend & torch.isfinite(rho) & (rho > self.nw_rho_hi)
+                        & on_boundary & (~shrink))
+                trust_r = torch.where(
+                    grow, torch.clamp(2.0 * trust_r, max=self.trust_max), trust_r)
+            else:
+                grow = (rho > self.eta_expand) & on_boundary & acc
+                trust_r = torch.where(
+                    grow, torch.clamp(2.0 * trust_r, max=self.trust_max), trust_r)
+                trust_r = torch.where(
+                    rej, torch.clamp(0.5 * trust_r, min=self.trust_min), trust_r)
 
-            self._w(self._fmt_iter_head(it, acc, rej, rho, trust_r, E_new))
+            if log:
+                self._w(self._fmt_iter_head(it, acc, rej, rho, trust_r, E_new))
             accepted |= acc
 
-        # Update acceptance rate (exponential moving average)
-        acceptance_this_iter = accepted.float().mean().item()
-        self._recent_acceptance_rate = 0.85 * self._recent_acceptance_rate + 0.15 * acceptance_this_iter
-
-        # Log efficiency
-        if attempts_used < max_attempts:
-            self._w(f"  [Efficiency] Used {attempts_used}/{max_attempts} attempts\n")
+        # Update acceptance rate (exponential moving average). [7] gated by `log`; with the
+        # default conv_check_interval=1 this fires every iter == legacy behavior.
+        if log:
+            acceptance_this_iter = accepted.float().mean().item()
+            self._recent_acceptance_rate = (
+                0.85 * self._recent_acceptance_rate + 0.15 * acceptance_this_iter)
+            if attempts_used < max_attempts:
+                self._w(f"  [Efficiency] Used {attempts_used}/{max_attempts} attempts\n")
 
         return trust_r, last_step, last_rho, step_accepted
     # ===================================================
