@@ -39,6 +39,32 @@ actually change (``_edges_dirty``), so repeated HVPs at a fixed geometry (e.g.
 dimer rotation inner loop) reuse it. ``self._n_forward`` counts model forwards
 for verification.
 
+HESSIAN MODE (opt-in, OLD numerical FD is the default + parity oracle)
+---------------------------------------------------------------------
+``get_efh_gpu`` dispatches on ``hessian_mode``:
+  * ``'numerical'`` (DEFAULT) -- ``_efh_fd``, the 6N central-FD Hessian. This is
+    the OLD path and is KEPT verbatim as both the fallback AND the byte-parity
+    ORACLE the autograd Hessian is validated against.
+  * ``'autograd'`` (OPT-IN)   -- ``_efh_analytic``, the seeded block-diagonal
+    DOUBLE-BACKWARD Hessian (the energy graph's ``autograd.grad(forces, pos)``
+    row-loop over the unit basis ``eye(3N)`` with ``create_graph=True`` on the
+    forces). Optional ``torch.vmap`` acceleration over the seed basis is tried
+    first when ``hessian_chunk_size`` is set, with a hard try/except fall-back to
+    the row-loop, and the whole autograd attempt falls back to ``_efh_fd`` on any
+    error. The model is loaded RAW/EAGER (no ``torch.compile``, no cuEq) because
+    double-backward is unsupported under those (pytorch#91469).
+
+References for the autograd Hessian / HVP
+-----------------------------------------
+  * Yuan et al., "Analytical ML Hessians for ...", Nat. Commun. 2024,
+    DOI 10.1038/s41467-024-52481-5 -- autograd (double-backward) molecular
+    Hessians as the exact, O(delta)-error-free alternative to finite difference.
+  * MACE ``compute_hessians_vmap`` (github ACEsuit/mace, mace/modules/utils.py):
+    ``torch.vmap`` of ``autograd.grad`` over ``eye(3N)`` with a per-row loop
+    fallback (MACE issue #488) -- the pattern mirrored here.
+  * pytorch#91469 -- double-backward is NOT supported under ``torch.compile`` /
+    fused kernels, hence the eager raw-model requirement.
+
 CONTRACT (mirrors ``UMABatchCalc`` / ``MACEBatchCalc`` / ``AIMNet2BatchCalc``)
 -----------------------------------------------------------------------------
     prepare(atoms_list, fixed_nmax=None)
@@ -129,8 +155,9 @@ def _one_hot_node_attrs(Z: torch.Tensor, atomic_number_table: Sequence[int],
 class MACEAutogradBatchCalc:
     """Batched standard-MACE calculator with NATIVE autograd F/HVP. See module docstring."""
 
-    # autograd path supports BOTH an analytic (double-backward) Hessian and FD.
-    supported_hessian_modes = ("analytic", "numerical")
+    # Canonical hessian_mode values; default 'numerical' (FD oracle). Legacy
+    # 'analytic' is accepted as an alias of 'autograd' (double-backward).
+    supported_hessian_modes = ("numerical", "autograd")
 
     def __init__(self,
                  model_path: str,
@@ -139,7 +166,9 @@ class MACEAutogradBatchCalc:
                  dtype: torch.dtype = torch.float64,
                  implicit: str = "none",
                  solvent: str = "none",
-                 hessian: str = "analytic"):
+                 hessian: Optional[str] = None,
+                 hessian_mode: Optional[str] = None,
+                 hessian_chunk_size: Optional[int] = None):
         if str(solvent).lower() not in ("none", "", "vacuum", "gas"):
             raise ValueError(
                 f"MACEAutogradBatchCalc is gas-phase ONLY; got solvent={solvent!r}.")
@@ -151,7 +180,23 @@ class MACEAutogradBatchCalc:
         self.mdtype = dtype         # model dtype (f64 for HVP accuracy)
         self._model_name = model
         self._model_path = model_path
-        self.hessian = str(hessian).lower()
+
+        # ---- Hessian mode resolution (OPT-IN discipline) -------------------
+        # Canonical knob = ``hessian_mode`` in {'numerical','autograd'}. The
+        # legacy ``hessian`` kwarg ('analytic'/'numerical') is still honoured for
+        # back-compat. When NEITHER is given the default is 'numerical' -- the OLD
+        # 6N finite-difference path that doubles as the parity ORACLE (user 铁则:
+        # every new method opt-in, default = old behaviour, old path = oracle).
+        _raw = hessian_mode if hessian_mode is not None else hessian
+        if _raw is None:
+            _raw = "numerical"
+        _m = str(_raw).lower()
+        self.hessian_mode = "autograd" if _m in ("autograd", "analytic") else "numerical"
+        self.hessian = self.hessian_mode             # back-compat attribute
+        # vmap seed-basis chunk size for the autograd Hessian (None = pure
+        # row-loop, the validated default; an int enables the opt-in vmap try).
+        self._hessian_chunk_size = (int(hessian_chunk_size)
+                                    if hessian_chunk_size is not None else None)
 
         # Load the *raw* (un-traced) MACE foundation model -> full autograd graph.
         raw = mace_off(model=model_path, device=dev, return_raw_model=True)
@@ -406,8 +451,16 @@ class MACEAutogradBatchCalc:
                     torch.zeros((0, 0), dtype=dtype, device=device),
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
-        if self.hessian == "numerical":
+        # OLD path (default + oracle): 6N central finite-difference Hessian.
+        if self.hessian_mode == "numerical":
             return self._efh_fd()
+        # OPT-IN autograd double-backward Hessian. Try (optional) vmap first, then
+        # the row-loop, then hard-fall-back to the FD oracle on ANY failure.
+        if self._hessian_chunk_size is not None:
+            try:
+                return self._efh_analytic(chunk_size=self._hessian_chunk_size)
+            except Exception:
+                pass
         try:
             return self._efh_analytic()
         except Exception:
@@ -444,6 +497,26 @@ class MACEAutogradBatchCalc:
                                       retain_graph=False)[0]              # H@v (N,3)
         Hn_pad = self._scatter_forces(Hn_atom.to(dtype)) * EV2HARTREE
         return Hn_pad, E_eV.detach().to(dtype) * EV2HARTREE
+
+    def hvp(self, v: torch.Tensor) -> torch.Tensor:
+        """Canonical batched Hessian-vector product ``H @ v`` (Task-2 name).
+
+        Block-diagonal per system, computed by ONE forward + TWO backward of the
+        energy graph: ``g = grad(E, x, create_graph=True); Hn = grad((g*v).sum(),
+        x)`` -- the dense Hessian is never formed. Thin wrapper over
+        ``hvp_batch``; consumed by the BPRFO iterative eigensolver (sibling agent).
+        Autograd-HVP ref: Yuan et al., Nat. Commun. 2024, DOI 10.1038/s41467-024-52481-5.
+
+        Parameters
+        ----------
+        v : (B, nmax_dof)  -- per-structure padded direction (forces layout).
+
+        Returns
+        -------
+        Hn_pad : (B, nmax_dof)  -- (H @ v) per structure [Ha/A^2].
+        """
+        Hn_pad, _ = self.hvp_batch(v)
+        return Hn_pad
 
     # =====================================================================
     # single-structure autograd HVP callback for the dimer (dimer.py hvp_fn).
@@ -483,9 +556,24 @@ class MACEAutogradBatchCalc:
     # =====================================================================
     # seeded block-diagonal analytic Hessian (double-backward) / FD fallback
     # =====================================================================
-    def _efh_analytic(self):
-        """Full block-diagonal Hessian by seeded double-backward. 1 forward +
-        (1 + 3*nmax_a) backward -- still ONE model forward (vs FD's 6N)."""
+    def _efh_analytic(self, chunk_size: Optional[int] = None):
+        """Full block-diagonal Hessian by seeded DOUBLE-BACKWARD. 1 forward +
+        (1 + 3*nmax_a) backward -- still ONE model forward (vs FD's 6N).
+
+        ``F_all = -dE/dx`` carries ``create_graph=True`` (built in
+        ``_forward_with_graph``); each Hessian column is the SECOND backward
+        ``autograd.grad(F_all, pos, grad_outputs=seed)`` where ``seed`` is the
+        block-diagonal unit cotangent for one local DOF over all molecules at once.
+
+        ``chunk_size`` (OPT-IN): when given, the 3*nmax_a seed cotangents are
+        stacked and the batched VJP is evaluated with ``torch.vmap(..., chunk_size)``
+        -- the MACE ``compute_hessians_vmap`` pattern (github ACEsuit/mace
+        mace/modules/utils.py; loop fallback per MACE issue #488). ``chunk_size``
+        bounds the vmap working set for OOM. ``chunk_size=None`` (DEFAULT) keeps the
+        byte-identical row-loop, which is also the fallback the caller drops to if
+        the vmap raises. Autograd Hessian ref: Yuan et al., Nat. Commun. 2024,
+        DOI 10.1038/s41467-024-52481-5. Model MUST be eager (pytorch#91469).
+        """
         B, device, dtype = self._atoms_B, self.device, self.dtype
         N, nmax, nmax_a = self.N_atoms, self.nmax_dof, self.Nmax_atoms
         E_eV, g, coord_leaf = self._forward_with_graph()                 # 1 forward
@@ -496,20 +584,48 @@ class MACEAutogradBatchCalc:
         F_eV = self._scatter_forces(F_all.to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
-        for k in range(3 * nmax_a):
-            a_local, c = k // 3, k % 3
-            valid = (n_b > a_local)
-            if not bool(valid.any()):
-                continue
-            rows = s[valid] + a_local
-            go = torch.zeros((N, 3), dtype=F_all.dtype, device=device)
-            go[rows, c] = 1.0
-            col = torch.autograd.grad(F_all, coord_leaf, grad_outputs=go,
-                                      retain_graph=True, create_graph=False)[0].to(dtype)
-            for i in valid.nonzero(as_tuple=False).flatten().tolist():
+        K = 3 * nmax_a
+
+        def _scatter_col(k, col):
+            a_local = k // 3
+            for i in (n_b > a_local).nonzero(as_tuple=False).flatten().tolist():
                 dof = 3 * n_b_list[i]
                 if k < dof:
                     H_eV[i, :dof, k] = -col[s[i]:s[i] + n_b_list[i], :].reshape(-1)
+
+        if chunk_size is not None and K > 0:
+            # OPT-IN vmap over the block-diagonal seed basis (batched VJP).
+            seeds = []
+            for k in range(K):
+                a_local, c = k // 3, k % 3
+                go = torch.zeros((N, 3), dtype=F_all.dtype, device=device)
+                valid = (n_b > a_local)
+                if bool(valid.any()):
+                    go[s[valid] + a_local, c] = 1.0
+                seeds.append(go)
+            GO = torch.stack(seeds, dim=0)                               # (K,N,3)
+
+            def _get_vjp(v):
+                return torch.autograd.grad(F_all, coord_leaf, grad_outputs=v,
+                                           retain_graph=True, create_graph=False)[0]
+
+            COLS = torch.vmap(_get_vjp, in_dims=0, out_dims=0,
+                              chunk_size=int(chunk_size))(GO)            # (K,N,3)
+            for k in range(K):
+                if bool((n_b > (k // 3)).any()):
+                    _scatter_col(k, COLS[k].to(dtype))
+        else:
+            for k in range(K):
+                a_local, c = k // 3, k % 3
+                valid = (n_b > a_local)
+                if not bool(valid.any()):
+                    continue
+                rows = s[valid] + a_local
+                go = torch.zeros((N, 3), dtype=F_all.dtype, device=device)
+                go[rows, c] = 1.0
+                col = torch.autograd.grad(F_all, coord_leaf, grad_outputs=go,
+                                          retain_graph=True, create_graph=False)[0].to(dtype)
+                _scatter_col(k, col)
         H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))
         return (E_eV.detach().to(dtype) * EV2HARTREE, F_eV * EV2HARTREE, H_eV * EV2HARTREE, P)
 

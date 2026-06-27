@@ -28,9 +28,54 @@ Mirrors ``AIMNet2BatchCalc``:
                       H_Ha: (B, nmax_dof, nmax_dof), P: (B,) int64)
 
 Hartree units (UMA returns eV / eV.A^-1; EV2HARTREE = 1/27.211386245988).
-UMA supports a NUMERICAL Hessian only -> get_efh_gpu() uses a batched central
-finite-difference Hessian (H = -(F(x+d) - F(x-d)) / (2d)); each perturbed replica
-is an isolated graph in a chunked super-batch.
+
+Hessian modes (opt-in; OLD numerical FD is the DEFAULT + parity oracle)
+----------------------------------------------------------------------
+``get_efh_gpu`` dispatches on ``hessian_mode``:
+  * ``'numerical'`` (DEFAULT) -- the batched central finite-difference Hessian
+    ``H = -(F(x+d) - F(x-d)) / (2d)``; each perturbed replica is an isolated graph
+    in a chunked super-batch. This is the OLD path, KEPT verbatim as both the
+    fallback AND the byte-parity ORACLE.
+  * ``'autograd'`` (OPT-IN) -- an exact AUTOGRAD Hessian from UMA's energy graph
+    (double-backward). UMA-omol is a conservative energy model, so the Hessian is
+    ``d^2E/dx^2`` obtained by ``autograd.grad`` of the energy graph's force field
+    ``F_all = -dE/dx`` (built with ``create_graph=True``) row-looped over the
+    block-diagonal unit basis ``eye(3N)``, with an optional ``torch.vmap``
+    (``hessian_chunk_size``) acceleration and a try/except loop fallback, and a
+    hard fall-back to the numerical oracle on any failure. If the loaded model
+    exposes a DIRECT force head (``direct_forces=True``) the same seeded backward
+    differentiates that head (matching the FD-of-direct-forces quantity exactly).
+    The model is run EAGER (no torch.compile / cuEq; double-backward is
+    unsupported there, pytorch#91469); activation checkpointing is auto-disabled
+    for this mode (checkpoint reentrancy breaks double-backward).
+
+    ACCURACY CAVEAT (validated 2026-06-27, uma-s-1p1 eSCN-MoE, fp32 native).
+    The autograd path is mechanically correct and SELF-CONSISTENT (HVP == H@v and
+    grad(grad(E)) == grad(forces) to ~5e-7; forces == predict to ~4e-8), BUT the
+    eSCN backbone's custom autograd ops give an INCOMPLETE double-backward: the
+    autograd Hessian is correct to FIRST order (forces) yet deviates from the
+    finite-difference Hessian by a delta-INDEPENDENT ~1e-2 Ha/A^2 (~1%) that does
+    NOT shrink as delta->0 (so it is NOT FD truncation -- it is missing 2nd-order
+    curvature in the model graph). Therefore for UMA the NUMERICAL FD Hessian (the
+    default) remains the recommended/accurate path; the autograd opt-in is exact
+    only on fully twice-differentiable models (e.g. MACE-OFF, validated to ~1e-5
+    vs FD with clean delta->0 convergence). A one-time warning is emitted when the
+    autograd Hessian is first used.
+
+References for the autograd Hessian / HVP
+-----------------------------------------
+  * Yuan et al., Nat. Commun. 2024, DOI 10.1038/s41467-024-52481-5 -- autograd
+    (double-backward) molecular Hessians, exact and free of the O(delta^2) FD
+    truncation error.
+  * fairchem UMA ``compute_hessian_vmap`` / ``predict_untrained_hessian``
+    (fairchem core uma/outputs.py) -- UMA ships an autograd Hessian via the energy
+    graph's double-backward; this calculator wires the same energy-graph
+    double-backward locally (the helper is absent in this fairchem build).
+  * MACE ``compute_hessians_vmap`` (github ACEsuit/mace, mace/modules/utils.py):
+    ``torch.vmap`` of ``autograd.grad`` over ``eye(3N)`` + per-row loop fallback
+    (MACE issue #488) -- the vmap+fallback pattern mirrored here.
+  * pytorch#91469 -- double-backward unsupported under torch.compile / fused
+    kernels -> eager-only requirement.
 
 Self-contained fairchem env-compat preamble
 -------------------------------------------
@@ -107,6 +152,19 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError(f"fairchem-core is not importable: {exc}")
 
+# Inference-settings handle for the OPT-IN activation_checkpointing toggle
+# (Task 3) and for the autograd-Hessian mode (checkpoint reentrancy breaks
+# double-backward). Optional: absence only disables those opt-ins, never the
+# default numerical path.
+try:
+    from fairchem.core.units.mlip_unit.api.inference import (
+        InferenceSettings,
+        inference_settings_default,
+    )
+except Exception:  # pragma: no cover
+    InferenceSettings = None
+    inference_settings_default = None
+
 
 EV2HARTREE = 1.0 / 27.211386245988
 EH2EV = 27.211386245988
@@ -121,7 +179,7 @@ class UMABatchCalc:
     an f64 master tensor; the forward bridges through f32 (UMA runs in f32).
     """
 
-    supported_hessian_modes = ("numerical",)
+    supported_hessian_modes = ("numerical", "autograd")
 
     def __init__(
         self,
@@ -131,18 +189,43 @@ class UMABatchCalc:
         task: str = "omol",
         hessian_delta: float = 2e-3,
         hessian_max_atoms: int = 4096,
+        hessian_mode: str = "numerical",
+        hessian_chunk_size: Optional[int] = None,
+        disable_activation_checkpointing: bool = False,
     ):
         dev = str(device)
         dev = "cuda" if dev.startswith("cuda") else "cpu"
         self.device = torch.device(dev)
         self.dtype = dtype
         self.task_name = str(task).lower()
-        self.hessian = "numerical"
         self._delta = float(hessian_delta)
         self._h_max_atoms = int(hessian_max_atoms)
 
+        # ---- Hessian mode (OPT-IN; default 'numerical' = OLD FD path = oracle).
+        _m = str(hessian_mode).lower()
+        self.hessian_mode = "autograd" if _m in ("autograd", "analytic") else "numerical"
+        self.hessian = self.hessian_mode             # back-compat attribute
+        self._hessian_chunk_size = (int(hessian_chunk_size)
+                                    if hessian_chunk_size is not None else None)
+        self._disable_ac = bool(disable_activation_checkpointing)
+        self._warned_autograd = False   # one-time eSCN double-backward caveat
+
+        # ---- inference settings ------------------------------------------
+        # Default path keeps the string "default" -> byte-identical to the base.
+        # OPT-IN: build an InferenceSettings object only to flip
+        # activation_checkpointing off, either because the user asked (Task 3,
+        # ~2x speed, parity-safe) OR because the autograd Hessian needs it off
+        # (torch.utils.checkpoint reentrancy is incompatible with double-backward).
+        _need_ac_off = self._disable_ac or (self.hessian_mode == "autograd")
+        if _need_ac_off and inference_settings_default is not None:
+            _isett = inference_settings_default()
+            _isett.activation_checkpointing = False
+            self._inference_settings_arg = _isett
+        else:
+            self._inference_settings_arg = "default"
+
         self._predictor = load_predict_unit(
-            model_path, inference_settings="default", device=dev
+            model_path, inference_settings=self._inference_settings_arg, device=dev
         )
         ext = bool(getattr(self._predictor.inference_settings, "external_graph_gen", False))
         self._r_edges = ext
@@ -531,7 +614,18 @@ class UMABatchCalc:
         to a per-structure flexible-atom subspace (None = full Hessian); frozen
         atoms still appear in every replica and exert forces (exact constrained-PES
         Hessian block).
+
+        Mode dispatch (OPT-IN): ``hessian_mode='autograd'`` routes to the exact
+        energy-graph double-backward Hessian; ANY failure hard-falls to the
+        numerical FD body below (the default + parity oracle).
         """
+        # OPT-IN autograd Hessian; on any error fall through to the numerical oracle.
+        if self.hessian_mode == "autograd":
+            try:
+                return self._efh_gpu_autograd(movable_masks)
+            except Exception:
+                pass
+
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
@@ -678,3 +772,231 @@ class UMABatchCalc:
             H_eV * EV2HARTREE,
             P,
         )
+
+    # ===================================================================== #
+    # OPT-IN autograd (energy-graph double-backward) Hessian + batched HVP.  #
+    # All of the below is reachable ONLY via hessian_mode='autograd' / hvp() #
+    # and never touches the default numerical path above.                    #
+    # Refs: Yuan et al. Nat. Commun. 2024 DOI 10.1038/s41467-024-52481-5;    #
+    # fairchem compute_hessian_vmap (uma/outputs.py); MACE compute_hessians_ #
+    # vmap (ACEsuit/mace, issue #488); eager-only per pytorch#91469.         #
+    # ===================================================================== #
+    def _warn_autograd_once(self):
+        """One-time RuntimeWarning about the eSCN double-backward accuracy caveat."""
+        if not self._warned_autograd:
+            import warnings as _warnings
+            _warnings.warn(
+                "UMABatchCalc autograd mode: the autograd Hessian/HVP is self-"
+                "consistent but the eSCN-MoE backbone's custom ops give an INCOMPLETE "
+                "double-backward (~1e-2 Ha/A^2, delta-independent, vs numerical FD). "
+                "Use hessian_mode='numerical' (default) for an accurate UMA Hessian. "
+                "See module docstring ACCURACY CAVEAT.",
+                RuntimeWarning, stacklevel=2)
+            self._warned_autograd = True
+
+    def _collate_proc(self, data, preds):
+        """Collate task-keyed model outputs -> {'energy':(B,), 'forces':(N,3)}.
+
+        Mirrors fairchem's ``collate_predictions`` (per-system / per-atom gather)
+        but keeps the autograd graph (we run the model under ``enable_grad``,
+        bypassing ``predict``'s ``no_grad`` + ``.clone()`` which would detach the
+        position leaf). ``preds`` already had ``normalizer.denorm`` + element-ref
+        undo applied by ``_process_outputs``; both are affine in positions so the
+        second derivative is exact up to the (positive) denorm scale they carry.
+        """
+        from collections import defaultdict
+        pu = self._predictor
+        collated = defaultdict(list)
+        for i, dataset in enumerate(data.dataset):
+            for task in pu.dataset_to_tasks[dataset]:
+                if task.level == "system":
+                    collated[task.property].append(preds[task.name][i].unsqueeze(0))
+                elif task.level == "atom":
+                    collated[task.property].append(preds[task.name][data.batch == i])
+        return {prop: torch.cat(val) for prop, val in collated.items()}
+
+    def _forward_fall_graph(self, coord_leaf):
+        """ONE grad-enabled forward at ``coord_leaf`` (N,3, requires_grad, f32).
+
+        Returns ``(E_eV (B,), F_all (N,3))`` where ``F_all`` is the energy graph's
+        force field, carrying a graph w.r.t. ``coord_leaf`` for a further backward
+        (Hessian / HVP):
+          * conservative UMA-omol (``direct_forces=False``): the model's energy
+            HEAD computes ``forces = -grad(E, pos, create_graph=self.training)``
+            INTERNALLY and, in eval, frees the energy graph -- so we flip ONLY the
+            head modules to ``training=True`` (``create_graph=True``) so
+            ``out['forces']`` (= ``-dE/dx``) is itself twice-differentiable
+            (fairchem's ``predict_untrained_hessian`` trick). The backbone + MoE
+            router stay in EVAL: MoE expert routing depends on ``self.training``
+            (escn_moe.py), so flipping the whole model would change the energy;
+            head-only flip keeps the energy byte-identical to the numerical predict
+            and makes ``d^2E/dx^2`` the exact second derivative of THAT energy;
+          * direct-force head: ``out['forces']`` is a first-order function of the
+            positions; differentiating it once reproduces the FD-of-direct-forces
+            Hessian exactly.
+        Either way ``F_all = out['forces']`` (the SAME force field the numerical
+        path differentiates). Model is run EAGER (no compile/cuEq) under
+        ``torch.enable_grad()``; train mode only flips ``self.training`` (UMA-eSCN
+        has no dropout/batchnorm), so energy/force VALUES are unchanged.
+        """
+        pu = self._predictor
+        # Ensure fairchem's lazy init ran (prepare_for_inference: eval mode, MOLE
+        # merge, graph-gen, activation_checkpointing flag) before the direct model
+        # call -- the autograd path may be the very first forward on this predictor.
+        if not getattr(pu, "lazy_model_intialized", False):
+            with torch.no_grad():
+                ad0 = self._to_device(self._clone_batch())
+                ad0.pos = self.coord.to(device=self.device, dtype=torch.float32)
+                pu.predict(ad0)
+        ad = self._to_device(self._clone_batch())
+        ad.pos = coord_leaf.to(device=self.device, dtype=torch.float32)
+        model = pu.model
+        # Flip ONLY the head modules to training=True (so their internal
+        # autograd.grad uses create_graph=True); keep backbone + MoE in eval so the
+        # energy is identical to the numerical predict (MoE routing is training-
+        # dependent: escn_moe.py). Restore afterwards.
+        flipped = [m for m in model.modules()
+                   if ("Head" in type(m).__name__) and (m.training is False)]
+        try:
+            for m in flipped:
+                m.training = True
+            with torch.enable_grad():
+                output = model(ad)
+                proc = pu._process_outputs(ad, output, True)
+                out = self._collate_proc(ad, proc)
+        finally:
+            for m in flipped:
+                m.training = False
+        E_eV = out["energy"].reshape(-1)
+        if ("forces" in out) and out["forces"].requires_grad:
+            F_all = out["forces"].reshape(self.N_atoms, 3)
+        else:
+            # no differentiable force field (energy-only model): differentiate the
+            # energy externally (works when the model does not free its own graph).
+            g = torch.autograd.grad(E_eV.sum(), coord_leaf, create_graph=True)[0]
+            F_all = -g
+        return E_eV, F_all
+
+    def _efh_gpu_autograd(self, movable_masks=None):
+        """Energy + forces + per-structure AUTOGRAD Hessian (double-backward).
+
+        Reverse-mode: seed a RESPONSE DOF and the backward fills that Hessian ROW.
+        ``F_all`` is the energy graph's force field (``-dE/dx``, create_graph=True)
+        for the conservative UMA-omol, so ``H[i, r, k] = -dF_r/dx_k = d^2E/dx^2``,
+        exactly the quantity the numerical FD path differentiates -> same return
+        contract / padded block-diagonal layout / sign / units. Seeds are
+        block-diagonal so ONE backward per local DOF index fills the row for every
+        molecule at once (the molecule batching). ``movable_masks`` restricts
+        perturbed/responding DOFs identically to the numerical path. Optional
+        ``torch.vmap`` over the seed basis when ``hessian_chunk_size`` is set (MACE
+        ``compute_hessians_vmap`` pattern) with a per-row loop fallback.
+        """
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return (
+                torch.zeros(0, dtype=dtype, device=device),
+                torch.zeros((0, 0), dtype=dtype, device=device),
+                torch.zeros((0, 0, 0), dtype=dtype, device=device),
+                torch.zeros(0, dtype=torch.int64, device=device),
+            )
+
+        self._warn_autograd_once()
+        nmax_a, nmax = self.Nmax_atoms, self.nmax_dof
+        N = self.N_atoms
+        ptr = self._ptr.tolist()
+        mov = self._resolve_movable(movable_masks)        # per-mol movable atom idx
+
+        # ONE grad-enabled forward; F_all carries the graph for the 2nd backward.
+        coord_leaf = self.coord.detach().to(torch.float32).requires_grad_(True)
+        E_eV, F_all = self._forward_fall_graph(coord_leaf)
+        E_eV = E_eV.to(dtype)
+
+        # padded forces -- F_all is the SAME force field the numerical Hessian
+        # differentiates (conservative F_all=-dE/dx=F; direct F_all=F_head=F), so
+        # this scatter is byte-equivalent to get_ef_gpu's force output.
+        F_pad = torch.zeros((B, nmax), dtype=dtype, device=device)
+        if N > 0:
+            F_pad.reshape(-1)[self._cols] = F_all.reshape(-1).to(dtype)
+
+        H = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
+        P = (nmax_a - self._n_b).to(torch.int64)
+
+        # local response-DOF index ld = 3*slot + c over the movable-atom slots;
+        # owners[ld] = list of (mol i, real local atom idx ap) that own slot.
+        n_movable_max = max((len(m) for m in mov), default=0)
+        K = 3 * n_movable_max
+        seeds, owners = [], {}
+        for ld in range(K):
+            slot, c = ld // 3, ld % 3
+            go = torch.zeros((N, 3), dtype=F_all.dtype, device=device)
+            own = []
+            for i in range(B):
+                if slot < len(mov[i]):
+                    ap = mov[i][slot]
+                    go[ptr[i] + ap, c] = 1.0
+                    own.append((i, ap))
+            seeds.append(go)
+            owners[ld] = own
+
+        def _scatter(ld, col):
+            slot, c = ld // 3, ld % 3
+            for (i, ap) in owners[ld]:
+                r = 3 * ap + c                            # response row DOF index
+                # fill row r across the molecule's movable column atoms:
+                for aq in mov[i]:
+                    H[i, r, 3 * aq:3 * aq + 3] = -col[ptr[i] + aq, :].to(dtype)
+
+        if self._hessian_chunk_size is not None and K > 0:
+            GO = torch.stack(seeds, dim=0)                # (K,N,3)
+
+            def _get_vjp(v):
+                return torch.autograd.grad(F_all, coord_leaf, grad_outputs=v,
+                                           retain_graph=True, create_graph=False)[0]
+
+            COLS = torch.vmap(_get_vjp, in_dims=0, out_dims=0,
+                              chunk_size=int(self._hessian_chunk_size))(GO)
+            for ld in range(K):
+                _scatter(ld, COLS[ld])
+        else:
+            for ld in range(K):
+                col = torch.autograd.grad(F_all, coord_leaf, grad_outputs=seeds[ld],
+                                          retain_graph=True, create_graph=False)[0]
+                _scatter(ld, col)
+
+        H = 0.5 * (H + H.transpose(1, 2))                 # symmetrize
+        return (E_eV * EV2HARTREE, F_pad * EV2HARTREE, H * EV2HARTREE, P)
+
+    def hvp(self, v: torch.Tensor) -> torch.Tensor:
+        """Batched Hessian-vector product ``H @ v`` via energy double-backward.
+
+        Block-diagonal per system; ONE forward + TWO backward, no dense Hessian:
+        ``g = dE/dx (create_graph=True); Hn = -grad((F_all . v).sum(), x)`` which
+        equals ``grad((g . v).sum(), x) = d^2E/dx^2 . v`` for the conservative
+        model (and ``-d(F_head)/dx . v`` for a direct head -- the matching
+        FD-of-forces operator). ``v`` is ``(B, nmax_dof)`` padded (forces layout);
+        returns ``Hn`` ``(B, nmax_dof)`` [Ha/A^2]. Consumed by the BPRFO iterative
+        eigensolver (sibling agent). Ref: Yuan et al. Nat. Commun. 2024,
+        DOI 10.1038/s41467-024-52481-5.
+        """
+        assert self._prepared, "call prepare() first"
+        self._warn_autograd_once()
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return torch.zeros((0, 0), dtype=dtype, device=device)
+        assert v.shape == (B, self.nmax_dof), \
+            f"hvp expects v (B,{self.nmax_dof}), got {tuple(v.shape)}"
+        coord_leaf = self.coord.detach().to(torch.float32).requires_grad_(True)
+        _E, F_all = self._forward_fall_graph(coord_leaf)
+        # gather padded v -> per-atom (N,3) using the same flat-column map as forces
+        if self.N_atoms > 0:
+            v_atom = v.to(device, F_all.dtype).reshape(-1)[self._cols].reshape(self.N_atoms, 3)
+        else:
+            v_atom = torch.zeros((0, 3), dtype=F_all.dtype, device=device)
+        Hn_atom = -torch.autograd.grad((F_all * v_atom).sum(), coord_leaf,
+                                       retain_graph=False)[0]
+        Hn_pad = torch.zeros((B, self.nmax_dof), dtype=dtype, device=device)
+        if self.N_atoms > 0:
+            Hn_pad.reshape(-1)[self._cols] = Hn_atom.reshape(-1).to(dtype)
+        return Hn_pad * EV2HARTREE
