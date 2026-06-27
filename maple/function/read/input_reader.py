@@ -1,5 +1,6 @@
 import os
 import re
+from pathlib import Path
 from typing import Any, List, Union
 
 from ase import Atoms
@@ -15,6 +16,7 @@ from .header.header import print_banner
 
 from maple.function.utility import Molecules
 from maple.function.timer import timer
+from maple.function.dispatcher.md.logger import _backup_file
 
 class InputReader():
     def __init__(self):
@@ -72,10 +74,10 @@ class InputReader():
                 self.output = os.path.splitext(self.input)[0] + ".out"
                 self.output = os.path.abspath(self.output)
 
-            # Remove existing output file if present
-            if os.path.exists(self.output):
-                os.remove(self.output)
-            
+            # Back up existing output file using GROMACS-style numbering
+            output_path = Path(self.output)
+            _backup_file(output_path)
+
             print_banner(self.output)
 
             # ------------------------------------------------------------------
@@ -94,9 +96,10 @@ class InputReader():
             with open(self.input, 'r') as f:
                 raw_lines = f.readlines()
 
-            # Regex used to detect coordinate-like lines.
-            # Matches "Elem x y z" (4 columns) or "Elem x y z vx vy vz" (7 columns,
-            # the latter produced by MD trajectory frames that include velocities).
+            # Regex used to detect coordinate-like lines while splitting sections.
+            # It matches standard inline structure lines "Elem x y z" and also the
+            # legacy 7-column shape "Elem x y z vx vy vz" so the inline parser can
+            # raise a clear error instead of silently truncating velocity columns.
             atom_line_re = re.compile(
                 r'^\s*([A-Za-z][a-z]?)\s+'
                 r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
@@ -114,7 +117,24 @@ class InputReader():
 
             def is_xyz_ref(s: str) -> bool:
                 upper = s.upper()
-                return (upper.startswith('XYZ ') or upper.startswith('XYZTRAJ ')) and len(s.split(maxsplit=1)) == 2
+                return upper.startswith('XYZ ') or upper.startswith('XYZTRAJ ')
+
+            def is_scan_postproc_line(s: str) -> bool:
+                tokens = s.split()
+                if not tokens or tokens[0].upper() != 'S' or len(tokens) not in (5, 6, 7):
+                    return False
+                try:
+                    for idx, token in enumerate(tokens[1:], 1):
+                        if idx == len(tokens) - 2:
+                            float(token)
+                        else:
+                            int(token)
+                except ValueError:
+                    return False
+                return True
+
+            def is_valid_inline_atom_line(s: str) -> bool:
+                return atom_line_re.match(s) is not None and len(s.split()) in (4, 7)
 
             def is_coord_like(s: str) -> bool:
                 if s == '' or s == '&':
@@ -145,17 +165,32 @@ class InputReader():
             while i < n and raw_lines[i].strip() == '':
                 i += 1
 
+            is_scan_input = any(line.lstrip().lower().startswith("#scan") for line in settings)
+
             # === 2) MOLECULES ===
             molecules = []
+            seen_molecule_line = False
+            after_molecule_blank = False
             while i < n:
                 line = raw_lines[i].rstrip('\n')
                 s = line.strip()
                 if s == '':
                     molecules.append(line)
+                    if seen_molecule_line:
+                        after_molecule_blank = True
                     i += 1
                     continue
+                if (
+                    is_scan_input
+                    and seen_molecule_line
+                    and is_scan_postproc_line(s)
+                    and (after_molecule_blank or not is_valid_inline_atom_line(s))
+                ):
+                    break
                 if is_coord_like(s):
                     molecules.append(s)
+                    seen_molecule_line = True
+                    after_molecule_blank = False
                     i += 1
                     continue
                 # First non-coordinate-like line marks end of molecule block
@@ -267,8 +302,18 @@ class InputReader():
 
     def log_error(self, error_message: str) -> None:
         """Logs error messages to the output file."""
-        with open(self.output, 'a') as file:
-            file.write(f"ERROR: {error_message}\n")
+        if not self.output:
+            return
+        line = f"ERROR: {error_message}\n"
+        try:
+            if os.path.exists(self.output):
+                with open(self.output, 'r', encoding='utf-8', errors='replace') as file:
+                    if line in file.read():
+                        return
+            with open(self.output, 'a', encoding='utf-8') as file:
+                file.write(line)
+        except Exception:
+            return
 
     def log_info(self, info_message: list) -> None:
         """Logs info messages to the output file."""
@@ -362,8 +407,10 @@ class InputReader():
             List[Atoms]: if multiple structures are present (will be converted to Molecules in __call__)
         """
 
-        # Regex for atomic line: element + 3 position floats + up to 3 optional velocity floats.
-        # Matches both "Elem x y z" (plain XYZ) and "Elem x y z vx vy vz" (MD with velocities).
+        # Regex for inline atomic line: element + 3 position floats, with optional
+        # legacy extra columns only so we can detect and reject inline velocity input
+        # explicitly. Formal inline/XYZ structure input is coordinates-only; velocity
+        # restoration must go through RST state loading.
         atom_pattern = re.compile(
             r'^\s*([A-Za-z][a-z]?)\s+'
             r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
@@ -460,15 +507,13 @@ class InputReader():
 
                             atoms_list.append(atoms)
 
-                        # Multiple structures from multiple files
-
-                        # group_counter += 1
-                        # info_message.append(f"\nGroup {group_counter} (from file: {file_path})\n")
-                        # info_message.append('-' * 20 + '\n')
-                        # syms = atoms.get_chemical_symbols()
-                        # poss = atoms.get_positions()
-                        # for i, (e, (x, y, z)) in enumerate(zip(syms, poss), start=1):
-                        #     info_message.append(f"{i:<4} {e:<2} {x:>20.6f} {y:>20.6f} {z:>20.6f}\n")
+                            group_counter += 1
+                            info_message.append(f"\nGroup {group_counter} (from file: {file_path})\n")
+                            info_message.append('-' * 20 + '\n')
+                            syms = atoms.get_chemical_symbols()
+                            poss = atoms.get_positions()
+                            for i, (e, (x, y, z)) in enumerate(zip(syms, poss), start=1):
+                                info_message.append(f"{i:<4} {e:<2} {x:>20.6f} {y:>20.6f} {z:>20.6f}\n")
                     continue
 
                 # Case 2: mixed XYZ + inline in the same block -> force user to split
@@ -481,7 +526,6 @@ class InputReader():
                 # Case 3: inline coordinates
                 elements: List[str] = []
                 coords: List[tuple] = []
-                velocities_inline: List[tuple] = []
                 charge = None
                 mult = None
 
@@ -497,31 +541,36 @@ class InputReader():
                         if mult < 1:
                             raise ValueError(f"Invalid multiplicity: {mult}. Must be >= 1")
 
-                # Parse atomic coordinates (and optional velocities in columns 5-7)
-                _float_re = re.compile(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
+                # Parse inline atomic coordinates. Formal inline structure input is
+                # still position-based, but we also detect the legacy 7-column form
+                # "Elem x y z vx vy vz" so we can warn clearly that those velocity
+                # columns are ignored for runtime state initialization. Velocity/state
+                # restoration must use RST via load_state/restart + rst_file.
+                inline_velocity_detected = False
                 for line in tokens:
                     m = atom_pattern.match(line)
                     if not m:
                         raise ValueError(f"Invalid element or coordinate line: '{line}'")
+
+                    parts = line.split()
+                    if len(parts) not in (4, 7):
+                        raise ValueError(
+                            "Inline atomic lines must be either 'Elem x y z' or "
+                            "'Elem x y z vx vy vz'. "
+                            f"Offending line: '{line}'"
+                        )
+                    if len(parts) == 7:
+                        inline_velocity_detected = True
+
                     elem = m.group(1)
                     x = float(m.group(2))
                     y = float(m.group(3))
                     z = float(m.group(4))
                     elements.append(elem)
                     coords.append((x, y, z))
-                    # Detect velocity columns (7-column format: Elem x y z vx vy vz)
-                    all_nums = _float_re.findall(line[line.index(m.group(1)) + len(m.group(1)):])
-                    if len(all_nums) == 6:
-                        velocities_inline.append(tuple(float(v) for v in all_nums[3:6]))
 
                 # Create Atoms object
                 atoms = Atoms(symbols=elements, positions=np.array(coords, dtype=np.float64))
-
-                # If all atom lines carried velocity columns, store them in atoms.arrays.
-                # The MD ensembles check for 'velocities' in atoms.arrays when
-                # init_velocities=False, so these will be used automatically.
-                if len(velocities_inline) == len(elements):
-                    atoms.arrays['velocities'] = np.array(velocities_inline, dtype=np.float64)
 
                 # Store charge and multiplicity if provided
                 if charge is not None:
@@ -543,6 +592,15 @@ class InputReader():
                 info_message.append(f"\nGroup {group_counter} (inline)\n")
                 if charge is not None and mult is not None:
                     info_message.append(f"Charge: {charge}, Multiplicity: {mult}\n")
+                if inline_velocity_detected:
+                    info_message.append(
+                        "WARNING: Detected inline/XYZ velocity columns (Elem x y z vx vy vz). "
+                        "These velocities are ignored and will not be used as formal runtime state input.\n"
+                    )
+                    info_message.append(
+                        "WARNING: MD will regenerate velocities at runtime. "
+                        "To restore velocities/state, use RST via load_state/restart + rst_file.\n"
+                    )
                 info_message.append('-' * 20 + '\n')
                 for i, (e, (x, y, z)) in enumerate(zip(elements, coords), start=1):
                     info_message.append(f"{i:<4} {e:<2} {x:>20.6f} {y:>20.6f} {z:>20.6f}\n")

@@ -1,0 +1,175 @@
+
+**********************************************************************
+*                                                                    *
+*                        M   A   P   L   E                           *
+*                                                                    *
+*      MAchine-learning Potential for Landscape Exploration          *
+*                                                                    *
+*                                                                    *
+*      © 2025 University of Pittsburgh. All rights reserved.         *
+*      Licensed under CC BY 4.0 for academic use.                    *
+*                                                                    *
+*      Principal Developer:  Xujian Wang                             *
+*                                                                    *
+**********************************************************************
+
+
+Parsing # commands...
+Global parameter: model = macepol-s
+Task set to 'opt'
+Global parameter: device = cpu
+Parsed configuration:
+----------------------------------------
+Task: opt
+model          : macepols
+method         : lbfgs
+device         : cpu
+
+                             Coordinates                              
+**********************************************************************
+
+Group 1 (inline)
+--------------------
+1    O              0.000000             0.000000             0.117790
+2    H              0.000000             0.755450            -0.471160
+3    H              0.000000            -0.755450            -0.471160
+
+======================================================================
+LBFGS Parameters
+======================================================================
+memory:     5
+curvature:  70.0
+max_step:   0.2
+max_iter:   256
+write_traj: False
+traj_every: 1
+verbose:    1
+======================================================================
+
+
+----------------------------------------------------------------------
+                             Iteration: 1                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    O                0.0000               0.0000               0.1138
+1    H                0.0000               0.7533              -0.4692
+2    H                0.0000              -0.7533              -0.4692
+
+
+Energy:                  -76.451501 Convergence criteria  Is converged 
+Maximum Force:             0.628904     0.002850  No
+RMS Force:                 0.531715     0.001900  No
+Maximum Displacement:      0.003947     0.003150  No
+RMS Displacement:          0.003300     0.002100  No
+
+----------------------------------------------------------------------
+                             Iteration: 2                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    O                0.0000              -0.0000               0.1209
+1    H                0.0000               0.7570              -0.4727
+2    H                0.0000              -0.7570              -0.4727
+
+
+Energy:                  -76.451671 Convergence criteria  Is converged 
+Maximum Force:             0.011463     0.002850  No
+RMS Force:                 0.008112     0.001900  No
+Maximum Displacement:      0.007041     0.003150  No
+RMS Displacement:          0.005840     0.002100  No
+
+----------------------------------------------------------------------
+                             Iteration: 3                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    O                0.0000              -0.0000               0.1210
+1    H                0.0000               0.7570              -0.4728
+2    H                0.0000              -0.7570              -0.4728
+
+
+Energy:                  -76.451662 Convergence criteria  Is converged 
+Maximum Force:             0.003448     0.002850  No
+RMS Force:                 0.003420     0.001900  No
+Maximum Displacement:      0.000132     0.003150  Yes
+RMS Displacement:          0.000093     0.002100  Yes
+
+----------------------------------------------------------------------
+                             Iteration: 4                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    O                0.0000              -0.0000               0.1211
+1    H                0.0000               0.7570              -0.4728
+2    H                0.0000              -0.7570              -0.4728
+
+
+Energy:                  -76.451662 Convergence criteria  Is converged 
+Maximum Force:             0.003506     0.002850  No
+RMS Force:                 0.002864     0.001900  No
+Maximum Displacement:      0.000071     0.003150  Yes
+RMS Displacement:          0.000065     0.002100  Yes
+
+----------------------------------------------------------------------
+                             Iteration: 5                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    O                0.0000              -0.0000               0.1212
+1    H                0.0000               0.7568              -0.4729
+2    H                0.0000              -0.7568              -0.4729
+
+
+Energy:                  -76.451662 Convergence criteria  Is converged 
+Maximum Force:             0.001149     0.002850  Yes
+RMS Force:                 0.001225     0.001900  Yes
+Maximum Displacement:      0.000136     0.003150  Yes
+RMS Displacement:          0.000130     0.002100  Yes
+
+----------------------------------------------------------------------
+                             Iteration: 5                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    O                0.0000              -0.0000               0.1212
+1    H                0.0000               0.7568              -0.4729
+2    H                0.0000              -0.7568              -0.4729
+
+
+Energy:                  -76.451662 Convergence criteria  Is converged 
+Maximum Force:             0.001149     0.002850  Yes
+RMS Force:                 0.001225     0.001900  Yes
+Maximum Displacement:      0.000136     0.003150  Yes
+RMS Displacement:          0.000130     0.002100  Yes
+
+LBFGS converged at iteration 5. Final frame written to /home/user/software/MAPLE/examples/opt/macepol/inp1_opt.xyz
+Complete trajectory written to /home/user/software/MAPLE/examples/opt/macepol/inp1_traj.xyz
+
+
+
+Program started: 2026-03-26 18:09:18
+
+======================================================================
+                      TIMING SUMMARY
+======================================================================
+Input Reading.......................................   0.001 s  (   0.1 %)
+  Settings Parsing....................................   0.000 s  (  22.9 %)
+  Coordinate Section Parsing..........................   0.000 s  (  20.9 %)
+  Post-Processing Expansion...........................   0.000 s  (   0.4 %)
+MLP Initialization..................................   0.406 s  (  32.6 %)
+Job Dispatching.....................................   0.837 s  (  67.3 %)
+  Optimization........................................   0.837 s  (  99.9 %)
+======================================================================
+Total wall time: 1.244 s
+Total CPU time: 1.245 s
+======================================================================
+
+Program ended: 2026-03-26 18:09:19
+TOTAL RUN TIME: 0 days 0 hours 0 minutes 1 seconds 244 msec

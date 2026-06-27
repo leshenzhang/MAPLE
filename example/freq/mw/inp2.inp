@@ -1,8 +1,0 @@
-#model=ANI-1xnr
-#freq(verbosity=10)
-#device=gpu0
-
-XYZ /home/user/software/MAPLE/example/freq/mw/inp1.xyz
-
-
-

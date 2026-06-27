@@ -14,7 +14,6 @@ from .logger import *
 
 def RFO(atoms: Atoms, output):
 	sys.setrecursionlimit(1000)
-	g_au = 27.211386024367243
 	max_iter = 256  # 最大迭代次数
 	max_step_size = 0.1  # 最大步长
 	iteration = 0  # 初始化迭代计数
@@ -60,7 +59,6 @@ def RFO(atoms: Atoms, output):
 			x = scale_down(x, max_step_size)
 		
 		#detalE = predict_energy_change(x, lambda_val, eigvals, gradient)
-		#deltaE = detalE/g_au
 
 
 		# Step 5: 更新几何结构
@@ -84,17 +82,17 @@ def RFO(atoms: Atoms, output):
 				coord = atom.position 
 				info_message.append(f"{atom_index:<4} {element_type:<2} {coord[0]:>20.4f} {coord[1]:>20.4f} {coord[2]:>20.4f}\n")
 
-			info_message.append(f"\n\nEnergy:                {energy/g_au:>12.6f} Convergence criteria  Is converged \n")
+			info_message.append(f"\n\nEnergy:                {energy:>12.6f} Convergence criteria  Is converged \n")
 
 			if atoms.max_f > atoms.f_max_th:
-				info_message.append(f"Maximum Force:         {atoms.max_f/g_au:>12.6f} {atoms.f_max_th/g_au:>12.6f}                No\n")
+				info_message.append(f"Maximum Force:         {atoms.max_f:>12.6f} {atoms.f_max_th:>12.6f}                No\n")
 			else:
-				info_message.append(f"Maximum Force:         {atoms.max_f/g_au:>12.6f} {atoms.f_max_th/g_au:>12.6f}                Yes\n")
+				info_message.append(f"Maximum Force:         {atoms.max_f:>12.6f} {atoms.f_max_th:>12.6f}                Yes\n")
 
 			if atoms.rms_f > atoms.f_rms_th:
-				info_message.append(f"RMS Force:             {atoms.rms_f/g_au:>12.6f} {atoms.f_rms_th/g_au:>12.6f}                No\n")
+				info_message.append(f"RMS Force:             {atoms.rms_f:>12.6f} {atoms.f_rms_th:>12.6f}                No\n")
 			else:
-				info_message.append(f"RMS Force:             {atoms.rms_f/g_au:>12.6f} {atoms.f_rms_th/g_au:>12.6f}                Yes\n")
+				info_message.append(f"RMS Force:             {atoms.rms_f:>12.6f} {atoms.f_rms_th:>12.6f}                Yes\n")
 
 			if atoms.max_dp > atoms.dp_max_th:
 				info_message.append(f"Maximum Displacement:  {atoms.max_dp:>12.6f} {atoms.dp_max_th:>12.6f}                No\n")

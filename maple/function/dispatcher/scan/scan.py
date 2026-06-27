@@ -19,10 +19,10 @@ class Scan(JobABC):
                  constraints: Optional[list] = None, params: Optional[dict] = None):
         super().__init__(output)
         self.atoms = atoms
-        self.initial_calc = atoms.calc
-        self.method = method.upper() if method is not None else "LBFGS"
         self.output = output
         self.params = params if params is not None else {}
+        self.initial_calc = atoms.calc
+        self.method = str(method or self.params.get("method") or "lbfgs").lower()
         self.mode = str(self.params.get("mode", "relaxed")).lower()
         if self.mode not in ("relaxed", "rigid"):
             raise ValueError(f"mode must be 'relaxed' or 'rigid', got: {self.mode}")
@@ -184,14 +184,13 @@ class Scan(JobABC):
         """Run geometry optimization."""
         if self.mode == "rigid":
             return atoms
-        self.params["verbose"] = 0  # suppress optimizer output
-        
-        if self.method == "LBFGS":
-            from maple.function.dispatcher.optimization.algorithm import LBFGS
-            run = LBFGS(atoms, output=self.output, paras=self.params)
-            return run.run()
-        else:
-            raise ValueError(f"Only LBFGS is supported for scan, got: {self.method}")
+        from maple.function.dispatcher.optimization import Optimization
+
+        params = dict(self.params)
+        params["method"] = self.method
+        params["verbose"] = 0  # suppress optimizer output inside each scan point
+        params["log_final_paths"] = False  # scan removes per-point optimizer temp files
+        return Optimization(params=params, output=self.output, atoms=atoms).run()
 
     def _record_result(self, atoms: Atoms, coord: List[float],
                        coords_list: list, energies: list):
@@ -384,7 +383,7 @@ class Scan(JobABC):
             self.log_info(["=" * 70])
             self.log_info([f"\nScan completed! Total points: {len(energies)}"])
             self.log_info([f"Results saved to: {xyz_filename}\n"])
-            self.log_info([f"Energy range: {min(energies):.6f} to {max(energies):.6f} eV\n"])
+            self.log_info([f"Energy range: {min(energies):.6f} to {max(energies):.6f} Hartree\n"])
             
         finally:
             if self.xyz_file is not None:
@@ -401,7 +400,7 @@ class Scan(JobABC):
     def _cleanup_opt_files(output_path):
         from pathlib import Path
         base, _ = os.path.splitext(str(output_path))
-        for f in (base + "_opt.xyz", base + "_traj.xyz"):
+        for f in (base + "_opt.xyz", base + "_opt_traj.xyz"):
             Path(f).unlink(missing_ok=True)
 
     def _build_connectivity(self, atoms: Atoms):

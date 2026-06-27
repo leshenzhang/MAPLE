@@ -1,5 +1,0 @@
-#model=uma
-#md(ensemble=nve, timestep=1.0, steps=10, temperature=300)
-#device=cpu
-
-XYZ 0 1 /home/user/software/MAPLE/example/md/nve/pbc_cu.xyz

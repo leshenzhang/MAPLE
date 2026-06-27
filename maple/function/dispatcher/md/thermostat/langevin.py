@@ -1,43 +1,27 @@
 """
-Langevin thermostat for NVT molecular dynamics.
+LFMiddle Langevin thermostat for NVT molecular dynamics.
 
-The Langevin equation adds a friction term and a random force to Newton's
-equations of motion, coupling the system to a heat bath at temperature T:
+This module implements the thermostat-only Ornstein-Uhlenbeck (OU) velocity
+update used in the LFMiddle formulation discussed by Leimkuhler & Matthews,
+J. Chem. Phys. 138, 174102 (2013), and by Zhang et al., J. Phys. Chem. A 123,
+6056-6079 (2019):
 
-    m * a = F_conservative - γ * m * v + F_random
+    v' = c1 * v + c2 * xi
+    c1 = exp(-gamma * dt)
+    c2 = sqrt((1 - c1**2) * k_B * T / m)
+    xi ~ N(0,1)
 
-where:
-    γ       = friction coefficient (1/fs)
-    F_random ~ N(0, sqrt(2 * γ * m * k_B * T / dt))
-
-This is integrated using the BAOAB splitting scheme (Leimkuhler & Matthews):
-    B: half-step velocity update with conservative force
-    A: half-step position update
-    O: full Ornstein-Uhlenbeck step (thermostat)
-    A: half-step position update
-    B: half-step velocity update with new conservative force
-
-Center-of-mass (COM) treatment for isolated systems
-----------------------------------------------------
-In Langevin dynamics each atom receives an independent random impulse, so
-the net force on the COM is non-zero at every step.  For isolated (non-PBC)
-systems this excites COM translational motion and thermostatises all 3N
-degrees of freedom — including the 3 COM modes — biasing the instantaneous
-temperature high by a factor 3N/(3N-3).
-
-To maintain consistency with calculate_temperature() which uses N_dof = 3N-3
-for isolated molecules, the COM velocity is removed from the output of each
-O-step.  This is the same approach used by OpenMM (CMMotionRemover, default
-frequency=1) and GROMACS (comm-mode=Linear, nstcomm=100).
-
-For periodic systems the COM has no physical meaning and is left unchanged.
+The surrounding LFMiddle splitting is handled outside this thermostat. In the
+current codebase, the full sequence is assembled in the ensemble layer using
+LF-middle carried velocities rather than exposing the textbook BAOAB half-step
+notation directly in this module. This module does not apply COM or angular-
+motion projection. If runtime motion projection is desired, it must be handled
+by the caller or by an ensemble-level policy outside this thermostat.
 
 References
 ----------
-Leimkuhler & Matthews, Appl. Math. Res. eXpress 2013, 34-56.  (BAOAB)
-Basconi & Shirts, J. Chem. Theory Comput. 9, 2887 (2013).     (N_dof accounting)
-OpenMM CMMotionRemover documentation.                          (COM removal)
-GROMACS Reference Manual, comm-mode / nstcomm.                 (COM removal)
+Leimkuhler & Matthews, J. Chem. Phys. 138, 174102 (2013).
+Zhang et al., J. Phys. Chem. A 123, 6056-6079 (2019).
 """
 
 import numpy as np
@@ -49,15 +33,14 @@ from ..utils import AMU_TO_AU, FS_TO_AU, KELVIN_TO_HARTREE
 
 class LangevinThermostat:
     """
-    Langevin thermostat using BAOAB splitting.
+    LFMiddle Langevin thermostat.
 
-    Applies the Ornstein-Uhlenbeck (O) step between the two velocity
-    half-steps of Velocity Verlet to provide canonical (NVT) sampling.
-
-    For isolated (non-periodic) systems, the COM velocity is removed after
-    each O-step so that N_dof = 3N-3 gives the correct temperature,
-    consistent with calculate_temperature().  For periodic systems no COM
-    correction is applied.
+    Applies the thermostat-only Ornstein-Uhlenbeck velocity update used by the
+    LFMiddle formulation. The complete splitting is assembled in the ensemble
+    layer; this class only implements the OU thermostat substep for the
+    LF-middle carried-velocity representation. This class does not apply COM or
+    angular-motion projection; if such runtime projection is desired, it
+    remains a caller- or ensemble-level policy outside this thermostat.
     """
 
     def __init__(
@@ -84,29 +67,34 @@ class LangevinThermostat:
         """
         self.atoms       = atoms
         self.temperature = temperature
-        self.friction    = friction * FS_TO_AU           # 1/fs → 1/a.u.
+        # NOTE: `timestep` is converted to atomic units below. The matching unit
+        # treatment for `friction` must be kept consistent so that γ·dt remains
+        # dimensionless in the OU factor exp(-γ·dt); verify carefully if this
+        # line is ever changed.
+        self.friction    = friction / FS_TO_AU           # 1/fs → 1/a.u.
         self.timestep    = timestep * FS_TO_AU           # fs   → a.u.
         self.masses      = atoms.get_masses() * AMU_TO_AU  # amu → a.u.
         self.rng         = rng if rng is not None else np.random.default_rng()
 
-        # COM removal applies only to isolated (non-periodic) systems.
-        self._fix_com = not any(atoms.pbc)
-
-        # Precompute BAOAB O-step coefficients (constant throughout run):
-        #   c1 = exp(-γ dt)                   (friction decay factor)
-        #   c2 = sqrt((1 - c1²) kT / m)       (noise amplitude, per atom)
+        # Motion projection is handled by the ensemble-level central policy.
+        # Precompute OU coefficients for the LFMiddle thermostat step:
+        #   c1 = exp(-γ dt)
+        #   c2 = sqrt((1 - c1²) k_B T / m)
         kT        = self.temperature * KELVIN_TO_HARTREE
-        self._c1  = np.exp(-self.friction * self.timestep)                    # scalar
-        self._c2  = np.sqrt((1.0 - self._c1**2) * kT / self.masses)          # (N_atoms,)
+        self._c1  = np.exp(-self.friction * self.timestep)
+        self._c2  = np.sqrt((1.0 - self._c1**2) * kT / self.masses)
 
     def apply(self, velocities: np.ndarray) -> np.ndarray:
         """
-        Apply the Ornstein-Uhlenbeck (O) step to velocities.
+        Apply the LFMiddle Ornstein-Uhlenbeck thermostat step to velocities.
 
-            v_new = c1 * v + c2 * ξ,   ξ ~ N(0, 1)
+        This method does not apply COM or angular-motion projection; any such
+        runtime constraint is the caller's responsibility.
 
-        For isolated systems the COM velocity is subsequently removed so that
-        the 3 translational modes do not contribute to the measured temperature.
+            v' = c1 * v + c2 * xi,   xi ~ N(0, 1)
+
+        Any runtime COM or angular projection is applied by the ensemble-level
+        central motion policy after the thermostat step.
 
         Parameters
         ----------
@@ -120,9 +108,4 @@ class LangevinThermostat:
         """
         noise = self.rng.standard_normal(velocities.shape)
         v_new = self._c1 * velocities + self._c2[:, np.newaxis] * noise
-
-        if self._fix_com:
-            com_vel = (self.masses[:, np.newaxis] * v_new).sum(axis=0) / self.masses.sum()
-            v_new  -= com_vel
-
         return v_new

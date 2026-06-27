@@ -162,11 +162,23 @@ cython_debug/
 #.idea/
 *.pt
 *.model
-*.claude/
-*claude/
+
+# Local assistant workspace artifacts
+/.claude/
+/claude/
 .worktrees/
+/AGENTS.md
+/CLAUDE.md
 
 # MD example outputs (large run data)
-example/md/**/*.out
-example/md/**/*.dat
-example/md/**/*.xyz
+examples/md/**/*.out
+examples/md/**/*.dat
+examples/md/**/*.xyz
+
+# Local automation/session artifacts
+/.omc/
+/docs/
+
+# Generated explicit-solvent example outputs
+examples/opt/exp-solv/*.out
+examples/opt/exp-solv/*.xyz

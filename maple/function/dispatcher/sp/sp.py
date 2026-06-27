@@ -1,22 +1,17 @@
-import numpy as np
 from typing import Union, List, Optional
 from dataclasses import dataclass
 
-from torch import Tensor
 from ase import Atoms
 
 from ..jobABC import JobABC
 from maple.function.timer import timer
-from maple.function.utility.molecules import Molecules
 
 @dataclass
 class SPParams:
     """Parameters for Single Point calculation."""
-    verbose: int = 1  # 0=energy only, 1=detailed (default), 2=no coordinates
+    verbose: int = 0  # 0=coordinates+energy+charge/mult, 1=+gradients
 
 class SinglePoint(JobABC):
-
-    eV2Hartree = 1 / 27.211386245988
 
     def __init__(self, output: str, atoms: Union[Atoms, List[Atoms]],
                  paras: Optional[dict] = None):
@@ -37,9 +32,60 @@ class SinglePoint(JobABC):
     def _run_single(self):
         """Original single-point calculation logic."""
         with timer("Single Point Energy Calculation"):
-            energy_ev = self.atoms.get_potential_energy()
-            energy_hartree = energy_ev * self.eV2Hartree
-            self.log_info([f"\nEnergy: {energy_hartree:.10f} Hartree\n"])
+            energy = self.atoms.get_potential_energy()
+            self.log_info(self._single_energy_lines(energy))
+
+    def _single_energy_lines(self, energy: float) -> list:
+        """Return single-structure SP result lines for the selected verbosity."""
+        lines = ["\n"]
+        lines.extend(self._charge_mult_lines(self.atoms))
+        lines.append(f"Energy: {energy:.10f} Hartree\n")
+        if self.verbose >= 1:
+            lines.extend(self._gradient_lines(self.atoms))
+        return lines
+
+    def _charge_mult_lines(self, atoms: Atoms) -> list:
+        """Return charge and multiplicity metadata lines for SP output."""
+        charge = atoms.info.get('charge', 0)
+        mult = atoms.info.get('mult', 1)
+        return [f"Charge: {charge}, Multiplicity: {mult}\n"]
+
+    def _gradient_lines(self, atoms: Atoms) -> list:
+        """Return per-atom energy gradients for detailed SP output."""
+        forces = atoms.get_forces()
+        gradients = -forces
+        symbols = atoms.get_chemical_symbols()
+        lines = [
+            "\nGradients (Hartree/Angstrom):\n",
+            "  Gradient = -Force\n",
+            "  Atom  El"
+            "        Gx              Gy              Gz\n",
+        ]
+        for i, (sym, gradient) in enumerate(zip(symbols, gradients), start=1):
+            lines.append(
+                f"  {i:<4} {sym:<2}"
+                f" {gradient[0]:>15.8f} {gradient[1]:>15.8f} {gradient[2]:>15.8f}\n"
+            )
+        return lines
+
+    def _trajectory_frame_lines(self, idx: int, atoms_frame: Atoms, energy_hartree: float) -> list:
+        """Return trajectory-frame SP result lines for the selected verbosity."""
+        lines = [
+            f"\n{('Frame ' + str(idx)):=^80}\n",
+        ]
+        lines.extend(self._charge_mult_lines(atoms_frame))
+        lines.extend([
+            f"Energy: {energy_hartree:.10f} Hartree\n\n",
+            "Coordinates (Angstrom):\n",
+        ])
+        symbols = atoms_frame.get_chemical_symbols()
+        positions = atoms_frame.get_positions()
+        for i, (sym, pos) in enumerate(zip(symbols, positions), start=1):
+            lines.append(f"  {i:<4} {sym:<2} {pos[0]:>15.8f} {pos[1]:>15.8f} {pos[2]:>15.8f}\n")
+        if self.verbose >= 1:
+            lines.extend(self._gradient_lines(atoms_frame))
+        lines.append("=" * 80 + "\n")
+        return lines
 
     def _run_trajectory(self):
         """Process multiple structures sequentially."""
@@ -52,44 +98,10 @@ class SinglePoint(JobABC):
 
             for idx, atoms_frame in enumerate(self.atoms, start=1):
                 # Calculate energy
-                energy_ev = atoms_frame.get_potential_energy()
-                energy_hartree = energy_ev * self.eV2Hartree
+                energy_hartree = atoms_frame.get_potential_energy()
                 energies_hartree.append(energy_hartree)
 
-                # Output based on verbose level
-                if self.verbose == 0:
-                    # Minimal: only energy
-                    self.log_info([f"Frame {idx:4d}: {energy_hartree:.10f} Hartree\n"])
-
-                elif self.verbose == 1:
-                    # Detailed: frame header + charge/mult + energy + coordinates
-                    self.log_info([f"\n{('Frame ' + str(idx)):=^80}\n"])
-
-                    charge = atoms_frame.info.get('charge', 0)
-                    mult = atoms_frame.info.get('mult', 1)
-                    self.log_info([f"Charge: {charge}, Multiplicity: {mult}\n"])
-
-                    self.log_info([f"Energy: {energy_hartree:.10f} Hartree\n\n"])
-
-                    # Coordinates
-                    self.log_info(["Coordinates (Angstrom):\n"])
-                    symbols = atoms_frame.get_chemical_symbols()
-                    positions = atoms_frame.get_positions()
-                    for i, (sym, pos) in enumerate(zip(symbols, positions), start=1):
-                        self.log_info([
-                            f"  {i:<4} {sym:<2} {pos[0]:>15.8f} {pos[1]:>15.8f} {pos[2]:>15.8f}\n"
-                        ])
-                    self.log_info(["=" * 80 + "\n"])
-
-                elif self.verbose == 2:
-                    # Medium: frame header + charge/mult + energy (no coordinates)
-                    self.log_info([f"\n{('Frame ' + str(idx)):=^80}\n"])
-
-                    charge = atoms_frame.info.get('charge', 0)
-                    mult = atoms_frame.info.get('mult', 1)
-                    self.log_info([f"Charge: {charge}, Multiplicity: {mult}\n"])
-                    self.log_info([f"Energy: {energy_hartree:.10f} Hartree\n"])
-                    self.log_info(["=" * 80 + "\n"])
+                self.log_info(self._trajectory_frame_lines(idx, atoms_frame, energy_hartree))
 
             # Summary (always shown)
             self.log_info([f"\n{' SUMMARY ':=^80}\n"])

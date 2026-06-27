@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Optional, TextIO, Any
 from ase import Atoms
 
-from .utils import write_xyz_frame
+from .utils import (
+    VELOCITY_REPR_STANDARD,
+    normalize_velocity_representation,
+    set_atoms_velocity_representation,
+    write_xyz_frame,
+)
 from .rst_io import read_rst, rotate_rst_checkpoint
 from .dcd_writer import DCDWriter
 
@@ -82,8 +87,6 @@ class MDLogger:
         traj_every: Trajectory write frequency (steps)
     """
 
-    eV2Hartree = 1 / 27.211386245988
-
     def __init__(
         self,
         output_path: str,
@@ -91,6 +94,7 @@ class MDLogger:
         traj_every: int = 10,
         verbose: int = 1,
         traj_format: str = "xyz",
+        debug: bool = False,
     ):
         """
         Initialize MD logger.
@@ -104,12 +108,14 @@ class MDLogger:
                            1 = GROMACS-style progress line every log_every steps
                            2 = verbose (step-level timing detail)
             traj_format: Trajectory output format: "xyz" (text) or "dcd" (binary)
+            debug:       Enable one-shot restart/load_state diagnostics
         """
         self.main_output = output_path
         self.log_every   = log_every
         self.traj_every  = traj_every
         self.verbose      = verbose
         self.traj_format  = traj_format.lower()
+        self.debug        = debug
 
         # Generate file paths
         base   = Path(output_path).stem
@@ -131,10 +137,17 @@ class MDLogger:
         self.temperatures        = []
         self.times               = []
         self.pressures           = []   # NPT only
-        self.kinetic_energies    = []   # for KE–PE anti-correlation
-        self.potential_energies  = []   # for KE–PE anti-correlation
+        self.kinetic_energies    = []   # raw KE history
+        self.potential_energies  = []   # raw PE history
+        self.analysis_energies   = []   # summary/progress energy history (sync when available)
+        self.analysis_temperatures = [] # summary/progress temperature history (sync when available)
+        self.analysis_kinetic_energies = []  # summary/progress KE history (sync when available)
+        self.analysis_label      = "raw"
+        self.conserved_energies  = []   # V-rescale conserved-energy history: H̃ = H − ΣΔW_external
         self._n_atoms            = 0    # set in start_simulation
-        self._is_pbc             = False  # set in start_simulation; affects N_dof
+        self._is_pbc             = False  # set in start_simulation; affects fallback N_dof
+        self._n_dof_override: Optional[int] = None
+        self._dof_description: Optional[str] = None
 
         # Performance / progress tracking (set in start_simulation)
         self._n_steps:    int   = 0
@@ -148,10 +161,62 @@ class MDLogger:
 
         # RNG state restored from the last trajectory frame on resume (None if not present)
         self.resumed_rng_state: Optional[str] = None
+        self.resumed_velocity_representation: str = VELOCITY_REPR_STANDARD
+        self.resumed_timestep: Optional[float] = None
+        self.velocity_representation: str = VELOCITY_REPR_STANDARD
+        # Fresh-start backup should not archive checkpoint files that are being
+        # used as explicit rst_file inputs for the current run.
+        self._protected_restart_inputs: set[Path] = set()
+
+    def log_debug_initial_state(self, atoms: Atoms, velocities: np.ndarray,
+                                mode: str, effective_step: int,
+                                source: Optional[str] = None,
+                                rst_step: Optional[int] = None,
+                                velocity_representation: Optional[str] = None):
+        if not self.debug:
+            return
+
+        from .utils import calculate_kinetic_energy, calculate_temperature
+
+        forces = atoms.get_forces()
+        kinetic_energy = calculate_kinetic_energy(atoms, velocities)
+        potential_energy = atoms.get_potential_energy()
+        temperature_inst = calculate_temperature(atoms, velocities)
+        atom0_pos = atoms.get_positions()[0]
+        atom0_vel = velocities[0]
+        atom0_force = forces[0]
+
+        lines = [
+            "\n[MD_DEBUG_INIT]\n",
+            f"  mode:             {mode}\n",
+            f"  effective_step:   {effective_step}\n",
+            f"  atom0_pos(A):     [{atom0_pos[0]: .10f}, {atom0_pos[1]: .10f}, {atom0_pos[2]: .10f}]\n",
+            f"  atom0_vel(au):    [{atom0_vel[0]: .10f}, {atom0_vel[1]: .10f}, {atom0_vel[2]: .10f}]\n",
+            f"  atom0_force(Ha/A):[{atom0_force[0]: .10f}, {atom0_force[1]: .10f}, {atom0_force[2]: .10f}]\n",
+            f"  PE(Ha):           {potential_energy: .12f}\n",
+            f"  KE(Ha):           {kinetic_energy: .12f}\n",
+            f"  T(K):             {temperature_inst: .6f}\n",
+        ]
+        if source is not None:
+            lines.insert(2, f"  source:           {source}\n")
+        if rst_step is not None:
+            insert_at = 3 if source is not None else 2
+            lines.insert(insert_at, f"  rst_step:         {rst_step}\n")
+        if velocity_representation is not None:
+            normalized = normalize_velocity_representation(velocity_representation)
+            insert_at = 4 if (source is not None and rst_step is not None) else (3 if (source is not None or rst_step is not None) else 2)
+            lines.insert(insert_at, f"  velocity_repr:    {normalized}\n")
+
+        self.log_main(lines)
 
     def start_simulation(self, ensemble: str, timestep: float, n_steps: int,
                         temperature: float, atoms: Atoms,
-                        pressure: float = None, step_offset: int = 0):
+                        pressure: float = None, step_offset: int = 0,
+                        velocity_representation: str = VELOCITY_REPR_STANDARD,
+                        n_dof: Optional[int] = None,
+                        dof_description: Optional[str] = None,
+                        write_sync_thermo: bool = False,
+                        write_conserved_energy: bool = False):
         """
         Initialize output files and write headers.
 
@@ -163,12 +228,23 @@ class MDLogger:
             atoms: ASE Atoms object
             pressure: Target pressure in bar (NPT only)
             step_offset: Step number already completed (for resume)
+            velocity_representation: Velocity semantics used for stored velocities.
+            write_sync_thermo: Append sync-corrected thermo columns for
+                Langevin LF-Middle carried-velocity runs.
+            write_conserved_energy: Append conserved-energy columns for
+                ensembles/thermostats that define one explicitly.
         """
         self._ensemble    = ensemble.lower()
+        self.velocity_representation = normalize_velocity_representation(velocity_representation)
+        set_atoms_velocity_representation(atoms, self.velocity_representation)
         self._n_atoms     = len(atoms)
         self._is_pbc      = bool(any(atoms.pbc))
         self._timestep    = timestep
         self._step_offset = step_offset
+        self._n_dof_override = n_dof
+        self._dof_description = dof_description
+        self._write_sync_thermo = bool(write_sync_thermo)
+        self._write_conserved_energy = bool(write_conserved_energy)
         # Total steps across the full run (for progress %)
         self._n_steps     = n_steps + step_offset
 
@@ -180,8 +256,16 @@ class MDLogger:
         if step_offset == 0:
             # Open files (back up any pre-existing files first, GROMACS-style)
             backup_msgs = []
-            main_out_path = Path(self.main_output)
-            for p in (main_out_path, self.thermo_path, self.traj_path, self.summary_path, self.final_path):
+            for p in (
+                self.thermo_path,
+                self.traj_path,
+                self.summary_path,
+                self.final_path,
+                self.rst_path,
+                self.rst_prev_path,
+            ):
+                if p in self._protected_restart_inputs:
+                    continue
                 backup = _backup_file(p)
                 if backup is not None:
                     backup_msgs.append(f"  Backed up existing file: {p.name} -> {backup.name}\n")
@@ -210,6 +294,7 @@ class MDLogger:
             f"Timestep:        {timestep:.3f} fs\n",
             f"Total steps:     {total_steps_display}\n",
             f"Simulation time: {total_steps_display * timestep:.2f} fs\n",
+            f"Velocity repr:   {self.velocity_representation}\n",
         ])
 
         if step_offset > 0:
@@ -248,6 +333,19 @@ class MDLogger:
                     f"{'KE(Ha)':>15} {'PE(Ha)':>15} {'TE(Ha)':>15} "
                     f"{'Press(bar)':>12} {'Vol(A^3)':>12}\n"
                 )
+            elif self._ensemble == 'nvt':
+                header = (
+                    f"# {'Step':>8} {'Time(fs)':>12} {'Temp(K)':>12} "
+                    f"{'KE(Ha)':>15} {'PE(Ha)':>15} {'TE(Ha)':>15}"
+                )
+                if self._write_sync_thermo:
+                    header += (
+                        f" {'Temp_sync(K)':>15} {'KE_sync(Ha)':>15} {'TE_sync(Ha)':>15}"
+                    )
+                elif self._write_conserved_energy:
+                    header += f" {'H_cons_ext(Ha)':>15}"
+                header += "\n"
+                self.thermo_file.write(header)
             else:
                 self.thermo_file.write(
                     f"# {'Step':>8} {'Time(fs)':>12} {'Temp(K)':>12} "
@@ -266,14 +364,16 @@ class MDLogger:
             hdr = (
                 f"\n"
                 f"  {'Step':>9}  {'Time(ps)':>{_time_col_w}}  {'Progress':>8}  "
-                f"{'T(K)':>8}  {'E_total(Ha)':>15}  "
-                f"{'Speed(ns/day)':>13}  {'ETA':>10}"
+                f"{'T(K)':>8}  {'E_total(Ha)':>15}"
+                + (f"  {'H_cons_ext(Ha)':>15}" if self._write_conserved_energy else "")
+                + f"  {'Speed(ns/day)':>13}  {'ETA':>10}"
                 + (f"  {'P(bar)':>10}" if is_npt else "")
             )
             sep = (
                 f"  {'-'*9}  {'-'*_time_col_w}  {'-'*8}  "
-                f"{'-'*8}  {'-'*15}  "
-                f"{'-'*13}  {'-'*10}"
+                f"{'-'*8}  {'-'*15}"
+                + (f"  {'-'*15}" if self._write_conserved_energy else "")
+                + f"  {'-'*13}  {'-'*10}"
                 + (f"  {'-'*10}" if is_npt else "")
             )
             self._time_col_w = _time_col_w
@@ -290,7 +390,12 @@ class MDLogger:
                  total_energy: float, atoms: Atoms, velocities: np.ndarray,
                  pressure: float = None, volume: float = None,
                  rng_state: Optional[str] = None,
-                 rst_every: Optional[int] = None):
+                 rst_every: Optional[int] = None,
+                 conserved_energy: Optional[float] = None,
+                 velocity_representation: Optional[str] = None,
+                 temperature_sync: Optional[float] = None,
+                 kinetic_energy_sync: Optional[float] = None,
+                 total_energy_sync: Optional[float] = None):
         """
         Log data for current step.
 
@@ -306,34 +411,74 @@ class MDLogger:
             pressure: Instantaneous pressure in bar (NPT only)
             volume: Cell volume in Å³ (NPT only)
             rng_state: Hex-encoded RNG state to embed in trajectory frame (NVT/NPT only)
+            conserved_energy: V-rescale conserved-energy bookkeeping value
+                H̃ = H − ΣΔW_external (Hartree). For pure thermostat dynamics this
+                reduces to the Bussi 2007 Eq. 15 form; when runtime COM/angular
+                projection is enabled it also includes the projection KE change.
+                None for NVE or Langevin thermostat.
+            velocity_representation: Label describing the semantics of ``velocities``.
+            temperature_sync: Sync-corrected temperature (K) for optional thermo output.
+            kinetic_energy_sync: Sync-corrected kinetic energy (Hartree).
+            total_energy_sync: Sync-corrected total energy (Hartree).
         """
+        velocity_representation = normalize_velocity_representation(
+            velocity_representation or self.velocity_representation
+        )
+        self.velocity_representation = velocity_representation
+        set_atoms_velocity_representation(atoms, velocity_representation)
+
         # PE and KE are both passed in Hartree (UMACalculator already converts)
         potential_energy_hartree = potential_energy
         kinetic_energy_hartree = kinetic_energy
         total_energy_hartree = kinetic_energy_hartree + potential_energy_hartree
 
-        # Store for statistics
+        # Store raw values and analysis values separately.
+        analysis_temperature = temperature_sync if temperature_sync is not None else temperature
+        analysis_kinetic_energy = kinetic_energy_sync if kinetic_energy_sync is not None else kinetic_energy_hartree
+        analysis_total_energy = total_energy_sync if total_energy_sync is not None else total_energy_hartree
+        if temperature_sync is not None and kinetic_energy_sync is not None and total_energy_sync is not None:
+            self.analysis_label = "sync-corrected"
+
         self.energies.append(total_energy_hartree)
         self.temperatures.append(temperature)
         self.times.append(time)
         self.kinetic_energies.append(kinetic_energy_hartree)
         self.potential_energies.append(potential_energy_hartree)
+        self.analysis_energies.append(analysis_total_energy)
+        self.analysis_temperatures.append(analysis_temperature)
+        self.analysis_kinetic_energies.append(analysis_kinetic_energy)
+        if conserved_energy is not None:
+            self.conserved_energies.append(conserved_energy)
         if pressure is not None:
             self.pressures.append(pressure)
 
         # Write thermodynamic data every step
+        # H_cons column is included only for NVT with V-rescale (Bussi 2007 Eq. 15)
         if self._ensemble == 'npt' and pressure is not None and volume is not None:
             self.thermo_file.write(
                 f"{step:>10} {time:>12.3f} {temperature:>12.2f} "
                 f"{kinetic_energy_hartree:>15.8f} {potential_energy_hartree:>15.8f} "
                 f"{total_energy_hartree:>15.8f} {pressure:>12.3f} {volume:>12.4f}\n"
             )
-        else:
+        elif conserved_energy is not None:
             self.thermo_file.write(
                 f"{step:>10} {time:>12.3f} {temperature:>12.2f} "
                 f"{kinetic_energy_hartree:>15.8f} {potential_energy_hartree:>15.8f} "
-                f"{total_energy_hartree:>15.8f}\n"
+                f"{total_energy_hartree:>15.8f} {conserved_energy:>15.8f}\n"
             )
+        else:
+            line = (
+                f"{step:>10} {time:>12.3f} {temperature:>12.2f} "
+                f"{kinetic_energy_hartree:>15.8f} {potential_energy_hartree:>15.8f} "
+                f"{total_energy_hartree:>15.8f}"
+            )
+            if self._write_sync_thermo and temperature_sync is not None and kinetic_energy_sync is not None and total_energy_sync is not None:
+                line += (
+                    f" {temperature_sync:>15.2f} {kinetic_energy_sync:>15.8f}"
+                    f" {total_energy_sync:>15.8f}"
+                )
+            line += "\n"
+            self.thermo_file.write(line)
         self.thermo_file.flush()
 
         # ------------------------------------------------------------------
@@ -374,11 +519,15 @@ class MDLogger:
             progress_str = f"{progress_pct:.1f}%"
             current_ps   = time / 1000.0
             time_str     = f"{current_ps:.3f}/{self._total_ps:.3f}"
+            progress_temperature = temperature_sync if temperature_sync is not None else temperature
+            progress_total_energy = total_energy_sync if total_energy_sync is not None else total_energy_hartree
             line = (
                 f"  {step:>9}  {time_str:>{self._time_col_w}}  {progress_str:>8}  "
-                f"{temperature:>8.2f}  {total_energy_hartree:>15.6f}  "
-                f"{speed_str:>13}  {eta_str:>10}"
+                f"{progress_temperature:>8.2f}  {progress_total_energy:>15.6f}"
             )
+            if self._write_conserved_energy and conserved_energy is not None:
+                line += f"  {conserved_energy:>15.6f}"
+            line += f"  {speed_str:>13}  {eta_str:>10}"
             if self._ensemble == 'npt' and pressure is not None:
                 line += f"  {pressure:>10.2f}"
 
@@ -388,11 +537,14 @@ class MDLogger:
 
         # Also write to .dat file at log_every frequency (unchanged)
         if step % self.log_every == 0:
-            self.log_main([
+            line = (
                 f"  Step {step:>8}  {time:>10.2f} fs  "
                 f"T {temperature:>7.2f} K  "
-                f"E {total_energy_hartree:>14.6f} Ha\n"
-            ])
+                f"E {total_energy_hartree:>14.6f} Ha"
+            )
+            if self._write_conserved_energy and conserved_energy is not None:
+                line += f"  H_cons {conserved_energy:>14.6f} Ha"
+            self.log_main([line + "\n"])
 
         # Write trajectory at traj_every frequency.
         # frame_number stores the MD *step* number so that restart_simulation()
@@ -407,8 +559,10 @@ class MDLogger:
                     atoms,
                     energy=total_energy_hartree,
                     frame_number=step,          # MD step number, NOT sequential frame index
-                    velocity=velocities,
+                    velocity=velocities if self.debug else None,
+                    include_velocities=self.debug,
                     rng_state=rng_state,
+                    velocity_representation=velocity_representation,
                 )
                 self.traj_file.flush()
 
@@ -424,6 +578,7 @@ class MDLogger:
                 ensemble=self._ensemble,
                 energy=total_energy_hartree,
                 rng_state=rng_state,
+                velocity_representation=velocity_representation,
             )
 
     def restart_simulation(
@@ -435,36 +590,44 @@ class MDLogger:
         atoms: Atoms,
         pressure: float = None,
         rst_file: str = None,
+        load_state: bool = False,
     ):
         """
         Restore state from a .rst checkpoint file, validate against input atoms,
         open output files, and return (atoms, velocities, step_offset).
 
-        Two modes of operation:
+        Restore state from a .rst checkpoint file, validate against input atoms,
+        and return ``(atoms, velocities, step_offset)``.
 
-        1. **Resume** (rst_file=None):
-           Auto-detects ``{base}_md.rst`` / ``{base}_md_prev.rst``.
-           Strict validation: ensemble and timestep must match the checkpoint.
-           Returns step_offset from the checkpoint so the run continues.
+        Input selection modes:
 
-        2. **Load state** (rst_file="/path/to/other.rst"):
-           Reads the specified RST file (auto-appends ``.rst`` if missing).
-           Relaxed validation: ensemble and timestep may differ (NVT → NVE).
-           Always returns step_offset=0 (fresh run with loaded coordinates
-           and velocities).
+        1. **Auto-detect** (rst_file=None):
+           Search ``{base}_md.rst`` and ``{base}_md_prev.rst``.
 
-        Returns None if the checkpoint already completed the requested run
-        (resume mode only).
+        2. **Explicit checkpoint** (rst_file="/path/to/file.rst"):
+           Read the specified checkpoint file (auto-appends ``.rst`` if missing).
+
+        Semantic modes:
+
+        - ``restart=yes`` / ``load_state=no``:
+          Resume semantics. Checkpoint coordinates, velocities, and step count
+          are restored, so the run continues from the saved step.
+
+        - ``load_state=yes``:
+          Load-state semantics. Checkpoint coordinates and velocities are
+          restored, but the new run starts from step 0.
+
+        Returns None if a restart checkpoint already completed the requested run.
         Raises RuntimeError on hard failures (mismatch, missing files, etc.).
         """
         from ase.cell import Cell
 
         # ------------------------------------------------------------------
-        # Determine whether this is a resume or a cross-ensemble load
+        # Determine checkpoint source
         # ------------------------------------------------------------------
-        is_cross_load = rst_file is not None
+        has_explicit_rst = rst_file is not None
 
-        if is_cross_load:
+        if has_explicit_rst:
             # Resolve path: auto-append .rst if missing
             rst = Path(rst_file)
             if rst.suffix == '':
@@ -475,6 +638,8 @@ class MDLogger:
             candidates = [rst]
         else:
             candidates = [self.rst_path, self.rst_prev_path]
+
+        self._protected_restart_inputs = set()
 
         state = None
         errors = []
@@ -507,18 +672,7 @@ class MDLogger:
                     f"Element mismatch between rst and input at position {idx}"
                 )
 
-        if is_cross_load:
-            # Cross-ensemble load: log the transition, skip ensemble/timestep checks
-            rst_ens = state["ensemble"].upper()
-            new_ens = ensemble.upper()
-            if state["ensemble"] != ensemble:
-                self.log_main([
-                    f"\nLoading state from {used_path.name} "
-                    f"({rst_ens} -> {new_ens} transition)\n",
-                ])
-            step_offset = 0
-        else:
-            # Resume: strict validation
+        if not load_state:
             if state["ensemble"] != ensemble:
                 raise RuntimeError(
                     f"Ensemble mismatch: rst has '{state['ensemble']}', "
@@ -540,18 +694,39 @@ class MDLogger:
                     atoms.set_positions(state["positions"])
                     if state["cell"] is not None:
                         atoms.set_cell(Cell.fromcellpar(state["cell"]))
+                    if state["pbc"] is not None:
+                        atoms.set_pbc(state["pbc"])
                     with open(self.final_path, 'w') as f:
                         write_xyz_frame(
                             f,
                             atoms=atoms,
                             energy=state["energy"],
                             frame_number=state["step"],
-                            velocity=state["velocities"],
+                            velocity=state["velocities"] if self.debug else None,
+                            include_velocities=self.debug,
+                            velocity_representation=state.get("velocity_representation"),
                         )
                     self.log_main([
                         f"  Exported final structure: {self.final_path.name}\n"
                     ])
                 return None
+
+        if has_explicit_rst and used_path in (self.rst_path, self.rst_prev_path):
+            self._protected_restart_inputs = {self.rst_path, self.rst_prev_path}
+
+        if load_state:
+            if self.debug:
+                self.log_main([
+                    f"\nLoading state from explicit checkpoint: {used_path.name} "
+                    f"(start new run from step 0)\n",
+                ])
+            step_offset = 0
+        else:
+            if has_explicit_rst and self.debug:
+                self.log_main([
+                    f"\nRestarting from explicit checkpoint: {used_path.name} "
+                    f"(resume from step {state['step']})\n",
+                ])
             step_offset = state["step"]
 
         # Restore atoms state
@@ -563,17 +738,30 @@ class MDLogger:
 
         # Store RNG state for ensemble drivers (NVT/NPT) to restore
         self.resumed_rng_state = state.get("rng_state")
+        self.resumed_velocity_representation = normalize_velocity_representation(
+            state.get("velocity_representation")
+        )
+        self.resumed_timestep = state["timestep"]
+        self.velocity_representation = self.resumed_velocity_representation
+        set_atoms_velocity_representation(atoms, self.velocity_representation)
+
+        self.log_debug_initial_state(
+            atoms=atoms,
+            velocities=state["velocities"],
+            mode="load_state" if load_state else "restart",
+            source=str(used_path),
+            rst_step=state["step"],
+            effective_step=step_offset,
+            velocity_representation=self.velocity_representation,
+        )
 
         # ------------------------------------------------------------------
-        # Open output files
-        #
-        # Cross-ensemble load (rst_file=...): step_offset=0 → start_simulation()
-        #   will open files fresh, so we do NOT open them here.
-        # Resume (same ensemble):  step_offset>0 → start_simulation() skips
-        #   file opening, so we MUST open in append mode here.
+        # Open output files only for resume semantics.
+        # start_simulation(step_offset>0) skips file opening, so resume mode
+        # must append here. load_state starts a fresh run and therefore relies
+        # on start_simulation(step_offset=0) to open clean output files.
         # ------------------------------------------------------------------
-        if not is_cross_load:
-            # Resume: append to existing output files
+        if not load_state:
             self.thermo_file = (open(self.thermo_path, "a") if self.thermo_path.exists()
                                 else open(self.thermo_path, "w"))
             if self.traj_format == 'dcd':
@@ -598,7 +786,8 @@ class MDLogger:
         return atoms, state["velocities"], step_offset
 
     def end_simulation(self, atoms: Atoms = None, final_velocities: np.ndarray = None,
-                       rng_state: str = None):
+                       rng_state: str = None,
+                       velocity_representation: Optional[str] = None):
         """
         Finalize simulation, compute publication-quality conservation metrics,
         write summary file, and write final restart checkpoint.
@@ -615,16 +804,27 @@ class MDLogger:
         rng_state : str, optional
             Hex-encoded RNG state (for NVT/NPT). Written to RST checkpoint
             for deterministic continuation. NVE does not need this.
+        velocity_representation : str, optional
+            Label describing the semantics of ``final_velocities``.
         """
+        velocity_representation = normalize_velocity_representation(
+            velocity_representation or self.velocity_representation
+        )
+        self.velocity_representation = velocity_representation
+        if atoms is not None:
+            set_atoms_velocity_representation(atoms, velocity_representation)
+
         # End the \r progress line with a newline so the summary starts cleanly
         if self.verbose >= 1:
             print(flush=True)
 
-        energies     = np.array(self.energies)
-        temperatures = np.array(self.temperatures)
+        energies     = np.array(self.analysis_energies)
+        temperatures = np.array(self.analysis_temperatures)
         times        = np.array(self.times)          # fs
-        ke_arr       = np.array(self.kinetic_energies)
+        ke_arr       = np.array(self.analysis_kinetic_energies)
         pe_arr       = np.array(self.potential_energies)
+        has_conserved = len(self.conserved_energies) > 0
+        cons_arr     = np.array(self.conserved_energies) if has_conserved else None
 
         # ------------------------------------------------------------------
         # 1. Basic energy statistics  (full trajectory, no skip)
@@ -633,29 +833,37 @@ class MDLogger:
         energy_std  = np.std(energies)
 
         # ------------------------------------------------------------------
-        # 2. Linear drift rate via least-squares fit
-        #    Front 20% of trajectory skipped as equilibration.
+        # 2. Total energy drift from a full-trajectory linear fit.
+        #    Use all sampled points for robustness, then report the fitted
+        #    total change across the full trajectory in kcal/mol.
         # ------------------------------------------------------------------
-        EQ_FRAC   = 0.20
+        analysis_time_ps = (times[-1] - times[0]) * 1e-3 if len(times) >= 2 else 0.0
+        total_time_fs = (times[-1] - times[0]) if len(times) >= 2 else 0.0
 
-        eq_cut = max(1, int(len(times) * EQ_FRAC))
-        prod_times    = times[eq_cut:]
-        prod_energies = energies[eq_cut:]
-        prod_time_ns  = (prod_times[-1] - prod_times[0]) * FS_TO_NS if len(prod_times) >= 2 else 0.0
-        eq_time_ps    = (times[eq_cut - 1] - times[0]) * 1e-3
-
-        if len(prod_times) >= 2 and prod_time_ns > 0:
-            coef = np.polyfit(prod_times, prod_energies, 1)
-            drift_rate = (coef[0]
-                          * HARTREE_TO_KCAL_PER_MOL
-                          / FS_TO_NS)
+        if len(times) >= 2 and total_time_fs > 0:
+            coef = np.polyfit(times, energies, 1)
+            drift_value = coef[0] * total_time_fs * HARTREE_TO_KCAL_PER_MOL
         else:
-            drift_rate = float('nan')
+            drift_value = float('nan')
 
         # ------------------------------------------------------------------
         # 3. Relative energy fluctuation
         # ------------------------------------------------------------------
         rel_fluctuation = energy_std / abs(energy_mean) if energy_mean != 0 else float('nan')
+
+        # ------------------------------------------------------------------
+        # 3b. V-rescale conserved energy H̃ drift (Bussi 2007, Eq. 15)
+        #     H̃ = H − Σ ΔW should be constant; measure its drift by fitting the
+        #     full trajectory and reporting the fitted total change in kcal/mol.
+        # ------------------------------------------------------------------
+        if has_conserved and len(cons_arr) == len(times):
+            if len(times) >= 2 and total_time_fs > 0:
+                cons_coef = np.polyfit(times, cons_arr, 1)
+                cons_drift = cons_coef[0] * total_time_fs * HARTREE_TO_KCAL_PER_MOL
+            else:
+                cons_drift = float('nan')
+        else:
+            cons_drift = float('nan')
 
         # ------------------------------------------------------------------
         # 4. KE–PE correlation coefficient
@@ -671,10 +879,13 @@ class MDLogger:
         temp_mean = np.mean(temperatures)
         temp_std  = np.std(temperatures)
 
-        n_dof = (3 * self._n_atoms if (self._is_pbc or self._n_atoms == 0)
-                 else 3 * self._n_atoms - 3)
+        n_dof = self._n_dof_override
+        if n_dof is None:
+            n_dof = (3 * self._n_atoms if (self._is_pbc or self._n_atoms == 0)
+                     else 3 * self._n_atoms - 3)
         if n_dof <= 0:
             n_dof = 1
+        dof_description = self._dof_description or ('legacy fallback: PBC 3N' if self._is_pbc else 'legacy fallback: isolated 3N')
 
         observed_ratio = temp_std / temp_mean if temp_mean > 0 else float('nan')
 
@@ -683,14 +894,15 @@ class MDLogger:
         # ------------------------------------------------------------------
         is_nve = self._ensemble == 'nve'
         ens_label = self._ensemble.upper()
+        drift_metric_label = "H̃ drift" if has_conserved else "Energy drift"
+        drift_metric_value = cons_drift if has_conserved else drift_value
 
         if is_nve:
             energy_section = [
                 f"\n{'── [NVE] Energy Conservation ──':^80}\n",
                 f"  σ(TE)/|⟨TE⟩|:              {rel_fluctuation:>18.2e}\n",
-                f"  Linear drift rate:         {drift_rate:>+18.6f}  kcal/mol/ns\n",
-                f"  Production window:         {prod_time_ns*1000:>15.3f}  ps"
-                f"  (skipped first {eq_time_ps:.2f} ps as equilibration)\n",
+                f"  {drift_metric_label}:         {drift_metric_value:>+18.6f}  kcal/mol\n",
+                f"  Fit window:           {analysis_time_ps:>15.3f}  ps  (full trajectory)\n",
                 f"  r(KE,PE):                  {ke_pe_corr:>18.4f}\n",
             ]
             temp_section = [
@@ -698,14 +910,14 @@ class MDLogger:
                 f"  ⟨T⟩:                       {temp_mean:>18.2f}  K\n",
                 f"  σ(T):                      {temp_std:>18.2f}  K\n",
                 f"  σ(T)/<T>:                  {observed_ratio:>18.4f}\n",
-                f"  N_dof = {n_dof}  ({'PBC: 3N' if self._is_pbc else 'isolated: 3N-3'})\n",
+                f"  N_dof = {n_dof}  {dof_description}\n",
             ]
         else:
             energy_section = [
                 f"\n{'── [' + ens_label + '] Temperature Control ──':^80}\n",
                 f"  ⟨T⟩:                       {temp_mean:>18.2f}  K\n",
                 f"  σ(T):                      {temp_std:>18.2f}  K\n",
-                f"  N_dof = {n_dof}  ({'PBC: 3N' if self._is_pbc else 'isolated: 3N-3'})\n",
+                f"  N_dof = {n_dof}  {dof_description}\n",
                 f"  r(KE,PE):                  {ke_pe_corr:>18.4f}\n",
             ]
             temp_section = [
@@ -713,15 +925,21 @@ class MDLogger:
                 f"  Mean TE:                   {energy_mean:>18.8f}  Ha\n",
                 f"  σ(TE):                     {energy_std:>18.8f}  Ha\n",
                 f"  σ(TE)/|⟨TE⟩|:             {rel_fluctuation:>18.2e}\n",
-                f"  Linear drift rate:         {drift_rate:>+18.6f}  kcal/mol/ns\n",
-                f"  Production window:         {prod_time_ns*1000:>15.3f}  ps"
-                f"  (skipped first {eq_time_ps:.2f} ps as equilibration)\n",
+                f"  {drift_metric_label}:         {drift_metric_value:>+18.6f}  kcal/mol\n",
+                f"  Fit window:           {analysis_time_ps:>15.3f}  ps  (full trajectory)\n",
             ]
 
+        if has_conserved:
+            energy_label = "vrescale-conserved"
+        elif self.analysis_label == "sync-corrected":
+            energy_label = "lfmiddle-sync-corrected"
+        else:
+            energy_label = "vv-raw"
         summary_lines = [
             "\n" + "="*80 + "\n",
             f"{'MD SIMULATION COMPLETED':^80}\n",
             "="*80 + "\n",
+            f"  Energy reporting basis:    {energy_label:>18}\n",
 
             f"\n{'── Energy Statistics ──':^80}\n",
             f"  Mean total energy:         {energy_mean:>18.8f}  Ha\n",
@@ -765,7 +983,8 @@ class MDLogger:
             f.write(f"Total time:                 {self.times[-1]:.2f} fs\n")
             f.write(f"Number of atoms:            {self._n_atoms}\n")
             f.write(f"N_dof:                      {n_dof}  "
-                    f"({'PBC: 3N' if self._is_pbc else 'isolated: 3N-3'})\n\n")
+                    f"{dof_description}\n")
+            f.write(f"Energy reporting basis:     {energy_label}\n\n")
 
             f.write("Energy Statistics:\n")
             f.write(f"  Mean total energy:        {energy_mean:.8f} Ha\n")
@@ -774,9 +993,8 @@ class MDLogger:
             if is_nve:
                 f.write("Energy Conservation Metrics [NVE]:\n")
                 f.write(f"  σ(TE)/|⟨TE⟩|:            {rel_fluctuation:.2e}\n")
-                f.write(f"  Linear drift rate:        {drift_rate:+.6f} kcal/mol/ns\n")
-                f.write(f"  Production window:        {prod_time_ns*1000:.3f} ps"
-                        f"  (skipped first {eq_time_ps:.2f} ps as equilibration)\n")
+                f.write(f"  {drift_metric_label}:        {drift_metric_value:+.6f} kcal/mol\n")
+                f.write(f"  Fit window:          {analysis_time_ps:.3f} ps  (full trajectory)\n")
                 f.write(f"  r(KE,PE):                 {ke_pe_corr:.4f}\n\n")
 
                 f.write("Temperature Statistics:\n")
@@ -791,9 +1009,8 @@ class MDLogger:
 
                 f.write(f"Energy Metrics [{self._ensemble.upper()}]:\n")
                 f.write(f"  σ(TE)/|⟨TE⟩|:            {rel_fluctuation:.2e}\n")
-                f.write(f"  Linear drift rate:        {drift_rate:+.6f} kcal/mol/ns\n")
-                f.write(f"  Production window:        {prod_time_ns*1000:.3f} ps"
-                        f"  (skipped first {eq_time_ps:.2f} ps as equilibration)\n")
+                f.write(f"  {drift_metric_label}:        {drift_metric_value:+.6f} kcal/mol\n")
+                f.write(f"  Fit window:          {analysis_time_ps:.3f} ps  (full trajectory)\n")
 
             if self.pressures:
                 pressures_arr = np.array(self.pressures)
@@ -842,6 +1059,7 @@ class MDLogger:
                 ensemble=self._ensemble,
                 energy=final_energy,
                 rng_state=rng_state,
+                velocity_representation=velocity_representation,
             )
             final_written = True
 
@@ -856,7 +1074,9 @@ class MDLogger:
                     atoms=atoms,
                     energy=final_energy,
                     frame_number=final_step,
-                    velocity=final_velocities,
+                    velocity=final_velocities if self.debug else None,
+                    include_velocities=self.debug,
+                    velocity_representation=velocity_representation,
                 )
             final_xyz_written = True
 
@@ -866,7 +1086,7 @@ class MDLogger:
             f"  Trajectory:                 {self.traj_path.name}\n",
             f"  Summary:                    {self.summary_path.name}\n",
             *([f"  Final structure:           {self.final_path.name}\n"
-               f"    (Use as input for next stage with velocities)\n"]
+               f"    (Structure handoff only; strict restart state is in {self.rst_path.name})\n"]
               if final_xyz_written else []),
             *([f"  Checkpoint:                 {self.rst_path.name}\n"
                f"  Previous checkpoint:        {self.rst_prev_path.name}\n"]

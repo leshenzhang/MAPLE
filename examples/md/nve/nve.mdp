@@ -1,0 +1,24 @@
+; Minimal runnable gas-phase methane NVE example for MAPLE MD.
+; The input file intentionally references this file via #md(mdp=nve.mdp).
+
+integrator = md
+ensemble = nve
+
+timestep = 0.1      ; fs
+steps = 10          ; short example run
+temperature = 300.0 ; K, used only for initial velocities
+
+traj_every = 1
+log_every = 1
+traj_format = xyz
+
+init_velocities = yes
+restart = no
+load_state = no
+rst_every = 10
+
+remove_com = yes
+remove_angular = yes
+remove_com_every = 0
+remove_angular_every = 0
+random_seed = 12345

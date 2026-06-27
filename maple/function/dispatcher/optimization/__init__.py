@@ -1,2 +1,2 @@
 
-from .optimization import Optmization
+from .optimization import Optimization, Optmization

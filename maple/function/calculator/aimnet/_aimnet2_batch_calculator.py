@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+"""Out-of-scope for the unified MAPLE calculator protocol.
+
+Consumed by BatchLBFGS only; does not implement the CalcABC protocol
+(`_finalize_results`, `_analytic_hessian`, `MODEL_*` class attrs). Keep
+self-contained until a future commit retrofits the batch path.
+"""
 import torch
 from typing import List
 from ase import Atoms
@@ -197,6 +203,12 @@ class AIMNet2BatchCalc:
         a fixed padded size (self._nmax) across all iterations.
         """
         device, dtype = self.device, self.dtype
+        if any(bool(np.any(getattr(at, "pbc", False))) for at in atoms_list):
+            raise NotImplementedError(
+                "AIMNet2BatchCalc is a no-PBC batch wrapper; use a validated "
+                "periodic backend for periodic systems."
+            )
+
         self._atoms_B = len(atoms_list)
         self._ptr     = _ptr_from_atoms(atoms_list, device)
 
@@ -226,6 +238,16 @@ class AIMNet2BatchCalc:
         else:
             # PRFO-defined padded dimension
             self.nmax_dof = int(fixed_nmax)
+            required_dof = 3 * self.Nmax_atoms
+            if self.nmax_dof < required_dof:
+                raise ValueError(
+                    f"fixed_nmax={self.nmax_dof} is too small for the current batch; "
+                    f"need at least {required_dof} Cartesian DOFs."
+                )
+            if self.nmax_dof % 3 != 0:
+                raise ValueError(
+                    f"fixed_nmax={self.nmax_dof} is not a multiple of 3 Cartesian DOFs."
+                )
         # ----------------------------------------------------------------------
 
         if self.N_atoms > 0:

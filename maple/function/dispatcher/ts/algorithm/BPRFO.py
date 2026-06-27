@@ -73,7 +73,8 @@ class BatchPRFO:
                  max_inner_attempts: int = 10,
                  max_outer_iter: int = 256,
                  device: str = "cuda",
-                 recalc: int = 4):
+                 recalc: int = 4,
+                 hessian_update: str = "bofill"):
         self.trust_init = trust_init
         self.trust_min = trust_min
         self.trust_max = trust_max
@@ -82,7 +83,10 @@ class BatchPRFO:
         self.max_inner_attempts = max_inner_attempts
         self.max_outer_iter = max_outer_iter
         self.device = torch.device(device)
-        self.recalc = int(recalc)
+        self.recalc = max(1, int(recalc))
+        self.hessian_update = str(hessian_update).lower()
+        if self.hessian_update not in {"bofill", "bfgs"}:
+            raise ValueError("hessian_update must be 'bofill' or 'bfgs'.")
         
         self.output = os.path.abspath(output)
         self.out_dir = os.path.dirname(self.output) or "."
@@ -145,6 +149,7 @@ class BatchPRFO:
         self._open_log()
         self._w("# RS-PRFO batched TS search start\n")
         self._w(f"# RecalcFC interval: {self.recalc}\n")
+        self._w(f"# Hessian update method: {self.hessian_update}\n")
 
         self._init_xyz_paths(B0)
         self._symbols_per_batch = _symbols_flat(atoms_list)
@@ -259,14 +264,22 @@ class BatchPRFO:
 
             # Bofill update: apply ONLY if we didn't just recalculate AND at least one step was accepted
             if not need_recalc and step_accepted.any():
-                self._w(f"[Iter {outer_it}] Applying Bofill update to {step_accepted.sum().item()} batches\n")
-                self._H_work = self._bofill_update_batched(
+                self._w(
+                    f"[Iter {outer_it}] Applying {self.hessian_update.upper()} "
+                    f"update to {step_accepted.sum().item()} batches\n"
+                )
+                update_fn = (
+                    self._bfgs_update_batched
+                    if self.hessian_update == "bfgs"
+                    else self._bofill_update_batched
+                )
+                self._H_work = update_fn(
                     H=self._H_work,
                     s_cart=last_step,
                     g_prev=self._g_cart_prev,
                     g_new=g_new_cart,
                     real_mask=real_mask,
-                    step_accepted=step_accepted  # Pass acceptance mask
+                    step_accepted=step_accepted
                 )
 
             # Always update gradient buffer for next iteration
@@ -881,6 +894,44 @@ class BatchPRFO:
             s_part[b] = s_full
 
         return mu_out, s_part
+
+    @staticmethod
+    @torch.no_grad()
+    def _bfgs_update_batched(
+        H, s_cart, g_prev, g_new, real_mask,
+        step_accepted=None,
+        step_tol: float = 1e-8,
+        grad_tol: float = 1e-8,
+        curvature_tol: float = 1e-12,
+    ):
+        """Symmetric BFGS Hessian update for accepted batched PRFO steps."""
+        DTYPE = H.dtype
+        rm = real_mask.to(DTYPE)
+        mask_ij = (real_mask.unsqueeze(-1) & real_mask.unsqueeze(-2)).to(DTYPE)
+
+        s = s_cart.to(DTYPE) * rm
+        y = (g_new - g_prev).to(DTYPE) * rm
+        upd_mask = ((s * s).sum(-1) > step_tol**2) & ((y * y).sum(-1) > grad_tol**2)
+        if step_accepted is not None:
+            upd_mask = upd_mask & step_accepted
+        if not bool(upd_mask.any()):
+            return H
+
+        H_new = H.clone()
+        for b in upd_mask.nonzero(as_tuple=False).flatten().tolist():
+            sb = s[b]
+            yb = y[b]
+            ys = torch.dot(yb, sb)
+            if ys <= curvature_tol:
+                continue
+            Hs = H[b].matmul(sb)
+            sHs = torch.dot(sb, Hs)
+            if sHs <= curvature_tol:
+                continue
+            Hb = H[b] + torch.outer(yb, yb) / ys - torch.outer(Hs, Hs) / sHs
+            Hb = 0.5 * (Hb + Hb.transpose(-1, -2))
+            H_new[b] = Hb * mask_ij[b] + H_new[b] * (1.0 - mask_ij[b])
+        return H_new
 
     @staticmethod
     @torch.no_grad()

@@ -350,6 +350,63 @@ def calculate_Hessian(atoms: Atoms):
     H = calc.get_hessian(atoms)
     return to_numpy_f64(H)
 
+def _bfgs_update(H: np.ndarray, s: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """BFGS update of Hessian approximation."""
+    H = to_numpy_f64(H)
+    s = vec1d(s)
+    y = vec1d(y, s.size)
+    ys = float(y.dot(s))
+    if ys <= 1e-12:
+        return H
+    Hs = H.dot(s)
+    sHs = float(s.dot(Hs))
+    if sHs <= 1e-12:
+        return H
+    H_new = H + np.outer(y, y) / ys - np.outer(Hs, Hs) / sHs
+    return 0.5 * (H_new + H_new.T)
+
+def _bofill_update(H: np.ndarray, s: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    Bofill = mixed MS/SR1 + PSB.
+    If the SR1/MS denominator is unsafe, fall back to pure PSB.
+    """
+    H = to_numpy_f64(H)
+    s = vec1d(s)
+    y = vec1d(y, s.size)
+
+    s2 = float(np.dot(s, s))
+    y2 = float(np.dot(y, y))
+    if s2 <= 1e-16 or y2 <= 1e-16:
+        return H
+
+    # Residual: z = Δg - H Δx
+    z = y - H.dot(s)
+    z2 = float(np.dot(z, z))
+    sz = float(np.dot(s, z))
+
+    # PSB term is safe as long as s2 is nonzero, already guaranteed above.
+    psb = (
+        (np.outer(z, s) + np.outer(s, z)) / s2
+        - (sz / (s2 * s2)) * np.outer(s, s)
+    )
+
+    # if s·z is too small, do NOT divide by it; use pure PSB.
+    use_sr1 = (abs(sz) > 1e-8) and (z2 > 1e-16)
+
+    if use_sr1:
+        ms = np.outer(z, z) / sz
+        if s2 > 1e-16 and z2 > 1e-16:
+            ratio = (sz * sz) / (s2 * z2)
+            phi = float(np.clip(1.0 - ratio, 0.0, 1.0))
+        else:
+            phi = 1.0
+    else:
+        ms = np.zeros_like(H)
+        phi = 1.0
+
+    H_new = H + (1.0 - phi) * ms + phi * psb
+    return 0.5 * (H_new + H_new.T)
+
 # =============================================================================
 # ------------------------------- PRFO Parameters -----------------------------
 # =============================================================================
@@ -374,6 +431,8 @@ class PRFOParams:
     evals_eps: float = 1e-10               # Eigenvalue regularization threshold
     mu_margin: float = 1e-8                # Safety margin for bisection
     max_bisect_it: int = 60                # Maximum bisection iterations
+    recalc: int = 1                        # Exact Hessian recalculation interval
+    hessian_update: str = "bofill"         # Working Hessian update: bofill or bfgs
     
     # Convergence thresholds (should be set from atoms object)
     f_max_th: float = 9.5e-3               # Maximum force threshold (Eh/Angstrom)
@@ -403,6 +462,10 @@ class PRFO(JobABC):
 
         # Initialize params from paras dict
         self.params = self._init_params(PRFOParams, paras, ("prfo", "PRFO", "ts"))
+        self.params.recalc = max(1, int(self.params.recalc))
+        self.params.hessian_update = str(self.params.hessian_update).lower()
+        if self.params.hessian_update not in {"bofill", "bfgs"}:
+            raise ValueError("Hessian update method must be 'bofill' or 'bfgs'.")
 
         # Override convergence thresholds from atoms if available
         for attr in ('f_max_th', 'f_rms_th', 'dp_max_th', 'dp_rms_th'):
@@ -617,6 +680,8 @@ class PRFO(JobABC):
         # Log header
         info_message = [
             f"\nStarting Transition State Search (TS) with RS-PRFO...\n",
+            f"Hessian recalc interval: {self.params.recalc}; "
+            f"update method: {self.params.hessian_update}\n",
             f"Trust radius adaptation: eta_shrink={self.params.eta_shrink}, "
             f"eta_expand={self.params.eta_expand}\n",
             f"Convergence thresholds: "
@@ -626,6 +691,8 @@ class PRFO(JobABC):
             f"dp_rms={self.params.dp_rms_th:.6f}\n"
         ]
         log_info(info_message, self.output)
+
+        H_work = None
         
         # Main optimization loop
         while iteration < self.params.max_iter:
@@ -638,12 +705,19 @@ class PRFO(JobABC):
             F_cart = to_numpy_f64(atoms.get_forces())
             g_cart = vec1d(-F_cart)
             
-            # Get Hessian in Cartesian
-            H_cart = to_numpy_f64(calculate_Hessian(atoms))
-            if H_cart.ndim == 3 and H_cart.shape[0] == 1:
-                H_cart = H_cart[0]
-            if H_cart.ndim != 2 or H_cart.shape[0] != H_cart.shape[1]:
-                raise ValueError(f"Hessian must be square, got {H_cart.shape}")
+            need_recalc = (
+                H_work is None
+                or (iteration % self.params.recalc == 0)
+            )
+            if need_recalc:
+                H_cart = to_numpy_f64(calculate_Hessian(atoms))
+                if H_cart.ndim == 3 and H_cart.shape[0] == 1:
+                    H_cart = H_cart[0]
+                if H_cart.ndim != 2 or H_cart.shape[0] != H_cart.shape[1]:
+                    raise ValueError(f"Hessian must be square, got {H_cart.shape}")
+                H_work = H_cart.copy()
+            else:
+                H_cart = H_work
             
             n3 = H_cart.shape[0]
             if g_cart.size != n3:
@@ -743,6 +817,13 @@ class PRFO(JobABC):
                     
                     # Get new forces for convergence check
                     F_new = to_numpy_f64(atoms.get_forces())
+                    g_new_cart = vec1d(-F_new, n3)
+                    if not need_recalc:
+                        y_cart = g_new_cart - g_cart
+                        if self.params.hessian_update == "bfgs":
+                            H_work = _bfgs_update(H_work, s_cart, y_cart)
+                        else:
+                            H_work = _bofill_update(H_work, s_cart, y_cart)
                     
                     # Compute convergence metrics (per DOF RMS)
                     dof = s_cart.size

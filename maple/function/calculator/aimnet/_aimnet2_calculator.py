@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import os
-import torch
-import numpy as np
 from typing import Dict, Literal
-from ase.calculators.calculator import Calculator, all_changes
-from ..calculator_base import CalcABC
 
+import numpy as np
+import torch
+from ase.calculators.calculator import all_changes
 
-EV2HARTREE = 1.0 / 27.211386245988
+from ..calculator_base import CalcABC, register_calculator
+
 
 # --------------------------------------------
 # Build dense neighbor list (N+1, M) sentinel padded
@@ -61,280 +63,175 @@ def maybe_pad_dim0(a: torch.Tensor, N: int, value=0.0) -> torch.Tensor:
 # ==========================================================
 # AIMNet2 Calculator (single-molecule minimal version)
 # ==========================================================
+@register_calculator
 class AIMNet2Calculator(CalcABC):
-    implemented_properties = ["energy", "forces", "hessian", "free_energy"]
-    supported_hessian_modes = ("analytic", "numerical")
+    implemented_properties = ['energy', 'forces', 'free_energy', 'hessian']
 
-    def __init__(self, device: torch.device, 
-                model: str = "aimnet2", 
-                coulomb_method: str = "simple",
-                implicit: Literal["gbsa", "none"] = "gbsa",
+    MODEL_NAMES = ('aimnet2', 'aimnet2nse')
+    MODEL_ENERGY_UNIT = 'eV'
+    SUPPORTED_HESSIAN_MODES = ('analytic', 'numerical')
+    SUPPORTS_CHARGE_MULT = True
+    SUPPORTS_PBC = False
+    SUPPORTED_COULOMB_METHODS = ('simple', 'dsf')
+    CHECKPOINT_FILENAME = {'aimnet2': 'aimnet2.pt', 'aimnet2nse': 'aimnet2nse.pt'}
+    REQUIRES_LOCAL_MODEL_FILE = False
+    OPTION_KEYS = ('coulomb_method',)
+    MODEL_PATH_OPTION = 'model_path'
+
+    @classmethod
+    def build_kwargs_from_options(cls, model, options, *, resolved_model_path=None):
+        kwargs = {}
+        coulomb_method = options.get('coulomb_method')
+        if coulomb_method is not None:
+            kwargs['coulomb_method'] = str(coulomb_method).lower()
+        if resolved_model_path is not None:
+            kwargs['model_path'] = resolved_model_path
+        return kwargs
+
+    def __init__(self, device: torch.device,
+                model: str = 'aimnet2',
+                model_path: str = None,
+                coulomb_method: str = 'simple',
+                implicit: Literal['gbsa', 'none'] = 'none',
                 solvent: str = 'none',
                 ):
         super().__init__()
         self.device = device
 
         # Load model
-        model_dir = os.path.dirname(os.path.realpath(__file__))
-        model_dir = os.path.dirname(model_dir)
-        model_path = os.path.join(model_dir, "model", f"{model}.pt")
+        if model_path is None:
+            model_dir = os.path.dirname(os.path.realpath(__file__))
+            model_dir = os.path.dirname(model_dir)
+            model_path = os.path.join(model_dir, 'model', f'{model}.pt')
         self.model = torch.jit.load(model_path, map_location=device).eval()
 
-        self.cutoff = float(getattr(self.model, "cutoff"))
-        # CHANGED: do not rely on hasattr(model, 'cutoff_lr') to decide LR; model may still need nbmat_lr
-        self.cutoff_lr = float(getattr(self.model, "cutoff_lr", float("inf")))
-        # keep a flag (optional); but we will always provide nbmat_lr anyway
-        self.lr = True  # CHANGED: force-true to avoid conditional omission
-        self.hessian: str = 'analytic'  # 'analytic' or 'numerical'
+        self.cutoff = float(getattr(self.model, 'cutoff'))
+        self.cutoff_lr = float(getattr(self.model, 'cutoff_lr', float('inf')))
+        # Always provide nbmat_lr to avoid TorchScript KeyError; method routing
+        # handles cutoff_lr.
+        self.lr = True
+        self.hessian: str = 'analytic'
 
-        # Coulomb settings (keep original behavior)
         self._set_lrcoulomb_method(coulomb_method)
 
-        # Initialize implicit solvent
         self.implicit_solv_init(implicit=implicit, solvent=solvent)
 
     def _set_lrcoulomb_method(self, method: str, cutoff: float = 15.0, dsf_alpha: float = 0.2):
-            """
-            Configure the long-range Coulomb interaction method if the model contains a 'lrcoulomb' submodule.
-            method: 'simple', 'dsf', or 'ewald'
-            cutoff: cutoff distance for long-range interactions
-            dsf_alpha: DSF damping parameter (if used)
-            """
-            assert method in ("simple", "dsf", "ewald"), f"Invalid method: {method}"
+        """
+        Configure the long-range Coulomb interaction method if the model contains a 'lrcoulomb' submodule.
+        method: 'simple' or 'dsf'. The historical 'ewald' selector is rejected
+        until this wrapper carries validated cell/PBC/MIC inputs.
+        cutoff: cutoff distance for long-range interactions
+        dsf_alpha: DSF damping parameter (if used)
+        """
+        method = str(method).lower()
+        if method == 'ewald':
+            raise NotImplementedError(
+                "AIMNet2 coulomb_method='ewald' requires validated PBC/cell/MIC support; "
+                "use 'simple' or 'dsf'."
+            )
+        if method not in self.SUPPORTED_COULOMB_METHODS:
+            raise ValueError(
+                f"Invalid coulomb_method: {method!r}; expected one of 'simple', 'dsf'."
+            )
 
-            # recursively look for 'lrcoulomb' submodules
-            def _iter_lrcoulomb_mods(model):
-                for name, mod in model.named_modules():
-                    if name == "lrcoulomb":
-                        yield mod
+        def _iter_lrcoulomb_mods(model):
+            for name, mod in model.named_modules():
+                if name == 'lrcoulomb':
+                    yield mod
 
-            for mod in _iter_lrcoulomb_mods(self.model):
-                mod.method = method
-                if method == "dsf" and hasattr(mod, "dsf_alpha"):
-                    mod.dsf_alpha = dsf_alpha
+        for mod in _iter_lrcoulomb_mods(self.model):
+            mod.method = method
+            if method == 'dsf' and hasattr(mod, 'dsf_alpha'):
+                mod.dsf_alpha = dsf_alpha
 
-            # update cutoff_lr based on the chosen method
-            self.cutoff_lr = float("inf") if method == "simple" else float(cutoff)
-            self._coulomb_method = method
+        self.cutoff_lr = float('inf') if method == 'simple' else float(cutoff)
+        self._coulomb_method = method
 
-    # ------------------------ calculate ------------------------
-    def calculate(self, atoms=None, properties=["energy", "forces", "free_energy", "hessian"], system_changes=all_changes):
-        super().calculate(atoms, properties, system_changes)
+    def calculate(self, atoms=None, properties=['energy'], system_changes=all_changes):
+        properties = self._normalize_properties(properties)
+        atoms = super().calculate(atoms, properties, system_changes)
 
+        needs_grad = ('forces' in properties or 'hessian' in properties)
         coord = torch.tensor(
             atoms.get_positions(),
             dtype=torch.float32,
             device=self.device,
-            requires_grad=("forces" in properties or "hessian" in properties)
+            requires_grad=needs_grad,
         )
+        data = self._build_data(coord, atoms)
+
+        # Pure model energy in eV; _finalize_results handles eV→Ha + solvent.
+        energy_eV = self._forward_energy(data)
+
+        if 'forces' in properties:
+            grad_full = torch.autograd.grad(
+                energy_eV, data['coord'], create_graph=('hessian' in properties)
+            )[0]
+            forces_eV = -grad_full[: coord.shape[0]]
+            forces_np = forces_eV.detach().cpu().numpy()
+        else:
+            forces_np = None
+
+        hessian = None
+        if 'hessian' in properties:
+            if self.solvent_correction is not None:
+                raise NotImplementedError(
+                    'Hessian calculation with implicit solvent is not implemented yet.'
+                )
+            hessian = self.get_hessian(atoms)
+
+        self._finalize_results(atoms, energy=energy_eV.item(), forces=forces_np, hessian=hessian)
+
+    def _build_data(self, coord: torch.Tensor, atoms) -> Dict[str, torch.Tensor]:
         Z = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.int32, device=self.device)
         mol_idx = torch.zeros(coord.shape[0], dtype=torch.int32, device=self.device)
-
         N = coord.shape[0]
-
-        charge_val = float(self.atoms.info.get("charge", 0.0))
-        mult_val = float(self.atoms.info.get("mult", 1.0))
+        charge_val = float(atoms.info.get('charge', 0.0))
+        mult_val = float(atoms.info.get('mult', 1.0))
 
         nbmat = nblist_dense_padded(coord, self.cutoff)
         data: Dict[str, torch.Tensor] = {
-            "coord": pad_dim0(coord, value=0.0),         # (N+1, 3)
-            "numbers": pad_dim0(Z, value=0),             # (N+1,)
-            "charge": torch.tensor([charge_val], dtype=torch.float32, device=self.device),
-            "mult": torch.tensor([mult_val], dtype=torch.float32, device=self.device),
-            "mol_idx": pad_dim0(mol_idx, value=mol_idx[-1].item() if N > 0 else 0),
-            "nbmat": nbmat,
+            'coord': pad_dim0(coord, value=0.0),
+            'numbers': pad_dim0(Z, value=0),
+            'charge': torch.tensor([charge_val], dtype=torch.float32, device=self.device),
+            'mult': torch.tensor([mult_val], dtype=torch.float32, device=self.device),
+            'mol_idx': pad_dim0(mol_idx, value=mol_idx[-1].item() if N > 0 else 0),
+            'nbmat': nbmat,
         }
 
-        # CHANGED: ALWAYS provide nbmat_lr + cutoff_lr to avoid KeyError inside TorchScript
         lr_cutoff = self.cutoff_lr if np.isfinite(self.cutoff_lr) else self.cutoff
-        data["nbmat_lr"] = nblist_dense_padded(coord, lr_cutoff)
-        data["cutoff_lr"] = torch.tensor(lr_cutoff, device=self.device)
+        data['nbmat_lr'] = nblist_dense_padded(coord, lr_cutoff)
+        data['cutoff_lr'] = torch.tensor(lr_cutoff, device=self.device)
+        return data
 
-        energy = self.get_energy(data)
-        energy = energy * EV2HARTREE  # to Hartree
-
-        if self.solvent_correction:
-            solvent_energy = self.implicit_solv_energy(atoms)
-            energy += solvent_energy
-
-        self.results["energy"] = float(energy.item())
-        self.results["free_energy"] = float(energy.item())
-
-        if "forces" in properties:
-            grad_full = torch.autograd.grad(
-                energy, data["coord"], create_graph=("hessian" in properties)
-            )[0]                      # (N+1, 3)
-            forces = -grad_full[:N]   # (N, 3)
-            if self.solvent_correction:
-                solvent_energy, solvent_force = self.implicit_solv_energy_and_force(atoms)
-                forces += solvent_force
-
-            self.results["forces"] = forces.detach().cpu().numpy()
-            
-        if "hessian" in properties:
-            if self.solvent_correction:
-                raise NotImplementedError("Hessian calculation with implicit solvent is not implemented yet.")
-            self.results["hessian"] = self.get_hessian(atoms)
-
-    # ------------------------ get_energy ------------------------
-    def get_energy(self, data: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _forward_energy(self, data: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Pure model forward; returns energy in eV (model's native unit)."""
         with torch.jit.optimized_execution(False):
             out = self.model(data)
-        return out["energy"].sum()
+        return out['energy'].sum()
 
-    # ------------------------ get_hessian ------------------------
-    def get_hessian(
-        self, 
-        atoms,
-        delta: float = 0.002,
-    ) -> np.ndarray:
-        """
-        Compute the Hessian matrix using either analytic or numerical method.
-        
-        Method is determined by self.hessian:
-        - 'analytic': Use automatic differentiation (faster, exact)
-        - 'numerical': Use finite-difference forces (slower, approximate)
-        
-        Returns a (3N, 3N) numpy array.
-        
-        Args:
-            atoms: ASE Atoms object
-            delta: Step size for numerical differentiation (only used if method='numerical')
-        """
-        if self.hessian == 'analytic':
-            return self._get_hessian_analytic(atoms)
-        elif self.hessian == 'numerical':
-            return self._get_hessian_numerical(atoms, delta)
-        else:
-            raise ValueError(f"Unknown hessian method: {self.hessian}. Must be 'analytic' or 'numerical'")
+    def _analytic_hessian(self, atoms) -> np.ndarray:
+        """Analytic Hessian via autograd. Returns (3N, 3N) np.ndarray in Hartree/Å²."""
+        from ..calculator_base import EV2HARTREE
 
-
-    def _get_hessian_analytic(self, atoms) -> np.ndarray:
-        """
-        Compute Hessian using automatic differentiation.
-        Fast and exact, but requires energy to be differentiable w.r.t. coordinates.
-        """
         coord = torch.tensor(
             atoms.get_positions(),
             dtype=torch.float32,
             device=self.device,
-            requires_grad=True
+            requires_grad=True,
         )
-        Z = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.int32, device=self.device)
-        mol_idx = torch.zeros(coord.shape[0], dtype=torch.int32, device=self.device)
-
         N = coord.shape[0]
-        nbmat = nblist_dense_padded(coord, self.cutoff)
-        charge_val = float(atoms.info.get("charge", 0.0))
-        mult_val = float(atoms.info.get("mult", 1.0))
+        data = self._build_data(coord, atoms)
 
-        data = {
-            "coord": pad_dim0(coord, value=0.0),
-            "numbers": pad_dim0(Z, value=0),
-            "charge": torch.tensor([charge_val], dtype=torch.float32, device=self.device),
-            "mult": torch.tensor([mult_val], dtype=torch.float32, device=self.device),
-            "mol_idx": pad_dim0(mol_idx, value=mol_idx[-1].item() if N > 0 else 0),
-            "nbmat": nbmat,
-        }
-        
-        # ALWAYS provide nbmat_lr + cutoff_lr
-        lr_cutoff = self.cutoff_lr if np.isfinite(self.cutoff_lr) else self.cutoff
-        data["nbmat_lr"] = nblist_dense_padded(coord, lr_cutoff)
-        data["cutoff_lr"] = torch.tensor(lr_cutoff, device=self.device)
+        energy = self._forward_energy(data) * EV2HARTREE
 
-        energy = self.get_energy(data)
-        energy = energy * EV2HARTREE
+        forces_full = torch.autograd.grad(energy, data['coord'], create_graph=True)[0]
+        forces = -forces_full[:N]
 
-        forces_full = torch.autograd.grad(energy, data["coord"], create_graph=True)[0]  # (N+1, 3)
-        forces = -forces_full[:N]  # (N, 3)
-
-        # Use original-style assembly to stay consistent with AIMNet2 padding
-        hessian = - torch.stack([
-            torch.autograd.grad(f, data["coord"], retain_graph=True)[0]
+        hessian = -torch.stack([
+            torch.autograd.grad(f, data['coord'], retain_graph=True)[0]
             for f in forces.flatten().unbind()
-        ]).view(-1, 3, N + 1, 3)[:, :, :N, :]  # slice out the padded row on atom-axis
+        ]).view(-1, 3, N + 1, 3)[:, :, :N, :]
 
         return hessian.detach().cpu().numpy().reshape(3 * N, 3 * N)
-
-
-    def _get_hessian_numerical(
-        self, 
-        atoms, 
-        delta: float = 0.002
-    ) -> np.ndarray:
-        """
-        Compute Hessian using finite-difference forces.
-        Hessian is defined as: H = d²E/dx_i dx_j = -∂F_i/∂x_j
-        
-        Args:
-            atoms: ASE Atoms object
-            delta: Step size for finite difference
-        """
-        import numpy as np
-        from ase.constraints import FixAtoms
-        from ase.calculators.calculator import all_changes
-
-        # Basic geometry setup
-        N = len(atoms)
-        pos0 = atoms.get_positions().copy()  # (N, 3) numpy array
-
-        # Identify frozen atoms from FixAtoms constraint
-        fixed = {
-            i for c in getattr(atoms, "constraints", [])
-            if isinstance(c, FixAtoms)
-            for i in c.get_indices()
-        }
-        movable = [i for i in range(N) if i not in fixed]
-
-        # Allocate Hessian as numpy array
-        H = np.zeros((3 * N, 3 * N), dtype=np.float64)
-
-        # If everything is frozen, return zero Hessian
-        if len(movable) == 0:
-            return H
-
-        # Helper function: evaluate AIMNet forces at a displaced geometry
-        def aimnet_force_at(pos_numpy: np.ndarray) -> np.ndarray:
-            """
-            Evaluate AIMNet forces at the given coordinates.
-            Returns a numpy array of shape (N, 3).
-            """
-            at = atoms.copy()
-            at.set_positions(pos_numpy)
-
-            # Preserve constraints if present
-            if getattr(atoms, "constraints", None):
-                at.set_constraint(atoms.constraints)
-
-            # Compute forces with the internal AIMNet calculator
-            self.calculate(at, properties=["forces"], system_changes=all_changes)
-            F_np = self.results["forces"]  # numpy (N, 3)
-            return F_np
-
-        # Finite-difference second derivatives:
-        # H_ij = -∂F_i/∂x_j ≈ -(F(+δ) - F(-δ)) / (2δ)
-        for a in movable:      # iterate over movable atoms
-            for k in range(3):  # iterate over x, y, z directions
-                row = 3 * a + k
-
-                # +delta displacement
-                pos_p = pos0.copy()
-                pos_p[a, k] += delta
-                Fp = aimnet_force_at(pos_p)
-
-                # -delta displacement
-                pos_m = pos0.copy()
-                pos_m[a, k] -= delta
-                Fm = aimnet_force_at(pos_m)
-
-                # Central difference derivative of force
-                # ∂F/∂x ≈ (F(+δ) - F(-δ)) / (2δ)
-                dF = (Fp - Fm) / (2.0 * delta)
-
-                # Hessian uses: H = -∂F/∂x
-                H[row, :] = (-dF).reshape(-1)
-
-        # Optional: symmetrize to reduce numerical noise
-        # H = 0.5 * (H + H.T)
-
-        return H

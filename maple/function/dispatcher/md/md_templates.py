@@ -27,11 +27,15 @@ traj_every  = 100        ; trajectory output every N steps
 log_every   = 100        ; log energy every N steps
 traj_format = xyz        ; xyz (text) or dcd (binary)
 
-remove_com_every = 100   ; remove COM motion every N steps
+remove_com = yes         ; initialization-only: remove COM
+remove_angular = no      ; initialization-only: remove COM + rigid-body rotation (parallel to remove_com, not a switch)
+remove_com_every = 100   ; runtime-only: remove COM every N steps
+remove_angular_every = 0 ; runtime-only: remove COM + rigid-body rotation every N steps (parallel to remove_com_every, not a switch)
 
-init_velocities = no     ; load velocities from rst_file (NVT -> NVE)
-restart     = yes
-rst_file    = nvt_md.rst ; load state from NVT equilibration
+init_velocities = no
+restart     = no
+load_state  = yes        ; read rst and start from step 0
+rst_file    = nvt_md.rst
 rst_every   = 1000       ; checkpoint frequency
 ; random_seed = 12345    ; uncomment for reproducibility
 """,
@@ -56,9 +60,15 @@ traj_every  = 100
 log_every   = 100
 traj_format = xyz
 
+remove_com = yes         ; initialization-only: remove COM
+remove_angular = no      ; initialization-only: remove COM + rigid-body rotation (parallel to remove_com, not a switch)
+remove_com_every = 100   ; runtime-only: remove COM every N steps
+remove_angular_every = 0 ; runtime-only: remove COM + rigid-body rotation every N steps (parallel to remove_com_every, not a switch)
+
 init_velocities = yes
-restart     = no
-; rst_file  =            ; load state from a .rst checkpoint
+restart     = no         ; resume from checkpoint step
+load_state  = no         ; read rst and start from step 0
+; rst_file  =
 rst_every   = 1000
 """,
 
@@ -85,9 +95,15 @@ traj_every  = 100
 log_every   = 100
 traj_format = xyz
 
+remove_com = yes         ; initialization-only: remove COM
+remove_angular = no      ; initialization-only: remove COM + rigid-body rotation (parallel to remove_com, ignored under PBC)
+remove_com_every = 100   ; runtime-only: remove COM every N steps
+remove_angular_every = 0 ; runtime-only: remove COM + rigid-body rotation every N steps (parallel to remove_com_every, ignored under PBC)
+
 init_velocities = yes
-restart     = no
-; rst_file  =            ; load state from a .rst checkpoint
+restart     = no         ; resume from checkpoint step
+load_state  = no         ; read rst and start from step 0
+; rst_file  =
 rst_every   = 1000
 """,
 }

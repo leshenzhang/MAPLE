@@ -1,0 +1,444 @@
+
+**********************************************************************
+*                                                                    *
+*                        M   A   P   L   E                           *
+*                                                                    *
+*      MAchine-learning Potential for Landscape Exploration          *
+*                                                                    *
+*                                                                    *
+*      © 2025 University of Pittsburgh. All rights reserved.         *
+*      Licensed under CC BY 4.0 for academic use.                    *
+*                                                                    *
+*      Principal Developer:  Xujian Wang                             *
+*                                                                    *
+**********************************************************************
+
+
+Parsing # commands...
+Global parameter: model = ANI-1xnr
+Task set to 'ts'
+Global parameter: device = gpu0
+Parsed configuration:
+----------------------------------------
+Task: ts
+model          : ani1xnr
+method         : neb
+refine         : nebts
+device         : gpu0
+
+                             Coordinates                              
+**********************************************************************
+
+======================================================================
+NEB Initialization
+======================================================================
+Input images:    2
+Required images: 12 (including endpoints)
+
+Aligning input images to reactant reference...
+Product aligned to reactant. RMSD: 0.898270 Angstrom
+Input alignment completed.
+
+Need to insert 10 additional image(s).
+Analyzing distances to determine optimal insertion points...
+
+Distances between consecutive input images:
+  Image 0 -> 1: 2.3766 Angstrom
+
+Insertion plan:
+  Insert 10 image(s) between image 0 and 1
+
+Total images after insertion: 12
+
+Applying IDPP smoothing to interpolated images...
+IDPP smoothing completed.
+
+Performing final Kabsch alignment of all images to reactant...
+Final alignment completed.
+
+Properties of fixed NEB end points:
+               Reactant:
+                         E               ....   -29.679614 Eh
+                         RMS(F)          ....    0.019958 Eh/Angstrom
+                         MAX(|F|)        ....    0.038337 Eh/Angstrom
+               Product:
+                         E               ....   -29.709697 Eh
+                         RMS(F)          ....    0.016525 Eh/Angstrom
+                         MAX(|F|)        ....    0.032252 Eh/Angstrom
+
+Reactant XYZ (Angstrom):
+C        0.826066       0.550860      -0.126179
+H        0.455445       1.241751      -0.878432
+O        0.568075       1.024651       1.118743
+C        1.441110      -0.587360      -0.436361
+H        0.909909       0.393232       1.766632
+H        1.591683      -0.859293      -1.474189
+H        1.808953      -1.273475       0.323724
+
+Product XYZ (Angstrom):
+C        0.784037       0.865659      -0.037116
+H        0.980929       1.340390      -1.023124
+O        0.187580       1.468124       0.822343
+C        1.310077      -0.535901       0.115373
+H        1.063949      -0.923634       1.105994
+H        0.877931      -1.181692      -0.658284
+H        2.396738      -0.542577      -0.031247
+
+
+Performing Kabsch alignment of all images...
+Alignment completed.
+
+Starting NEB iterations with ORCA-style dynamic spring constants:
+k_min = 0.0300, k_max = 0.3000, k_decay = 0.5000
+Optim.  Iteration  HEI  E(HEI)-E(0)  max(|Fp|)   RMS(Fp)   k(HEI)
+Convergence thresholds          0.009500    0.005000
+Initial    0      5   0.105236    0.130819   0.042307   0.1362
+   LBFGS    1      5   0.104724    0.127712   0.041719   0.1362
+   LBFGS    2      5   0.098679    0.101719   0.036327   0.1362
+   LBFGS    3      5   0.093354    0.089403   0.031247   0.1362
+   LBFGS    4      5   0.088762    0.067296   0.025790   0.1362
+   LBFGS    5      5   0.085286    0.053811   0.020364   0.1362
+   LBFGS    6      5   0.082654    0.043585   0.016107   0.1362
+   LBFGS    7      5   0.080573    0.037724   0.012447   0.1362
+   LBFGS    8      5   0.078734    0.024067   0.008754   0.1362
+   LBFGS    9      5   0.076912    0.021963   0.007277   0.1362
+   LBFGS   10      5   0.075560    0.022133   0.006027   0.1362
+   LBFGS   11      5   0.074467    0.012264   0.004974   0.1362
+   LBFGS   12      5   0.073422    0.021302   0.005752   0.1362
+   LBFGS   13      5   0.072557    0.015755   0.005635   0.1362
+   LBFGS   14      5   0.071723    0.016383   0.005770   0.1362
+   LBFGS   15      5   0.070902    0.014561   0.005802   0.1362
+   LBFGS   16      5   0.070137    0.014287   0.005113   0.1362
+   LBFGS   17      5   0.069462    0.012553   0.004410   0.1362
+   LBFGS   18      5   0.068906    0.009140   0.003038   0.1362
+
+NEB optimization converged after 18 iterations.
+
+---------------------------------------------------------------
+                         PATH SUMMARY              
+---------------------------------------------------------------
+All forces in Eh/Angstrom.
+
+Image Dist.(Ang.)    E(Eh)   dE(kcal/mol)  max(|Fp|)  RMS(Fp)
+  0     0.000     -29.67961        0.00     0.00000    0.00000
+  1     0.565     -29.67802        1.00     0.00486    0.00382
+  2     0.469     -29.66928        6.48     0.00930    0.00577
+  3     0.400     -29.65546       15.16     0.01052    0.00734
+  4     0.335     -29.63055       30.79     0.00969    0.00590
+  5     0.203     -29.61071       43.24     0.00790    0.00455 <= HEI
+  6     0.200     -29.61234       42.22     0.00659    0.00413
+  7     0.231     -29.64843       19.57     0.00876    0.00554
+  8     0.297     -29.68926       -6.05     0.00866    0.00598
+  9     0.348     -29.70735      -17.40     0.00629    0.00428
+ 10     0.353     -29.70984      -18.96     0.00593    0.00423
+ 11     0.280     -29.70970      -18.88     0.00000    0.00000
+
+Straight line distance between images along the path:
+        D( 0- 1) =  0.5649 Ang.
+        D( 1- 2) =  0.4687 Ang.
+        D( 2- 3) =  0.3999 Ang.
+        D( 3- 4) =  0.3350 Ang.
+        D( 4- 5) =  0.2026 Ang.
+        D( 5- 6) =  0.1999 Ang.
+        D( 6- 7) =  0.2310 Ang.
+        D( 7- 8) =  0.2974 Ang.
+        D( 8- 9) =  0.3479 Ang.
+        D( 9-10) =  0.3527 Ang.
+        D(10-11) =  0.2803 Ang.
+
+---------------------------------------------------------------
+           INFORMATION ABOUT HIGHEST ENERGY IMAGE
+---------------------------------------------------------------
+Highest energy image                      ....  5
+Energy                                    ....  -29.61070818 Eh
+Max. abs. force                           ....   7.8969e-03 Eh/Angstrom
+
+-----------------------------------------
+  HIGHEST ENERGY IMAGE (ANGSTROEM)
+-----------------------------------------
+C        0.891133       0.780897      -0.188206
+H        0.754252       1.587594      -0.922245
+O        0.558400       0.953323       1.114830
+C        1.343612      -0.564935      -0.216214
+H        0.781612      -0.169457       1.109398
+H        0.957146      -1.343483      -0.874012
+H        2.315086      -0.753572       0.270389
+
+Wrote MEP to: /home/user/software/MAPLE/examples/ts/neb/inp1_mep.xyz
+Wrote HEI to: /home/user/software/MAPLE/examples/ts/neb/inp1_hei.xyz
+Wrote trajectory to: /home/user/software/MAPLE/examples/ts/neb/inp1_image_traj.xyz
+
+Starting CINEB refinement:
+Optim.  Iteration  CI   E(CI)-E(0)   max(|Fp|)   RMS(Fp)   max(|FCI|)   RMS(|FCI|)
+Convergence thresholds regular:  0.009500/ 0.005000,  CI:  0.010000/ 0.010000
+   LBFGS    0      5   0.069000    0.030739   0.007810   0.063910   0.031103
+   LBFGS    1      5   0.069638    0.027872   0.007397   0.058813   0.028771
+   LBFGS    2      5   0.070150    0.025418   0.006878   0.053902   0.026423
+   LBFGS    3      5   0.070631    0.023480   0.006415   0.048724   0.023889
+   LBFGS    4      5   0.071096    0.021411   0.005901   0.042942   0.021154
+   LBFGS    5      5   0.071421    0.019439   0.005415   0.038363   0.018804
+   LBFGS    6      5   0.071663    0.018234   0.005020   0.034185   0.016740
+   LBFGS    7      5   0.071836    0.017035   0.004692   0.030800   0.015102
+   LBFGS    8      5   0.071963    0.015821   0.004372   0.028064   0.013654
+   LBFGS    9      5   0.072066    0.015017   0.004107   0.025479   0.012419
+   LBFGS   10      5   0.072150    0.013974   0.003845   0.023003   0.011188
+   LBFGS   11      5   0.072211    0.013027   0.003578   0.020765   0.010026
+   LBFGS   12      5   0.072260    0.012244   0.003361   0.018572   0.009030
+   LBFGS   13      5   0.072296    0.011504   0.003133   0.016678   0.008058
+   LBFGS   14      5   0.072323    0.010666   0.002926   0.014944   0.007178
+   LBFGS   15      5   0.072344    0.009899   0.002714   0.013274   0.006409
+   LBFGS   16      5   0.072359    0.009269   0.002544   0.011746   0.005612
+
+CINEB converged after 17 iterations.
+
+---------------------------------------------------------------
+               INFORMATION ABOUT SADDLE POINT     
+---------------------------------------------------------------
+Climbing image                            ....  5
+Energy                                    ....  -29.60725517 Eh
+Max. abs. force                           ....   1.1746e-02 Eh/Angstrom
+
+-----------------------------------------
+  SADDLE POINT (ANGSTROEM)
+-----------------------------------------
+C        0.895774       0.789534      -0.179568
+H        0.756587       1.585820      -0.923881
+O        0.554861       0.977683       1.112571
+C        1.333426      -0.566224      -0.195084
+H        0.795765      -0.213651       1.071223
+H        0.951199      -1.345004      -0.862944
+H        2.313631      -0.737792       0.271622
+
+Starting Transition State Search (TS) with RS-PRFO...
+Trust radius adaptation: eta_shrink=0.75, eta_expand=1.75
+Convergence thresholds: f_max=0.002850, f_rms=0.001900, dp_max=0.003150, dp_rms=0.002100
+
+----------------------------------------------------------------------
+                             Iteration: 1                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8937               0.7847              -0.1759
+1    H                0.7395               1.5701              -0.9284
+2    O                0.5569               0.9840               1.1144
+3    C                1.3318              -0.5681              -0.1979
+4    H                0.7920              -0.2324               1.0645
+5    H                1.0010              -1.3286              -0.9206
+6    H                2.2958              -0.7397               0.3022
+
+
+Energy:                  -29.607342 Convergence criteria  Is converged 
+Maximum Force:             0.002536     0.002850                Yes
+RMS Force:                 0.001075     0.001900                Yes
+Maximum Displacement:      0.057615     0.003150                No
+RMS Displacement:          0.019990     0.002100                No
+
+Model change: -1.143358e-04  Actual change: -8.699298e-05  rho: 0.761
+Trust radius (MW):  0.100000  Step norm (MW):  0.098859  On boundary: False
+
+----------------------------------------------------------------------
+                             Iteration: 2                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8920               0.7750              -0.1782
+1    H                0.7361               1.5544              -0.9362
+2    O                0.5594               0.9840               1.1108
+3    C                1.3267              -0.5791              -0.1958
+4    H                0.7850              -0.2365               1.0657
+5    H                0.9973              -1.3372              -0.9178
+6    H                2.2894              -0.7541               0.3046
+
+
+Energy:                  -29.607351 Convergence criteria  Is converged 
+Maximum Force:             0.000073     0.002850                Yes
+RMS Force:                 0.000028     0.001900                Yes
+Maximum Displacement:      0.015732     0.003150                No
+RMS Displacement:          0.006931     0.002100                No
+
+Model change: -9.219328e-06  Actual change: -9.238720e-06  rho: 1.002
+Trust radius (MW):  0.100000  Step norm (MW):  0.063966  On boundary: False
+
+----------------------------------------------------------------------
+                             Iteration: 3                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8865               0.7701              -0.1778
+1    H                0.7307               1.5496              -0.9358
+2    O                0.5539               0.9791               1.1112
+3    C                1.3211              -0.5840              -0.1955
+4    H                0.7794              -0.2414               1.0660
+5    H                0.9917              -1.3419              -0.9177
+6    H                2.2837              -0.7591               0.3050
+
+
+Energy:                  -29.607351 Convergence criteria  Is converged 
+Maximum Force:             0.000000     0.002850                Yes
+RMS Force:                 0.000000     0.001900                Yes
+Maximum Displacement:      0.005691     0.003150                No
+RMS Displacement:          0.004260     0.002100                No
+
+Model change: -5.460903e-09  Actual change: -1.490116e-08  rho: 2.729
+Trust radius (MW):  0.050000  Step norm (MW):  0.048734  On boundary: False
+
+----------------------------------------------------------------------
+                             Iteration: 4                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8939               0.7753              -0.1779
+1    H                0.7481               1.5604              -0.9322
+2    O                0.5524               0.9779               1.1098
+3    C                1.3213              -0.5810              -0.2009
+4    H                0.7717              -0.2436               1.0586
+5    H                0.9934              -1.3326              -0.9304
+6    H                2.2791              -0.7645               0.3059
+
+
+Energy:                  -29.607351 Convergence criteria  Is converged 
+Maximum Force:             0.000063     0.002850                Yes
+RMS Force:                 0.000034     0.001900                Yes
+Maximum Displacement:      0.017415     0.003150                No
+RMS Displacement:          0.006830     0.002100                No
+
+Model change: -1.823535e-10  Actual change: -2.980232e-08  rho: 163.432
+Trust radius (MW):  0.050000  Step norm (MW):  0.048734  On boundary: False
+
+----------------------------------------------------------------------
+                             Iteration: 5                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8943               0.7746              -0.1852
+1    H                0.7485               1.5596              -0.9394
+2    O                0.5528               0.9773               1.1025
+3    C                1.3217              -0.5817              -0.2082
+4    H                0.7720              -0.2442               1.0513
+5    H                0.9938              -1.3333              -0.9376
+6    H                2.2794              -0.7652               0.2986
+
+
+Energy:                  -29.607351 Convergence criteria  Is converged 
+Maximum Force:             0.000000     0.002850                Yes
+RMS Force:                 0.000000     0.001900                Yes
+Maximum Displacement:      0.007339     0.003150                No
+RMS Displacement:          0.004234     0.002100                No
+
+Model change: -1.170790e-08  Actual change: -1.490116e-08  rho: 1.273
+Trust radius (MW):  0.050000  Step norm (MW):  0.048734  On boundary: False
+
+----------------------------------------------------------------------
+                             Iteration: 6                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8957               0.7771              -0.1819
+1    H                0.7534               1.5682              -0.9305
+2    O                0.5543               0.9718               1.1071
+3    C                1.3176              -0.5808              -0.2145
+4    H                0.7687              -0.2502               1.0471
+5    H                0.9872              -1.3258              -0.9496
+6    H                2.2744              -0.7717               0.2914
+
+
+Energy:                  -29.607351 Convergence criteria  Is converged 
+Maximum Force:             0.000043     0.002850                Yes
+RMS Force:                 0.000022     0.001900                Yes
+Maximum Displacement:      0.011961     0.003150                No
+RMS Displacement:          0.005909     0.002100                No
+
+Model change: -3.020435e-10  Actual change: -2.980232e-08  rho: 98.669
+Trust radius (MW):  0.050000  Step norm (MW):  0.048734  On boundary: False
+
+----------------------------------------------------------------------
+                             Iteration: 7                             
+
+
+                             Coordinates                              
+----------------------------------------------------------------------
+0    C                0.8957               0.7771              -0.1818
+1    H                0.7534               1.5682              -0.9304
+2    O                0.5542               0.9718               1.1071
+3    C                1.3177              -0.5806              -0.2144
+4    H                0.7687              -0.2501               1.0471
+5    H                0.9874              -1.3256              -0.9495
+6    H                2.2744              -0.7716               0.2916
+
+
+Energy:                  -29.607351 Convergence criteria  Is converged 
+Maximum Force:             0.000000     0.002850                Yes
+RMS Force:                 0.000000     0.001900                Yes
+Maximum Displacement:      0.000183     0.003150                Yes
+RMS Displacement:          0.000098     0.002100                Yes
+
+Model change: -4.657325e-09  Actual change:  5.960464e-08  rho: -12.798
+Trust radius (MW):  0.001000  Step norm (MW):  0.000975  On boundary: False
+
+
+----------------------------------------------------------------------
+                          Normal Termination                          
+
+
+---------------------------------------------------------------
+                      PATH SUMMARY FOR NEB-TS             
+---------------------------------------------------------------
+All forces in Eh/Angstrom. Global forces for TS.
+
+Image     E(Eh)   dE(kcal/mol)  max(|Fp|)  RMS(Fp)
+   0    -29.67961        0.00     0.03834    0.01996
+   1    -29.67891        0.44     0.00495    0.00317
+   2    -29.67222        4.64     0.01521    0.00885
+   3    -29.65991       12.36     0.02942    0.01560
+   4    -29.63614       27.28     0.07851    0.03623
+   5    -29.60726       45.41     0.01175    0.00561 <= CI
+  TS    -29.60735       45.35     0.00000    0.00000 <= TS
+   7    -29.62138       36.54     0.10529    0.05268
+   8    -29.66356       10.07     0.12138    0.06027
+   9    -29.69464       -9.43     0.05418    0.02709
+  10    -29.70807      -17.85     0.01481    0.00844
+  11    -29.70997      -19.05     0.00262    0.00172
+  12    -29.70970      -18.88     0.03225    0.01652
+
+-----------------------------------------
+  REFINED TS STRUCTURE (ANGSTROEM)
+-----------------------------------------
+C        0.895672       0.777145      -0.181794
+H        0.753447       1.568208      -0.930374
+O        0.554223       0.971785       1.107112
+C        1.317723      -0.580619      -0.214444
+H        0.768683      -0.250103       1.047145
+H        0.987373      -1.325603      -0.949525
+H        2.274431      -0.771564       0.291563
+
+Wrote NEB-TS MEP to: /home/user/software/MAPLE/examples/ts/neb/inp1_nebts_mep.xyz
+Wrote TS structure to: /home/user/software/MAPLE/examples/ts/neb/inp1_nebts_ts.xyz
+
+
+
+Program started: 2026-02-03 14:48:16
+
+======================================================================
+                      TIMING SUMMARY
+======================================================================
+Input Reading (×9)..................................   0.016 s  (   0.1 %)
+  Settings Parsing (×9)...............................   0.012 s  (  75.5 %)
+  Coordinate Section Parsing (×9).....................   0.002 s  (  12.5 %)
+  Post-Processing Expansion (×9)......................   0.000 s  (   0.1 %)
+MLP Initialization (×9).............................   0.657 s  (   3.9 %)
+Job Dispatching (×9)................................ 1203.346 s  (7144.3 %)
+  Frequency Calculation (×4)..........................   1.438 s  (   0.1 %)
+  Transition State Optimization (×5).................. 1201.906 s  (  99.9 %)
+======================================================================
+Total wall time: 16.844 s
+Total CPU time: 16.910 s
+======================================================================
+
+Program ended: 2026-02-03 14:48:33
+TOTAL RUN TIME: 0 days 0 hours 0 minutes 16 seconds 843 msec

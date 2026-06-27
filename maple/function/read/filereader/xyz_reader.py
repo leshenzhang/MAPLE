@@ -13,6 +13,52 @@ _COORD_RE = re.compile(
     r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)'
 )
 
+
+def _parse_pbc_tokens(pbc_str: str) -> Optional[List[bool]]:
+    """Parse PBC metadata tokens into a 3-element boolean list."""
+    pbc_tokens = pbc_str.upper().split()
+    if len(pbc_tokens) != 3:
+        return None
+    return [token in ('T', 'TRUE', '1') for token in pbc_tokens]
+
+
+
+def _parse_cell_and_pbc(comment_line: str) -> Tuple[Optional[np.ndarray], Optional[List[bool]]]:
+    """Extract cell and PBC metadata from extXYZ or MAPLE XYZ comment lines."""
+    lattice_match = re.search(r'[Ll]attice\s*=\s*"([^"]+)"', comment_line)
+    pbc_match = re.search(r'[Pp][Bb][Cc]\s*=\s*(?:"([^"]+)"|([^\s][^\r\n]*?))(?=\s{2,}\S+\s*=|\s*$)', comment_line)
+    explicit_pbc = None
+    if pbc_match:
+        explicit_pbc = _parse_pbc_tokens((pbc_match.group(1) or pbc_match.group(2) or '').strip())
+    if lattice_match:
+        try:
+            vals = [float(v) for v in lattice_match.group(1).split()]
+            if len(vals) == 9:
+                cell = np.array(vals, dtype=np.float64).reshape(3, 3)
+                return cell, explicit_pbc or [True, True, True]
+        except (ValueError, IndexError):
+            pass
+
+    cell_match = re.search(
+        r'\bCell\s*=\s*'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)',
+        comment_line,
+    )
+    if cell_match:
+        try:
+            cellpar = [float(cell_match.group(i)) for i in range(1, 7)]
+            return Atoms(cell=cellpar, pbc=True).cell.array.copy(), explicit_pbc or [True, True, True]
+        except ValueError:
+            pass
+
+    return None, None
+
+
 def _case_insensitive_lookup(path: str) -> str:
     """
     Try to resolve a path in a case-insensitive manner within its directory.
@@ -188,6 +234,18 @@ class XYZReader:
         # If fewer than declared, we still use what we have.
         elements: List[str] = []
         coords: List[List[float]] = []
+        comment_line = None
+        _scan = 0
+        while _scan < len(lines) and not lines[_scan].strip():
+            _scan += 1
+        if _scan < len(lines):
+            try:
+                int(lines[_scan].strip())
+                _scan += 1
+            except ValueError:
+                pass
+        if _scan < len(lines):
+            comment_line = lines[_scan]
         for ln in coord_lines:
             m = _COORD_RE.match(ln)
             # m must exist because we filtered above
@@ -200,43 +258,12 @@ class XYZReader:
 
         atoms = Atoms(symbols=elements, positions=np.array(coords, dtype=np.float64))
 
-        # Parse extXYZ comment line for Lattice and PBC info
-        # The comment line was at index (natoms_line_idx + 1); we need to re-find it.
-        # Re-scan: after the natoms line, the very next non-empty line is the comment.
-        comment_line = None
-        _scan = 0
-        while _scan < len(lines) and not lines[_scan].strip():
-            _scan += 1
-        # skip natoms line
-        if _scan < len(lines):
-            try:
-                int(lines[_scan].strip())
-                _scan += 1
-            except ValueError:
-                pass
-        # comment line
-        if _scan < len(lines):
-            comment_line = lines[_scan]
-
+        # Parse extXYZ comment line for Lattice and PBC info.
         if comment_line:
-            # Try to parse Lattice="a b c d e f g h i"
-            lattice_match = re.search(r'[Ll]attice\s*=\s*"([^"]+)"', comment_line)
-            pbc_match = re.search(r'[Pp][Bb][Cc]\s*=\s*"([^"]+)"', comment_line)
-            if lattice_match:
-                try:
-                    vals = [float(v) for v in lattice_match.group(1).split()]
-                    if len(vals) == 9:
-                        cell = np.array(vals).reshape(3, 3)
-                        atoms.set_cell(cell)
-                        if pbc_match:
-                            pbc_str = pbc_match.group(1).upper().split()
-                            pbc = [s in ('T', 'TRUE', '1') for s in pbc_str]
-                            if len(pbc) == 3:
-                                atoms.set_pbc(pbc)
-                        else:
-                            atoms.set_pbc(True)
-                except (ValueError, IndexError):
-                    pass
+            cell, pbc = _parse_cell_and_pbc(comment_line)
+            if cell is not None:
+                atoms.set_cell(cell)
+                atoms.set_pbc(pbc if pbc is not None else True)
 
         # Store charge and multiplicity in atoms.info for UMA
         if charge is not None:

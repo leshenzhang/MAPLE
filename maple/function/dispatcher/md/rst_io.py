@@ -76,7 +76,17 @@ def restore_rng_from_hex(rng: np.random.Generator, hex_str: str) -> None:
     rng.bit_generator.state = state
 
 
-def write_rst(path, atoms, velocities, step, timestep, ensemble, energy, rng_state=None):
+def write_rst(
+    path,
+    atoms,
+    velocities,
+    step,
+    timestep,
+    ensemble,
+    energy,
+    rng_state=None,
+    velocity_representation=None,
+):
     """
     Write MD restart checkpoint file.
 
@@ -98,6 +108,8 @@ def write_rst(path, atoms, velocities, step, timestep, ensemble, energy, rng_sta
         Total energy in Hartree.
     rng_state : str, optional
         Hex-encoded RNG state (for NVT/NPT deterministic continuation).
+    velocity_representation : str, optional
+        Label describing the semantics of the stored velocities.
 
     Raises
     ------
@@ -132,6 +144,8 @@ def write_rst(path, atoms, velocities, step, timestep, ensemble, energy, rng_sta
         f"timestep = {timestep:.10f}\n",
         f"energy = {energy:.10f}\n",
     ]
+    if velocity_representation is not None:
+        lines.append(f"velocity_representation = {velocity_representation}\n")
     if rng_state is not None:
         lines.append(f"rng_state = {rng_state}\n")
     if cell_line:
@@ -169,6 +183,7 @@ def read_rst(path):
         - ``timestep`` : float — Timestep in fs
         - ``energy`` : float — Total energy in Hartree
         - ``rng_state`` : str or None — Hex-encoded RNG state
+        - ``velocity_representation`` : str — Stored velocity semantics label
         - ``symbols`` : list[str] — Element symbols
         - ``positions`` : np.ndarray — Positions in Angstrom, shape (N, 3)
         - ``velocities`` : np.ndarray — Velocities in a.u., shape (N, 3)
@@ -242,6 +257,7 @@ def read_rst(path):
         "timestep": float(header["timestep"]),
         "energy": float(header["energy"]),
         "rng_state": header.get("rng_state"),
+        "velocity_representation": header.get("velocity_representation", "standard"),
         "symbols": symbols,
         "positions": np.array(positions),
         "velocities": np.array(velocities),
@@ -260,23 +276,23 @@ def rotate_rst_checkpoint(
     ensemble,
     energy,
     rng_state=None,
+    velocity_representation=None,
 ):
     """
-    Rotate checkpoint files and write new checkpoint.
+    Rotate runtime checkpoint files and write a new checkpoint.
 
-    Implements GROMACS-style checkpoint rotation:
-        1. If ``rst_path`` exists, move it to ``rst_prev_path``
-        2. Write new checkpoint to ``rst_path``
-
-    This ensures at least two recent checkpoints are always available,
-    protecting against corruption during write.
+    Fresh-start backup of pre-existing ``*_md.rst`` and ``*_md_prev.rst``
+    files is handled earlier by the MD logger using GROMACS-style numbered
+    backups. During an active MD run, the checkpoint writer still preserves
+    the most recent previous checkpoint by moving ``rst_path`` to
+    ``rst_prev_path`` before writing the new ``rst_path``.
 
     Parameters
     ----------
     rst_path : str or Path
         Current checkpoint file path.
     rst_prev_path : str or Path
-        Previous checkpoint file path (backup).
+        Previous runtime checkpoint file path.
     atoms : ase.Atoms
         Atomic system.
     velocities : np.ndarray
@@ -291,6 +307,8 @@ def rotate_rst_checkpoint(
         Total energy in Hartree.
     rng_state : str, optional
         Hex-encoded RNG state (for NVT/NPT).
+    velocity_representation : str, optional
+        Label describing the semantics of the stored velocities.
     """
     rst_path = Path(rst_path)
     rst_prev_path = Path(rst_prev_path)
@@ -309,4 +327,5 @@ def rotate_rst_checkpoint(
         ensemble=ensemble,
         energy=energy,
         rng_state=rng_state,
+        velocity_representation=velocity_representation,
     )

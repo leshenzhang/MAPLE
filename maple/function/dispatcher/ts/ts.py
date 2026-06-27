@@ -23,10 +23,6 @@ class TransitionState(JobABC):
             if self.method is None:
                 raise ValueError('Method is not provided.')
 
-            elif self.method == 'newton':
-                from .algorithm import Newton
-                Newton(self.atoms, output=self.output)
-                
             elif self.method == 'prfo':
                 from .algorithm import PRFO
                 prfo = PRFO(
@@ -115,4 +111,4 @@ class TransitionState(JobABC):
                     raise ValueError('For AutoNEB method, you should provide a Molecules object or a list of structures.')
 
             else:
-                raise ValueError(f'Method {self.method} not recognized. Available methods are: newton, prfo, neb, string, dimer, autoneb.')
+                raise ValueError(f'Method {self.method} not recognized. Available methods are: prfo, neb, string, dimer, autoneb.')

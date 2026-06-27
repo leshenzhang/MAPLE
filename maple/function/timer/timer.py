@@ -113,7 +113,7 @@ class HierarchicalTimer:
             
         Example:
             with timer("Energy Calculation"):
-                energy = calculator.get_energy()
+                energy = atoms.get_potential_energy()
         """
         self.start(name)
         try:
@@ -443,12 +443,12 @@ def timed(name: Optional[str] = None):
         
     Example:
         @timed("Energy Calculation")
-        def get_energy(self, atoms):
+        def compute_energy(self, atoms):
             # ... function body
             return energy
-            
+
         # Equivalent to:
-        def get_energy(self, atoms):
+        def compute_energy(self, atoms):
             with timer("Energy Calculation"):
                 # ... function body
                 return energy

@@ -23,7 +23,7 @@ Barostats   : BerendsenBarostat, CRescaleBarostat (Bernetti & Bussi 2020)
 Logger      : MDLogger
 """
 
-__version__ = '0.1.2'
+__version__ = '0.1.4'
 __author__ = 'MAPLE Development Team'
 
 # Ensembles (primary public API)

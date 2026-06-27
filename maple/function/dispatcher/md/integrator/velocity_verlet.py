@@ -137,23 +137,47 @@ class VelocityVerlet:
 
     def half_step_r(self, velocities: np.ndarray):
         """
-        Perform half-step position update: r(t+dt/2) = r(t) + v(t+dt/2) * dt/2
+        Perform the LFMiddle half-step drift.
 
-        Used in BAOAB splitting: called twice per step, once before and once
-        after the O-step (thermostat), so positions advance by a full dt total.
+        This advances positions by dt/2 using the carried velocities. Calling
+        it twice around the thermostat completes the full LFMiddle drift.
 
         Modifies atoms.positions in-place.
 
         Parameters
         ----------
         velocities : np.ndarray
-            Half-step velocities in atomic units (Bohr/a.u. time)
+            Carried velocities in atomic units (Bohr/a.u. time)
         """
         positions = self.atoms.get_positions()                          # Å
         positions += velocities * (0.5 * self.timestep) * BOHR_TO_ANGSTROM
         self.atoms.set_positions(positions)
         if any(self.atoms.pbc):
             self.atoms.wrap()
+
+    def lfmiddle_full_kick(self, velocities: np.ndarray,
+                           forces: np.ndarray) -> np.ndarray:
+        """
+        Perform the LFMiddle full kick.
+
+        Update rule:
+            velocities + forces / masses * dt
+
+        Parameters
+        ----------
+        velocities : np.ndarray
+            Carried velocities before the full kick, in atomic units
+        forces : np.ndarray
+            Forces at the current positions in atomic units (Ha/Bohr)
+
+        Returns
+        -------
+        np.ndarray
+            Carried velocities after the full kick
+        """
+        dt = self.timestep
+        masses = self.masses[:, np.newaxis]
+        return velocities + forces / masses * dt
 
     def full_step_r(self, velocities: np.ndarray):
         """
@@ -199,13 +223,13 @@ class VelocityVerlet:
 
     def split_step(self, velocities: np.ndarray, forces: np.ndarray) -> np.ndarray:
         """
-        Perform B-A(half) steps for BAOAB thermostat insertion.
+        Perform the existing split Velocity Verlet pre-thermostat leg.
 
-        First leg of the BAOAB splitting scheme:
+        This keeps the current API behavior unchanged:
             B: v(t+dt/2) = v(t) + F(t)/m * dt/2
             A: r(t+dt/2) = r(t) + v(t+dt/2) * dt/2
 
-        The caller then applies the thermostat O-step and calls
+        The caller then applies the thermostat and calls
         complete_split_step() for the second A(half)-B leg.
 
         Parameters
@@ -218,7 +242,7 @@ class VelocityVerlet:
         Returns
         -------
         np.ndarray
-            Half-step velocities (after B, before O-step)
+            Half-step velocities after the first half-kick and half-drift
         """
         dt = self.timestep
         masses = self.masses[:, np.newaxis]
@@ -226,20 +250,44 @@ class VelocityVerlet:
         self.half_step_r(v_half)
         return v_half
 
-    def complete_split_step(self, velocities: np.ndarray) -> tuple:
+    def lfmiddle_post_thermostat(self, velocities: np.ndarray) -> tuple:
         """
-        Perform A(half)-B steps to complete the BAOAB cycle.
+        Complete the post-thermostat LFMiddle primitives.
 
-        Second leg of the BAOAB splitting scheme:
-            A: r(t+dt) = r(t+dt/2) + v_O * dt/2
-            B: v(t+dt) = v_O + F(t+dt)/m * dt/2
-
-        Call after the thermostat O-step.
+        This method:
+            1. Executes the second half-step drift
+            2. Computes forces at the new positions for next-step caching
+            3. Returns the thermostat-updated carried velocity unchanged
 
         Parameters
         ----------
         velocities : np.ndarray
-            Velocities after O-step (thermostat output) in atomic units
+            Thermostat-updated carried velocities in atomic units
+
+        Returns
+        -------
+        tuple of (np.ndarray, np.ndarray)
+            (carried velocities after the thermostat, forces at the new
+            positions to cache for the next step)
+        """
+        self.half_step_r(velocities)
+        forces = self.atoms.get_forces() * HA_PER_ANG_TO_AU   # Ha/Å → Ha/Bohr (a.u.)
+        return velocities, forces
+
+    def complete_split_step(self, velocities: np.ndarray) -> tuple:
+        """
+        Perform the existing split Velocity Verlet post-thermostat leg.
+
+        This keeps the current API behavior unchanged:
+            A: r(t+dt) = r(t+dt/2) + v_thermostat * dt/2
+            B: v(t+dt) = v_thermostat + F(t+dt)/m * dt/2
+
+        Call after the thermostat step.
+
+        Parameters
+        ----------
+        velocities : np.ndarray
+            Velocities after the thermostat step in atomic units
 
         Returns
         -------
@@ -250,7 +298,6 @@ class VelocityVerlet:
         dt = self.timestep
         masses = self.masses[:, np.newaxis]
 
-        self.half_step_r(velocities)
-        forces = self.atoms.get_forces() * HA_PER_ANG_TO_AU   # Ha/Å → Ha/Bohr (a.u.)
+        velocities, forces = self.lfmiddle_post_thermostat(velocities)
         v_new = velocities + 0.5 * forces / masses * dt
         return v_new, forces

@@ -5,7 +5,7 @@ from ..jobABC import JobABC
 from maple.function.timer import timer
 
 class IRC(JobABC):
-    def __init__(self, params: dict, output:str, atoms:Atoms, method:str='hpc'):
+    def __init__(self, params: dict, output:str, atoms:Atoms, method:str='gs'):
         super().__init__(output)
         self.atoms = atoms
         self.method = method

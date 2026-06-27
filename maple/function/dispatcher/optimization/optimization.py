@@ -5,28 +5,33 @@ from ..jobABC import JobABC
 
 from maple.function.timer import timer
 
-class Optmization(JobABC):
-    def __init__(self, params: dict, output:str, atoms:Atoms, method:str='LBFGS'):
+
+class Optimization(JobABC):
+    def __init__(self, params: dict, output: str, atoms: Atoms):
         super().__init__(output)
         self.atoms = atoms
-        if method is None:
-            self.method = 'LBFGS'
-        else:
-            self.method = method
-        self.output = output
         self.commandcontrol = params
-        
+
     def run(self):
         with timer("Optimization"):
-            if self.commandcontrol.get('method', 'lbfgs').lower() == 'lbfgs':
+            method = str(self.commandcontrol.get('method') or 'lbfgs').lower()
+            if method == 'lbfgs':
                 from .algorithm import LBFGS
-                opt = LBFGS(self.atoms, output=self.output, paras=self.commandcontrol)
-                opt.run()
-            elif self.commandcontrol.get('method').lower() == 'rfo':
+                return LBFGS(self.atoms, output=self.output,
+                             paras=self.commandcontrol).run()
+            elif method == 'rfo':
                 from .algorithm import RFO
-                opt = RFO(self.atoms, output=self.output, paras=self.commandcontrol)
-                opt.run()
-            elif self.commandcontrol.get('method', '').lower() in ('sd', 'sdcg', 'cg'):
+                return RFO(self.atoms, output=self.output,
+                           paras=self.commandcontrol).run()
+            elif method in ('sd', 'sdcg', 'cg'):
                 from .algorithm import SDCG
-                opt = SDCG(self.atoms, output=self.output, paras=self.commandcontrol)
-                return opt.run()
+                return SDCG(self.atoms, output=self.output,
+                            paras=self.commandcontrol).run()
+            else:
+                raise NotImplementedError(
+                    f"Unknown opt method: {method!r}. "
+                    f"Supported: lbfgs, rfo, sd, sdcg, cg.")
+
+
+# Backward compatibility for the historical misspelling.
+Optmization = Optimization

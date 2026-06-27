@@ -1,0 +1,10 @@
+#model=aimnet2nse
+#ts(method=autoneb)
+#device=gpu0
+
+XYZ 0 1 gauopt_opt.xyz
+
+XYZ 0 1 gauopt2_opt.xyz
+
+
+

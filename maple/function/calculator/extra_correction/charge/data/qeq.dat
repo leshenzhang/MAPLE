@@ -1,4 +1,4 @@
-# Elt   Eneg    Hard    Radius
+# Elt   Eneg(eV/e)    Hard(eV/e^2)    Radius(Å)
 H 	4.528 	13.8904  0.8271
 He 	9.66 	29.8400  1.7640
 Li 	3.006 	 4.7720  2.4076

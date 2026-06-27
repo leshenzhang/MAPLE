@@ -4,8 +4,6 @@ import numpy as np
 from ase import Atoms
 from .logger import *
 
-g_au = 27.211386024367243
-
 
 def write_xyz(filename: str, atoms_list: list, energies: list = None):
 	"""

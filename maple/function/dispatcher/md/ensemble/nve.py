@@ -19,9 +19,17 @@ from maple.function.timer import timer
 
 from ..integrator.velocity_verlet import VelocityVerlet
 from ..utils import (
+    VELOCITY_REPR_LFMIDDLE_CARRIED,
+    apply_runtime_motion_projection,
     calculate_temperature,
     calculate_kinetic_energy,
+    describe_dof_policy,
+    get_initialization_dof_policy,
+    get_n_dof_from_policy,
+    get_runtime_dof_policy,
     initialize_velocities,
+    lfmiddle_carried_to_standard,
+    FS_TO_AU,
     HA_PER_ANG_TO_AU,
 )
 from ..logger import MDLogger
@@ -100,12 +108,15 @@ class NVEParams:
     traj_format: str = "xyz"        # "xyz" (text, default) or "dcd" (binary)
 
     verbose: int = 1                # 0=concise, 1=detailed
+    debug: bool = False
     init_velocities: bool = True
     restart: bool = False
-    rst_file: str = ""               # Path to RST checkpoint file (default: auto-detect from output name)
+    load_state: bool = False
+    rst_file: str = ""               # Path to RST checkpoint file (explicit source for restart/load_state)
     rst_every: int = 1000
     remove_com: bool = True
-    remove_rotation: bool = False
+    remove_rotation: bool = False  # legacy alias path; prefer remove_angular
+    remove_angular: bool = True    # initialization-only COM + rotation; default keeps isolated-system input velocities clean
 
     # ------------------------------------------------------------------
     # Periodic COM-momentum removal: remove_com_every
@@ -126,9 +137,12 @@ class NVEParams:
     # internal modes; it does NOT break the microcanonical ensemble because
     # the three COM translational DOF carry zero internal information.
     #
-    # Default interval 100 steps: identical to GROMACS (nstcomm=100),
-    # AMBER (nscm=100), LAMMPS (fix momentum 100 linear 1 1 1), and
-    # OpenMM's default ComMotionRemover period.
+    # Runtime COM removal is optional. For strict NVE, the default is disabled
+    # (`remove_com_every = 0`) so the trajectory remains a pure Hamiltonian
+    # evolution after initialization. Users can still opt in to periodic COM
+    # drift removal (for example every 100 steps, as in GROMACS/AMBER/LAMMPS/
+    # OpenMM) when they want numerical COM-drift control rather than a strict
+    # integrator benchmark.
     #
     # Refs:
     #   GROMACS Reference Manual 2024, §3.4.4 "Removal of COM motion":
@@ -145,11 +159,13 @@ class NVEParams:
     #     rotational-translational coupling gradually leaks energy into
     #     internal modes, inflating σ(TE) by 10–20 % over nanosecond runs.
     #
-    # Set to 0 to disable (only recommended for PBC systems where ASE's
-    # wrap() already handles cell-image drift; COM removal has no effect
-    # on periodic systems because the COM DOF are not well-defined).
+    # Set to 0 to disable. Under PBC, remove_com_every remains an optional
+    # numerical COM-drift control; wrap() handles cell imaging, but it does
+    # not zero the total momentum. In contrast, remove_angular_every is
+    # ignored under PBC because global rigid-body rotation is not well-defined.
     # ------------------------------------------------------------------
-    remove_com_every: int = 100     # steps  [GROMACS nstcomm=100; AMBER nscm=100; Harvey 1998]
+    remove_com_every: int = 0       # runtime-only COM projection cadence; default disabled for strict NVE
+    remove_angular_every: int = 0   # runtime-only angular projection cadence (includes COM first)
 
     # ------------------------------------------------------------------
     # Random seed
@@ -191,6 +207,7 @@ class NVE(JobABC):
             traj_every=self.params.traj_every,
             traj_format=self.params.traj_format,
             verbose=self.params.verbose,
+            debug=self.params.debug,
         )
 
     def run(self):
@@ -201,7 +218,11 @@ class NVE(JobABC):
             # Log parameters
             self._log_parameters()
 
-            if self.params.restart:
+            if self.params.load_state:
+                if self.params.init_velocities and self.params.debug:
+                    self.log_info([
+                        "\nload_state=True: ignoring init_velocities and using coordinates/velocities from RST.\n"
+                    ])
                 result = self.logger.restart_simulation(
                     ensemble='nve',
                     timestep=self.params.timestep,
@@ -209,10 +230,29 @@ class NVE(JobABC):
                     temperature=self.params.temperature,
                     atoms=self.atoms,
                     rst_file=self.params.rst_file if self.params.rst_file else None,
+                    load_state=True,
+                )
+                self.atoms, velocities, step_offset = result
+                velocities = self._restore_standard_velocities(velocities)
+                remaining = self.params.steps
+            elif self.params.restart:
+                if self.params.init_velocities and self.params.debug:
+                    self.log_info([
+                        "\nrestart=True: ignoring init_velocities and using coordinates/velocities from RST.\n"
+                    ])
+                result = self.logger.restart_simulation(
+                    ensemble='nve',
+                    timestep=self.params.timestep,
+                    n_steps=self.params.steps,
+                    temperature=self.params.temperature,
+                    atoms=self.atoms,
+                    rst_file=self.params.rst_file if self.params.rst_file else None,
+                    load_state=False,
                 )
                 if result is None:   # already completed
                     return
                 self.atoms, velocities, step_offset = result
+                velocities = self._restore_standard_velocities(velocities)
                 remaining = self.params.steps - step_offset
             else:
                 # ── Velocity initialisation ───────────────────────────────
@@ -239,6 +279,8 @@ class NVE(JobABC):
                     velocities = self.atoms.arrays['velocities']
                 step_offset = 0
                 remaining   = self.params.steps
+                source = "input_xyz" if 'velocities' in self.atoms.arrays and not self.params.init_velocities else ("input_xyz" if 'velocities' in self.atoms.arrays and self.params.init_velocities else "init_velocities")
+                self.logger.log_debug_initial_state(self.atoms, velocities, mode=source, effective_step=step_offset)
 
             # Run simulation
             final_velocities = self._run_simulation(velocities,
@@ -250,13 +292,19 @@ class NVE(JobABC):
 
     def _log_parameters(self):
         """Log NVE parameters to output."""
-        # Format COM-removal status for display
+        # Runtime motion projection settings are parallel, not enable/disable toggles.
         if any(self.atoms.pbc):
-            com_status = "disabled (PBC — not applicable)"
-        elif self.params.remove_com_every == 0:
-            com_status = "disabled (remove_com_every=0)"
+            com_status = ("disabled (remove_com_every=0)"
+                          if self.params.remove_com_every == 0
+                          else f"every {self.params.remove_com_every} steps (PBC COM drift removal)")
+            angular_status = "disabled (PBC — rigid-body rotation is not well-defined)"
         else:
-            com_status = f"every {self.params.remove_com_every} steps"
+            com_status = ("disabled (remove_com_every=0)"
+                          if self.params.remove_com_every == 0
+                          else f"every {self.params.remove_com_every} steps")
+            angular_status = ("disabled (remove_angular_every=0)"
+                              if self.params.remove_angular_every == 0
+                              else f"every {self.params.remove_angular_every} steps")
 
         self.log_info([
             "\n" + "="*80 + "\n",
@@ -271,9 +319,12 @@ class NVE(JobABC):
             f"  Traj every:       {self.params.traj_every} steps\n",
             f"\nVelocity init:      {self.params.init_velocities}\n",
             f"Restart mode:       {self.params.restart}\n",
+            f"Load-state mode:    {self.params.load_state}\n",
             f"RST every:          {self.params.rst_every} steps\n",
-            f"Remove COM motion:  {self.params.remove_com}\n",
+            f"Remove COM:         {self.params.remove_com} (initialization-only)\n",
+            f"Remove angular:     {self.params.remove_angular} (initialization-only; includes COM+rotation)\n",
             f"Remove COM every:   {com_status}\n",
+            f"Remove angular ev.: {angular_status}\n",
         ])
 
         if self.params.random_seed is not None:
@@ -320,8 +371,9 @@ class NVE(JobABC):
         #   #md(ensemble=nve, timestep=0.1, steps=100000, restart=true)
         #
         # Only suppress this warning if you have already equilibrated the
-        # system with NVT (restart=true from a completed NVT run).
-        if not self.params.restart:
+        # system with NVT (restart=true from a completed NVT run, or
+        # load_state=true from an equilibrated NVT checkpoint).
+        if not (self.params.restart or self.params.load_state):
             nvt_warn = (
                 "\n"
                 "  ┌─ NVT PRE-EQUILIBRATION ADVISORY ──────────────────────────────────────┐\n"
@@ -341,6 +393,19 @@ class NVE(JobABC):
             self.log_info([nvt_warn])
             print(nvt_warn, end='', flush=True)
 
+    def _restore_standard_velocities(self, velocities: np.ndarray) -> np.ndarray:
+        # NVT (LF-Middle Langevin) writes carried velocities to .rst. Standard
+        # Velocity Verlet expects v_standard = v_carried + 0.5 * F * dt / m at
+        # the saved position; without this half-kick the NVE microcanonical
+        # surface is offset by O(dt²) and ⟨T⟩ drifts low.
+        if self.logger.resumed_velocity_representation != VELOCITY_REPR_LFMIDDLE_CARRIED:
+            return velocities
+        forces = self.atoms.get_forces() * HA_PER_ANG_TO_AU
+        source_dt_au = (self.logger.resumed_timestep * FS_TO_AU
+                        if self.logger.resumed_timestep is not None
+                        else self.params.timestep * FS_TO_AU)
+        return lfmiddle_carried_to_standard(self.atoms, velocities, forces, source_dt_au)
+
     def _initialize_velocities(self) -> np.ndarray:
         """
         Initialize velocities from Maxwell-Boltzmann distribution.
@@ -359,27 +424,50 @@ class NVE(JobABC):
             else None
         )
 
-        # Remind user to consider removing angular momentum for isolated molecules
-        if not any(self.atoms.pbc) and not self.params.remove_rotation:
+        # Remind user to consider removing angular momentum for isolated molecules.
+        if not any(self.atoms.pbc) and not self.params.remove_angular:
             msg = (
                 "NOTE: Non-periodic system detected. In NVE, total angular momentum\n"
                 "  is conserved, so any initial L causes rigid-body rotation throughout\n"
-                "  the run. Consider setting remove_rotation=true to project it out.\n"
+                "  the run. Consider setting remove_angular=true for initialization-only\n"
+                "  projection, or remove_angular_every>0 for runtime angular removal.\n"
+            )
+            self.log_info([msg])
+            print(msg, end='', flush=True)
+        if (not any(self.atoms.pbc) and self.params.remove_angular
+                and self.params.remove_angular_every == 0):
+            msg = (
+                "NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,\n"
+                "  not an on/off pair. Initialization removes COM + rigid-body rotation once,\n"
+                "  but runtime angular motion will not be projected out during the run.\n"
             )
             self.log_info([msg])
             print(msg, end='', flush=True)
 
         # Initialize velocities
+        runtime_policy = get_runtime_dof_policy(
+            self.atoms,
+            remove_com_every=self.params.remove_com_every,
+            remove_angular_every=self.params.remove_angular_every,
+        )
+        runtime_n_dof = get_n_dof_from_policy(runtime_policy)
+
         velocities = initialize_velocities(
             atoms=self.atoms,
             temperature=self.params.temperature,
             remove_com=self.params.remove_com,
             remove_rotation=self.params.remove_rotation,
+            remove_angular=self.params.remove_angular,
+            target_n_dof=runtime_n_dof,
             rng=rng
         )
 
-        # Verify temperature
-        actual_temp = calculate_temperature(self.atoms, velocities)
+        # Verify temperature against the runtime DOF policy.
+        actual_temp = calculate_temperature(
+            self.atoms,
+            velocities,
+            n_dof=runtime_n_dof,
+        )
         self.log_info([
             f"Initial temperature: {actual_temp:.2f} K\n"
         ])
@@ -420,23 +508,28 @@ class NVE(JobABC):
             temperature=self.params.temperature,
             atoms=self.atoms,
             step_offset=step_offset,
+            n_dof=get_n_dof_from_policy(get_runtime_dof_policy(
+                self.atoms,
+                remove_com_every=self.params.remove_com_every,
+                remove_angular_every=self.params.remove_angular_every,
+            )),
+            dof_description=describe_dof_policy(get_runtime_dof_policy(
+                self.atoms,
+                remove_com_every=self.params.remove_com_every,
+                remove_angular_every=self.params.remove_angular_every,
+            )),
         )
 
         self.logger.log_main(["\nStarting NVE simulation...\n\n"])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
-        masses_1d = integrator.masses          # shape (N,) atomic units
-        total_mass = masses_1d.sum()
-        v = velocities.copy()
-
-        # Determine COM-removal schedule.
-        # For PBC systems ASE's wrap() handles cell-image drift; COM removal
-        # is not meaningful for periodic cells (no well-defined global COM).
-        # For non-periodic (gas-phase) systems, remove every remove_com_every
-        # steps (default 100), mirroring GROMACS nstcomm=100, AMBER nscm=100.
-        _remove_com_every = (
-            0 if any(self.atoms.pbc) else self.params.remove_com_every
+        runtime_policy = get_runtime_dof_policy(
+            self.atoms,
+            remove_com_every=self.params.remove_com_every,
+            remove_angular_every=self.params.remove_angular_every,
         )
+        runtime_n_dof = get_n_dof_from_policy(runtime_policy)
+        v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.
         forces = self.atoms.get_forces() * HA_PER_ANG_TO_AU  # Ha/Å → a.u.
@@ -446,31 +539,23 @@ class NVE(JobABC):
             # Full B-A-B Velocity Verlet step (forces cached across steps)
             v, forces = integrator.step(v, forces)
 
-            # ── Periodic COM-momentum removal ─────────────────────────────
-            # Remove the three translational degrees of freedom that carry no
-            # thermodynamic information but accumulate floating-point noise.
-            #
-            # Algorithm: subtract the mass-weighted mean velocity (COM velocity)
-            # from every atom.  This is a projection, not a rescaling; KE of
-            # all internal (vibrational + rotational) modes is preserved exactly.
-            #
-            # Placement: applied AFTER the full VV step so that forces and
-            # positions are mutually consistent at the time of removal.
-            # Applying it between the two B half-steps would contaminate the
-            # force cache used by the next step.
-            #
-            # Refs:
-            #   GROMACS Manual 2024 §3.4.4; AMBER 2023 Manual §3.1 (nscm);
-            #   LAMMPS "fix momentum" docs;
-            #   Harvey et al. (1998) J. Comput. Chem. 19, 726.
-            if _remove_com_every and step % _remove_com_every == 0:
-                p_com = np.sum(masses_1d[:, np.newaxis] * v, axis=0)  # (3,)
-                v -= p_com / total_mass                                # v_com → 0
+            # Runtime motion projection is controlled by two parallel settings:
+            # `remove_com_every` handles runtime COM removal only, while
+            # `remove_angular_every` handles runtime angular projection and always
+            # includes COM removal first. If angular projection fires on this step,
+            # it supersedes COM-only removal for the same step.
+            v, _projection = apply_runtime_motion_projection(
+                self.atoms,
+                v,
+                step=step,
+                remove_com_every=self.params.remove_com_every,
+                remove_angular_every=self.params.remove_angular_every,
+            )
 
             # Calculate thermodynamic quantities
             abs_step      = step_offset + step
             current_time  = abs_step * self.params.timestep
-            temperature   = calculate_temperature(self.atoms, v)
+            temperature   = calculate_temperature(self.atoms, v, n_dof=runtime_n_dof)
             kinetic_energy   = calculate_kinetic_energy(self.atoms, v)
             potential_energy = self.atoms.get_potential_energy()  # Ha
             total_energy     = kinetic_energy + potential_energy
