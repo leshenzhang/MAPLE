@@ -445,10 +445,10 @@ class NVE(JobABC):
             print(msg, end='', flush=True)
 
         # Initialize velocities
-        runtime_policy = get_runtime_dof_policy(
+        runtime_policy = get_initialization_dof_policy(
             self.atoms,
-            remove_com_every=self.params.remove_com_every,
-            remove_angular_every=self.params.remove_angular_every,
+            remove_com=self.params.remove_com,
+            remove_angular=self.params.remove_angular,
         )
         runtime_n_dof = get_n_dof_from_policy(runtime_policy)
 
@@ -508,27 +508,34 @@ class NVE(JobABC):
             temperature=self.params.temperature,
             atoms=self.atoms,
             step_offset=step_offset,
-            n_dof=get_n_dof_from_policy(get_runtime_dof_policy(
+            n_dof=get_n_dof_from_policy(get_initialization_dof_policy(
                 self.atoms,
-                remove_com_every=self.params.remove_com_every,
-                remove_angular_every=self.params.remove_angular_every,
+                remove_com=self.params.remove_com,
+                remove_angular=self.params.remove_angular,
             )),
-            dof_description=describe_dof_policy(get_runtime_dof_policy(
+            dof_description=describe_dof_policy(get_initialization_dof_policy(
                 self.atoms,
-                remove_com_every=self.params.remove_com_every,
-                remove_angular_every=self.params.remove_angular_every,
+                remove_com=self.params.remove_com,
+                remove_angular=self.params.remove_angular,
             )),
         )
 
         self.logger.log_main(["\nStarting NVE simulation...\n\n"])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
-        runtime_policy = get_runtime_dof_policy(
+        # BUGFIX(ai-maple-md): NVE conserves total linear momentum (and, for an
+        # isolated / non-PBC system, total angular momentum). The 3 (COM) [+3
+        # rotation] DOF removed ONCE at initialization therefore stay frozen for
+        # the whole trajectory, so the reported temperature must use the
+        # INITIALIZATION DOF policy (3N-3[-3]), not the runtime policy, which with
+        # remove_*_every=0 returns 3N and biases T by n_dof_init/3N (CH4: 9/15).
+        # NVT is unaffected (its thermostat performs runtime projection).
+        nve_policy = get_initialization_dof_policy(
             self.atoms,
-            remove_com_every=self.params.remove_com_every,
-            remove_angular_every=self.params.remove_angular_every,
+            remove_com=self.params.remove_com,
+            remove_angular=self.params.remove_angular,
         )
-        runtime_n_dof = get_n_dof_from_policy(runtime_policy)
+        runtime_n_dof = get_n_dof_from_policy(nve_policy)
         v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.
