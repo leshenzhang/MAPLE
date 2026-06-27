@@ -13,7 +13,7 @@ import os
 import math
 import torch
 from dataclasses import dataclass
-from typing import Optional, Callable, List, Tuple
+from typing import Optional, Callable, List
 
 import numpy as np
 from ase import Atoms
@@ -245,80 +245,6 @@ class Dimer(JobABC):
             n = _remove_rigid_body_components(n, self.atoms, M=self.M)
         n = _normalize(n, M=self.M)
         return n
-
-    # ----------------------- curvature & rotation helpers ---------------------
-
-    def _finite_diff_Hn_and_F(self, x_flat: np.ndarray, n: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Return (Hn, F_avg, F_diff) with central difference using forces at R ± Δ n.
-        """
-        p = self.params
-        Δ = float(p.delta)
-
-        # save & perturb positions
-        X = x_flat.reshape(-1, 3)
-        # +Δ
-        self.atoms.set_positions((X + Δ * n.reshape(-1, 3)))
-        F_plus = to_numpy_f64(self.atoms.get_forces()).reshape(-1)
-        # -Δ
-        self.atoms.set_positions((X - Δ * n.reshape(-1, 3)))
-        F_minus = to_numpy_f64(self.atoms.get_forces()).reshape(-1)
-        # restore
-        self.atoms.set_positions(X)
-
-        F_avg = 0.5 * (F_plus + F_minus)
-        F_diff = 0.5 * (F_plus - F_minus)
-        Hn = -(F_plus - F_minus) / (2.0 * Δ)  # central difference for Hn
-        return Hn, F_avg, F_diff
-
-    def _hvp_Hn_and_F(self, x_flat: np.ndarray, n: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Return (Hn, F) using autograd HVP for Hn, and single force at R for F.
-        """
-        # force at current R
-        F = to_numpy_f64(self.atoms.get_forces()).reshape(-1)
-        # Hn via callback
-        if self.hvp_fn is None:
-            raise RuntimeError("use_hvp=True but hvp_fn is not provided.")
-        Hn = vec1d(self.hvp_fn(self.atoms, n), n.size)
-        return Hn, F
-
-    def _rotate_minimize_kappa(self, x_flat: np.ndarray, n: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        """
-        Do up to rot_max_iter steps of rotation to minimize kappa = n^T H n.
-        Returns (n_new, max|F_rot|, rms(F_rot)).
-        """
-        p = self.params
-        n_cur = n.copy()
-
-        for _ in range(p.rot_max_iter):
-            if self.hvp_fn is not None and p.use_hvp:
-                Hn, F = self._hvp_Hn_and_F(x_flat, n_cur)
-                # we only need Hn for rotation; F used later for translation
-            else:
-                Hn, F_avg, _ = self._finite_diff_Hn_and_F(x_flat, n_cur)
-                F = F_avg  # keep F_avg for later translation when using FD
-
-            # rotation force: (I - nn^T) Hn
-            F_par = _proj_parallel(Hn, n_cur, M=self.M)
-            F_rot = Hn - F_par
-
-            max_frot = float(np.max(np.abs(F_rot)))
-            rms_frot = float(math.sqrt(np.mean(F_rot * F_rot)))
-
-            # convergence of rotation
-            if (max_frot < p.rot_f_max_th) and (rms_frot < p.rot_f_rms_th):
-                return n_cur, max_frot, rms_frot
-
-            # gradient descent on kappa: n <- n - α * F_rot (and renormalize)
-            n_next = n_cur - p.rot_alpha * F_rot
-            if self.params.remove_rigid:
-                n_next = _remove_rigid_body_components(n_next, self.atoms, M=self.M)
-            n_next = _normalize(n_next, M=self.M)
-            n_cur = n_next
-
-        # after max rot steps return last
-        return n_cur, max_frot, rms_frot
 
     # ------------------------------- main flow --------------------------------
 
