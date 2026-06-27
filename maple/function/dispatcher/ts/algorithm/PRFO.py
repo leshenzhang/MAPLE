@@ -725,10 +725,6 @@ class PRFO(JobABC):
                     f"Gradient size {g_cart.size} != Hessian dim {n3}"
                 )
             
-            # Eigenvalues for logging
-            eigvals_log, _ = np.linalg.eigh(H_cart)
-            eigvals_log = np.real(eigvals_log).astype(np.float64).squeeze()
-            
             # Mass-weighting
             masses = to_numpy_f64(atoms.get_masses())
             masses = np.where(masses > 0.0, masses, 1.0)

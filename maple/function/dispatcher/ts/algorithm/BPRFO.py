@@ -110,6 +110,13 @@ class BatchPRFO:
         self._arange_n = None
         self._real_mask = None
         self._D = None
+        # Per-structure convergence thresholds, built ONCE per topology in
+        # _rebuild_topology (they only change when the batch shrinks/refills)
+        # instead of being rebuilt from python lists every _check_convergence.
+        self._f_max_th = None
+        self._f_rms_th = None
+        self._dp_max_th = None
+        self._dp_rms_th = None
 
         self._orig_index = None
         self._H_work = None
@@ -559,6 +566,24 @@ class BatchPRFO:
         mass = _masses_flat(atoms_list, self._nmax, device)
         self._D = 1.0 / torch.sqrt(torch.clamp(mass, min=1e-12))
 
+        # Precompute per-structure convergence thresholds ONCE per topology
+        # (mirror blbfgs). These only change when the batch shrinks/refills,
+        # which re-calls this method, so rebuilding them from python lists every
+        # _check_convergence (host->device copy + sync x4) was pure overhead.
+        # TS-search defaults (looser |F| than minimization) are preserved.
+        self._f_max_th = torch.tensor(
+            [getattr(at, "f_max_th", 9.5e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+        self._f_rms_th = torch.tensor(
+            [getattr(at, "f_rms_th", 5e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+        self._dp_max_th = torch.tensor(
+            [getattr(at, "dp_max_th", 1.8e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+        self._dp_rms_th = torch.tensor(
+            [getattr(at, "dp_rms_th", 1.2e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+
     def _sync_atoms_from_calc(self, calc, atoms_list):
         with torch.no_grad():
             pos = _get_coord_gpu(calc).detach().cpu().numpy()
@@ -823,18 +848,13 @@ class BatchPRFO:
             F_final = F_final.to(dtype=DTYPE)
             g_last = -F_final * real_mask.to(DTYPE)
 
-        f_max_th = torch.tensor(
-            [getattr(at, "f_max_th", 9.5e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
-        f_rms_th = torch.tensor(
-            [getattr(at, "f_rms_th", 5e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
-        dp_max_th = torch.tensor(
-            [getattr(at, "dp_max_th", 1.8e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
-        dp_rms_th = torch.tensor(
-            [getattr(at, "dp_rms_th", 1.2e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
+        # Thresholds are built ONCE per topology in _rebuild_topology (mirror
+        # blbfgs); reuse the cached (B,) tensors instead of rebuilding from
+        # python lists every iteration.
+        f_max_th = self._f_max_th
+        f_rms_th = self._f_rms_th
+        dp_max_th = self._dp_max_th
+        dp_rms_th = self._dp_rms_th
 
         L_eff = self._L_vec.clamp(min=1).to(DTYPE)
 

@@ -59,6 +59,12 @@ class RFO(JobABC):
         self.params = self._init_params(RFOParams, paras, ("rfo", "RFO", "opt"))
         self.trust_radius = float(self.params.trust_radius_init)
         self._last_iter_info = None
+        # Geometry-keyed Hessian cache: the Hessian is a pure function of the
+        # coordinates, so a rejected step (which rolls the geometry back to X and
+        # re-enters the loop at the SAME positions) can reuse the cached Hessian
+        # instead of paying for another full calc.get_hessian() evaluation.
+        self._hess_cache = None
+        self._hess_cache_key = None
 
     # ----------------------------------------------------------
     # Public API
@@ -190,13 +196,25 @@ class RFO(JobABC):
     # Core math
     # ----------------------------------------------------------
     def _calculate_hessian(self, atoms: Atoms) -> np.ndarray:
-        """Fetch Hessian from calculator and ensure square (3N x 3N) float64."""
+        """Fetch Hessian from calculator and ensure square (3N x 3N) float64.
+
+        Geometry-keyed cache: keyed on the raw coordinate bytes, so a rejected
+        step (geometry rolled back to X, then the loop re-enters at the SAME
+        positions) reuses the previously computed Hessian instead of a second
+        full calc.get_hessian() evaluation. An accepted step changes the
+        positions -> cache miss -> recompute.
+        """
+        key = atoms.get_positions().tobytes()
+        if self._hess_cache is not None and self._hess_cache_key == key:
+            return self._hess_cache
         H = atoms.calc.get_hessian(atoms)
         H = to_numpy_f64(H)
         if H.ndim == 3 and H.shape[0] == 1:
             H = H[0]
         if H.ndim != 2 or H.shape[0] != H.shape[1]:
             raise ValueError(f"Hessian must be square, got shape={H.shape}")
+        self._hess_cache = H
+        self._hess_cache_key = key
         return H
 
     def _mass_weight(self, H_cart: np.ndarray, g_cart: np.ndarray, atoms: Atoms) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
