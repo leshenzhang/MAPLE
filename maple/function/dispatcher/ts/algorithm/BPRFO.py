@@ -74,6 +74,9 @@ class BatchPRFO:
                  max_outer_iter: int = 256,
                  device: str = "cuda",
                  recalc: int = 4,
+                 pool_queue: Optional[list] = None,
+                 B_target: Optional[int] = None,
+                 pool_size_bucket: bool = False,
                  hessian_update: str = "bofill"):
         self.trust_init = trust_init
         self.trust_min = trust_min
@@ -130,12 +133,25 @@ class BatchPRFO:
         self._restart_count = None
         self._final_status = None         # per ORIGINAL index: converged / evicted_straggler / max_iter
 
+        # --- streaming pool (optional; None => no pooling => baseline behavior) ---
+        # A list of pending ASE Atoms TS-guesses used to refill the active batch
+        # back up to `B_target` after structures converge/evict and the batch shrinks.
+        self._pool_queue_init = list(pool_queue) if pool_queue is not None else None
+        self._B_target_init = int(B_target) if B_target is not None else None
+        self._pool_size_bucket = bool(pool_size_bucket)
+        self._pool_queue = None            # live queue (set in run())
+        self._B_target = None              # live target (set in run())
+        self._next_orig = 0                # next free ORIGINAL index for refilled guesses
+        self._pool_refilled = 0            # diagnostics: total guesses pulled from queue
+
 
     # ===================================================
     # PUBLIC RUN
     # ===================================================
     @profile
-    def run(self, mols) -> None:
+    def run(self, mols,
+            pool_queue: Optional[list] = None,
+            B_target: Optional[int] = None) -> None:
         device = self.device
         atoms_list = list(mols.multiatoms)
         calc = mols.calc
@@ -144,7 +160,21 @@ class BatchPRFO:
         if B0 == 0:
             return
 
+        # --- resolve streaming-pool config (run() args override __init__ defaults) ---
+        pq = pool_queue if pool_queue is not None else self._pool_queue_init
+        bt = B_target if B_target is not None else self._B_target_init
+        self._pool_queue = list(pq) if pq is not None else None
+        self._B_target = int(bt) if bt is not None else None
+        if (self._pool_queue is not None and self._B_target is not None
+                and self._pool_size_bucket):
+            # D1.5 size-bucketing: optimize most-homogeneous refills first (less padding
+            # waste) by draining the queue in ascending atom-count order.
+            self._pool_queue.sort(key=lambda a: len(a))
+        self._pool_refilled = 0
+
         self._orig_index = torch.arange(B0, dtype=torch.long, device=device)
+        # ORIGINAL-index counter; refilled guesses get fresh indices >= B0.
+        self._next_orig = B0
 
         self._open_log()
         self._w("# RS-PRFO batched TS search start\n")
@@ -339,9 +369,21 @@ class BatchPRFO:
 
             # Dynamic batch shrinking (on-GPU mask drives the shrink).
             survive_local = (~final_done).nonzero(as_tuple=False).flatten()
-            if survive_local.numel() < final_done.numel():
+
+            # Streaming pool: after the shrink, the active batch can be refilled from
+            # `self._pool_queue` back up to `self._B_target` (keeps the GPU saturated).
+            # Pooling disabled (queue/target None) => want_refill is always False =>
+            # this whole block reduces EXACTLY to the original shrink-only behavior.
+            pooling = (self._pool_queue is not None and self._B_target is not None)
+            n_room = (self._B_target - int(survive_local.numel())) if pooling else 0
+            want_refill = pooling and (n_room > 0) and (len(self._pool_queue) > 0)
+
+            if (survive_local.numel() < final_done.numel()) or want_refill:
+                # Commit current geometries back into the (pre-slice) atoms objects so
+                # survivors keep their optimized coords across the prepare() rebuild.
                 self._sync_atoms_from_calc(calc, atoms_list)
 
+                # ---- Slice survivors (every per-structure state in lockstep) ----
                 atoms_list = [atoms_list[i] for i in survive_local.cpu().tolist()]
                 self._orig_index = self._orig_index[survive_local]
 
@@ -360,14 +402,115 @@ class BatchPRFO:
                 self._pin_streak = self._pin_streak[survive_local]
                 self._restart_count = self._restart_count[survive_local]
 
-                calc.prepare(atoms_list, fixed_nmax=self._nmax)
-                self._rebuild_topology(atoms_list)
-
-                # Slice working buffers
+                # Slice working buffers in lockstep.
                 if self._H_work is not None:
                     self._H_work = self._H_work[survive_local]
                 if self._g_cart_prev is not None:
                     self._g_cart_prev = self._g_cart_prev[survive_local]
+
+                # ---- Streaming pool refill (INVERSE of the shrink above) ----
+                # Pull up to (B_target - active) fresh guesses and torch.cat new rows
+                # onto EVERY per-structure tensor so the batch stays in lockstep.
+                if want_refill:
+                    k_want = self._B_target - len(atoms_list)
+                    new_atoms = []
+                    while len(new_atoms) < k_want and self._pool_queue:
+                        cand = self._pool_queue.pop(0)
+                        if 3 * len(cand) > self._nmax:
+                            # Cannot fit the fixed padded layout (nmax fixed at startup).
+                            self._w(f"[Iter {outer_it}] pool: skip guess with "
+                                    f"{len(cand)} atoms (> nmax_atoms {self._nmax // 3})\n")
+                            continue
+                        new_atoms.append(cand)
+                    k = len(new_atoms)
+                    if k > 0:
+                        # Fresh ORIGINAL indices for the newcomers (unique, monotonic).
+                        new_oi = list(range(self._next_orig, self._next_orig + k))
+                        self._next_orig += k
+                        self._pool_refilled += k
+
+                        # Extend python-side per-ORIGINAL-index bookkeeping + xyz sinks.
+                        for j, at in enumerate(new_atoms):
+                            oi = new_oi[j]
+                            self._symbols_per_batch.append(at.get_chemical_symbols())
+                            self._final_status.append(None)
+                            p = os.path.join(self.out_dir, f"ts_batch{oi + 1}.xyz")
+                            self.xyz_paths.append(p)
+                            self.frame_counts.append(0)
+                            open(p, "w").close()
+
+                        # Extend the active set + its ORIGINAL-index map.
+                        atoms_list = atoms_list + new_atoms
+                        self._orig_index = torch.cat([
+                            self._orig_index,
+                            torch.tensor(new_oi, dtype=torch.long, device=device),
+                        ])
+
+                        # New per-structure (B,) state: trust=trust_init, last_step=0,
+                        # all robustness counters = 0.
+                        trust_r = torch.cat([
+                            trust_r,
+                            torch.full((k,), self.trust_init, dtype=DTYPE, device=device),
+                        ])
+                        last_step = torch.cat([
+                            last_step,
+                            torch.zeros((k, self._nmax), dtype=DTYPE, device=device),
+                        ])
+                        # One zero tensor feeds all five cats (torch.cat copies into
+                        # fresh storage and never mutates its inputs -> no clones).
+                        zl = torch.zeros((k,), dtype=torch.long, device=device)
+                        self._iter_count = torch.cat([self._iter_count, zl])
+                        self._recalc_count = torch.cat([self._recalc_count, zl])
+                        self._bad_streak = torch.cat([self._bad_streak, zl])
+                        self._pin_streak = torch.cat([self._pin_streak, zl])
+                        self._restart_count = torch.cat([self._restart_count, zl])
+
+                        # Mode tracking: seed newcomers with a ZERO reference vector so the
+                        # next _eigh_and_track_modes (overlap branch) auto-selects eigen-
+                        # mode 0 (the lowest/most-negative mode after ascending eigh) = the
+                        # TS reaction coordinate. No special-casing needed.
+                        if self.tracked_mode_idx is not None:
+                            self.tracked_mode_idx = torch.cat([
+                                self.tracked_mode_idx,
+                                torch.zeros((k,), dtype=torch.long, device=device),
+                            ])
+                        if self.tracked_mode_vec_mw is not None:
+                            self.tracked_mode_vec_mw = torch.cat([
+                                self.tracked_mode_vec_mw,
+                                torch.zeros((k, self._nmax), dtype=DTYPE, device=device),
+                            ])
+
+                        # New working Hessian = identity (Cartesian), prev grad = 0 (like
+                        # the startup init); the RecalcFC schedule replaces it with the
+                        # exact numerical Hessian within `self.recalc` iterations.
+                        if self._H_work is not None:
+                            # cat copies into fresh storage, so the 0-stride expand
+                            # is fine here (no .contiguous() materialization needed).
+                            eye = torch.eye(self._nmax, dtype=DTYPE, device=device)
+                            self._H_work = torch.cat([
+                                self._H_work,
+                                eye.unsqueeze(0).expand(k, -1, -1),
+                            ])
+                        if self._g_cart_prev is not None:
+                            self._g_cart_prev = torch.cat([
+                                self._g_cart_prev,
+                                torch.zeros((k, self._nmax), dtype=DTYPE, device=device),
+                            ])
+
+                        self._w(f"[Iter {outer_it}] pool refill +{k} "
+                                f"(active={len(atoms_list)}, queue_left="
+                                f"{len(self._pool_queue)})\n")
+
+                # ---- Rebuild calculator topology ONCE for the new active set ----
+                calc.prepare(atoms_list, fixed_nmax=self._nmax)
+                self._rebuild_topology(atoms_list)
+
+                # Dump the init frame of any freshly refilled structures (trajectory
+                # completeness; survivors already have their running trajectory).
+                if want_refill and len(atoms_list) > survive_local.numel():
+                    n_new = len(atoms_list) - int(survive_local.numel())
+                    new_local = list(range(len(atoms_list) - n_new, len(atoms_list)))
+                    self._dump_xyz_locals(calc, new_local, tag="refill_init")
 
         else:
             self._w("# Maximum iterations reached.\n")
@@ -382,7 +525,8 @@ class BatchPRFO:
         n_evict = sum(1 for s in self._final_status if s == "evicted_straggler")
         n_max = sum(1 for s in self._final_status if s == "max_iter")
         self._w(f"# Final status: converged={n_conv} evicted_straggler={n_evict} "
-                f"max_iter={n_max} (mu_unbracketed={self._mu_unbracketed})\n")
+                f"max_iter={n_max} (mu_unbracketed={self._mu_unbracketed}, "
+                f"pool_refilled={self._pool_refilled})\n")
 
         self._close_log()
 
@@ -1071,6 +1215,23 @@ class BatchPRFO:
             idx_orig = int(self._orig_index[i_local].item())
             symbols = self._symbols_per_batch[idx_orig]
             self._append_xyz(idx_orig, symbols, pos[s:t], f"iter={it}")
+
+    def _dump_xyz_locals(self, calc, local_indices, tag=""):
+        """Dump current geometry for an explicit list of LOCAL batch indices.
+
+        Used to record the initial frame of structures freshly pulled into the
+        active batch by the streaming pool (after calc.prepare/_rebuild_topology).
+        """
+        if not local_indices:
+            return
+        with torch.no_grad():
+            pos = _get_coord_gpu(calc).detach().cpu().numpy()
+        ptr = self._ptr.detach().cpu().numpy()
+        for i_local in local_indices:
+            s, t = ptr[i_local], ptr[i_local + 1]
+            idx_orig = int(self._orig_index[i_local].item())
+            symbols = self._symbols_per_batch[idx_orig]
+            self._append_xyz(idx_orig, symbols, pos[s:t], tag)
 
     def _append_xyz(self, idx_orig, symbols, pos_np, comment=""):
         path = self.xyz_paths[idx_orig]
