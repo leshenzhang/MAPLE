@@ -501,6 +501,16 @@ class BatchPRFO:
                                 f"(active={len(atoms_list)}, queue_left="
                                 f"{len(self._pool_queue)})\n")
 
+                        # D1-1: newcomers are seeded with an IDENTITY working
+                        # Hessian and a ZERO previous-gradient placeholder. Force
+                        # a full exact-Hessian recalc on the NEXT outer iteration
+                        # so their first active step uses a real Hessian (correct
+                        # TS reaction mode instead of the degenerate identity
+                        # spectrum), and the need_recalc path skips the Bofill
+                        # update + resets _g_cart_prev to the true exact gradient
+                        # (a g_prev=0 Bofill would corrupt the curvature update).
+                        self._force_recalc_next = True
+
                 # ---- Rebuild calculator topology ONCE for the new active set ----
                 calc.prepare(atoms_list, fixed_nmax=self._nmax)
                 self._rebuild_topology(atoms_list)
