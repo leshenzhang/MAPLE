@@ -476,3 +476,517 @@ class Dimer(JobABC):
         ], self.output)
 
 
+# =============================================================================
+# ====================== BatchDimer (additive, batched GPU) ===================
+# =============================================================================
+# B independent dimer min-mode saddle searches advanced in lockstep on the GPU,
+# analogous to BatchPRFO (BPRFO.py): one batched force forward serves all B
+# systems, per-structure state lives in (B, nmax_dof) padded tensors, a
+# per-structure convergence mask freezes finished systems while tensor shapes
+# stay static, and per-structure optimizer state is NEVER shared.
+#
+# The single-structure ``Dimer`` class above is KEPT UNCHANGED as the fallback
+# path + parity oracle (validate: BatchDimer must converge to the SAME saddle
+# as the serial single-structure loop).
+#
+# Method / references (cited per 铁则):
+#   * Dimer minimum-mode following (finite-difference curvature + rotation):
+#       G. Henkelman, H. Jonsson, J. Chem. Phys. 1999, 111, 7010.
+#       DOI: 10.1063/1.480097
+#   * Improved dimer (single trigonometric "Fourier" rotation to the optimal
+#     angle from the rotational force + curvature, instead of many SD rotations):
+#       A. Heyden, A. T. Bell, F. J. Keil, J. Chem. Phys. 2005, 123, 224101.
+#       DOI: 10.1063/1.2104507
+#   * Superlinear dimer (opt-in): gradient extrapolation during rotation
+#     (~1 gradient per rotation) + L-BFGS for translation (and a 1-D L-BFGS /
+#     secant for rotation), cutting cost to ~2 grad/iter near convergence:
+#       J. Kastner, P. Sherwood, J. Chem. Phys. 2008, 128, 014106.
+#       DOI: 10.1063/1.2815812
+#
+# Batched HVP: UMA (and the other MAPLE batch calculators) expose batched
+# forces only (``get_ef_gpu``) + a batched numerical Hessian (``get_efh_gpu``),
+# NOT a batched autograd HVP. The dimer never needs a full Hessian -- it needs
+# only H@N along the current axis, which is obtained by a finite difference of
+# the batched force field along N (this IS the dimer construction of HJ-1999):
+#       forward difference (default, 1 force eval, reuses the midpoint force F0):
+#           H@N ~= -(F(R + dN) - F0) / d            (g = -F)
+#       central difference (opt-in ``central_hvp``, 2 force evals, more accurate):
+#           H@N ~= -(F(R + dN) - F(R - dN)) / (2 d)
+# Every force eval is ONE batched forward over all active systems.
+
+DTYPE_BD = torch.float64
+
+
+@dataclass
+class BatchDimerParams:
+    """Parameters for :class:`BatchDimer` (batched dimer saddle search)."""
+    # --- curvature / HVP (finite difference of the batched force field) ---
+    delta: float = 0.005               # Angstrom dimer half-length for the FD HVP
+    central_hvp: bool = False          # False -> 1-eval forward diff (classic HJ);
+                                       # True  -> 2-eval central diff (more accurate)
+    # --- rotation (Heyden single trigonometric rotation) ---
+    rot_max_iter: int = 5              # max rotation iters per outer step
+    rot_f_tol: float = 1.0e-3          # stop rotating a system once max|F_rot| < tol
+    rot_phi_trial: float = math.pi / 4.0  # Heyden trial angle for the curvature fit
+    rot_phi_max: float = math.pi / 12.0   # superlinear: max |rotation| per rot-iter
+    rot_kappa_min: float = 0.2            # superlinear: positive floor on rot curvature
+    # --- translation / trust region ---
+    step0: float = 0.2                 # initial step scaling on the translation force
+    step_max: float = 0.15             # absolute max Cartesian displacement (Ang)
+    trust_radius: float = 0.15         # trust radius (same role as step_max)
+    kappa_to_flip: float = 0.0         # flip the parallel force once curvature < this
+    # --- convergence (per structure; same defaults as single-structure Dimer) ---
+    f_max_th: float = 5.0e-3
+    f_rms_th: float = 1.0e-3
+    dp_max_th: float = 1.8e-3
+    dp_rms_th: float = 1.2e-3
+    max_iter: int = 200
+    # --- direction init / projections ---
+    remove_rigid: bool = True          # project out global translation/rotation from N
+    n_init: str = "random"             # "random" | "given"
+    n_given: Optional[np.ndarray] = None  # (B, nmax) padded axes when n_init="given"
+    seed: int = 0                      # RNG seed for reproducible random N init
+    # --- superlinear (opt-in, Kastner & Sherwood 2008) ---
+    superlinear: bool = False          # gradient-extrapolation rotation + L-BFGS translation
+    lbfgs_history: int = 8             # L-BFGS memory (number of (s, y) pairs)
+    # --- outputs ---
+    save_traj: bool = True
+
+
+class BatchDimer(JobABC):
+    """Run B independent dimer saddle searches in lockstep on the GPU.
+
+    Mirrors the BatchPRFO per-system-state / convergence-mask / one-batched-
+    forward pattern, but follows the minimum-curvature mode with a dimer
+    (finite-difference HVP + rotation) instead of an explicit Hessian RS-PRFO.
+
+    Parameters
+    ----------
+    output : str
+        Log file path; per-structure TS guesses are written next to it.
+    device : str
+        "cuda" | "cpu".
+    paras : dict, optional
+        Maps onto :class:`BatchDimerParams` (aliases: "batchdimer", "dimer", "ts").
+
+    Usage
+    -----
+        m = Molecules(atoms_list); m.calc = batch_calc      # e.g. UMABatchCalc
+        BatchDimer(output="bd.out", device="cuda").run(m)
+
+    The calculator must provide the batched contract used by BatchPRFO:
+    ``prepare`` / ``get_ef_gpu`` / ``step_cart_`` / ``backup_coords`` /
+    ``restore_coords`` and expose ``coord`` / ``_cols`` / ``_n_b`` / ``nmax_dof``.
+    """
+
+    def __init__(self, output: str, device: str = "cuda",
+                 paras: Optional[dict] = None):
+        super().__init__(output)
+        self.device = torch.device(device if torch.cuda.is_available()
+                                   or device == "cpu" else "cpu")
+        self.params = self._init_params(
+            BatchDimerParams, paras, ("batchdimer", "dimer", "ts"))
+
+        # topology (set in run())
+        self._B = 0
+        self._nmax = 0
+        self._A = 0                      # padded atom count = nmax // 3
+        self._real_mask = None           # (B, nmax) bool  -- real Cartesian DOFs
+        self._atom_mask = None           # (B, A)    bool  -- real atoms
+        self._nat = None                 # (B, 1, 1) float -- atoms per structure
+        self._Leff = None                # (B,) float      -- 3 * n_atoms (real DOFs)
+
+        # per-structure L-BFGS state (superlinear translation); allocated in run()
+        self._lb_S = None
+        self._lb_Y = None
+        self._lb_rho = None
+        self._lb_k = 0
+        self._rot_kappa = None           # persisted 1-D rotation curvature (superlinear)
+
+    # ------------------------------------------------------------------ helpers
+    def _coord_padded(self, calc) -> torch.Tensor:
+        """Current geometry scattered into the (B, nmax) padded DOF layout."""
+        flat = torch.zeros(self._B * self._nmax, dtype=DTYPE_BD, device=self.device)
+        if calc.N_atoms > 0:
+            flat[calc._cols] = calc.coord.reshape(-1).to(DTYPE_BD)
+        return flat.reshape(self._B, self._nmax)
+
+    def _atomview(self, v: torch.Tensor) -> torch.Tensor:
+        """(B, nmax) -> (B, A, 3)."""
+        return v.reshape(self._B, self._A, 3)
+
+    def _mdot(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Masked Euclidean dot over real DOFs -> (B,)."""
+        return (a * b * self._real_mask).sum(dim=-1)
+
+    def _mnorm(self, a: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(self._mdot(a, a).clamp(min=0.0))
+
+    def _mnormalize(self, a: torch.Tensor, eps: float = 1e-20) -> torch.Tensor:
+        a = a * self._real_mask
+        nrm = self._mnorm(a).clamp(min=eps)
+        return a / nrm.unsqueeze(-1)
+
+    def _remove_rigid(self, V: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Project global translation (+ rotation) out of each system's direction.
+
+        V, pos: (B, nmax). Per-structure, mass-unweighted (matches the single-
+        structure Dimer default ``use_mass_weight=False``)."""
+        Va = self._atomview(V).clone()
+        Pa = self._atomview(pos)
+        m = self._atom_mask.unsqueeze(-1).to(DTYPE_BD)          # (B, A, 1)
+        nat = m.sum(dim=1, keepdim=True).clamp(min=1.0)         # (B, 1, 1)
+        # translation: subtract per-axis mean over real atoms
+        Va = Va - (Va * m).sum(dim=1, keepdim=True) / nat
+        Va = Va * m
+        # rotation: project out the 3 infinitesimal rotations r x e_k about the COM
+        com = (Pa * m).sum(dim=1, keepdim=True) / nat
+        r = (Pa - com) * m
+        eye = torch.eye(3, dtype=DTYPE_BD, device=self.device)
+        for k in range(3):
+            rot = torch.cross(r, eye[k].view(1, 1, 3).expand_as(r), dim=-1) * m
+            denom = (rot * rot).sum(dim=(1, 2), keepdim=True) + 1e-20
+            a = (Va * rot).sum(dim=(1, 2), keepdim=True) / denom
+            Va = (Va - a * rot) * m
+        return Va.reshape(self._B, self._nmax)
+
+    # ------------------------------------------------------------- batched HVP
+    def _hvp(self, calc, N, F0, delta, central):
+        """Batched H@N along the unit dimer axis N via finite difference.
+
+        N  : (B, nmax) unit, masked, per structure.
+        F0 : (B, nmax) midpoint forces (reused by the forward difference).
+        Returns HN (B, nmax), masked. One (central=False) or two (central=True)
+        batched forwards. Each system uses its OWN N -> the perturbations are
+        block-diagonal isolated (same isolation BatchPRFO relies on)."""
+        calc.backup_coords()
+        calc.step_cart_((delta * N))
+        _, Fp = calc.get_ef_gpu()
+        calc.restore_coords()
+        Fp = Fp.to(DTYPE_BD)
+        if central:
+            calc.backup_coords()
+            calc.step_cart_((-delta * N))
+            _, Fm = calc.get_ef_gpu()
+            calc.restore_coords()
+            Fm = Fm.to(DTYPE_BD)
+            HN = -(Fp - Fm) / (2.0 * delta)
+        else:
+            HN = -(Fp - F0) / delta
+        return HN * self._real_mask
+
+    def _rotate(self, N, Theta, phi):
+        """Rotate unit axis N toward unit, N-orthogonal Theta by angle phi (B,)."""
+        c = torch.cos(phi).unsqueeze(-1)
+        s = torch.sin(phi).unsqueeze(-1)
+        return self._mnormalize(N * c + Theta * s)
+
+    # ------------------------------------------------------------- rotation
+    def _rotation_step(self, calc, N, F0, active):
+        """One outer rotation cycle: align N with the lowest-curvature mode.
+
+        Returns (N, curvature C (B,), max|F_rot| (B,), n_force_evals).
+        Default: Heyden single trigonometric rotation (2 grad / rot-iter).
+        Superlinear: secant / 1-D L-BFGS rotation (~1 grad / rot-iter after seed).
+        """
+        p = self.params
+        B = self._B
+        nfe = 0
+        C = torch.zeros(B, dtype=DTYPE_BD, device=self.device)
+        max_frot = torch.zeros(B, dtype=DTYPE_BD, device=self.device)
+        rot_done = ~active                       # frozen systems never rotate
+        dC_prev = None                           # for the superlinear secant
+        phi_prev = None
+        # superlinear: persisted per-structure 1-D rotation curvature (carried
+        # ACROSS outer iterations) so NO Heyden trial HVP is needed -> 1 grad/iter
+        kap = self._rot_kappa if p.superlinear else None
+
+        for _it in range(p.rot_max_iter):
+            HN = self._hvp(calc, N, F0, p.delta, p.central_hvp); nfe += (2 if p.central_hvp else 1)
+            C = self._mdot(N, HN)                                  # curvature N^T H N
+            # rotational force F_rot = -(I - N N^T) H N  (steepest descent on C)
+            F_rot = -(HN - C.unsqueeze(-1) * N) * self._real_mask
+            # max per-atom |F_rot| as the rotation convergence metric
+            frot_atom = torch.linalg.norm(self._atomview(F_rot), dim=-1)
+            max_frot = (frot_atom * self._atom_mask).amax(dim=-1)
+            newly = (max_frot < p.rot_f_tol) & (~rot_done)
+            rot_done = rot_done | newly
+            run_mask = ~rot_done
+            if not bool(run_mask.any()):
+                break
+
+            Theta = self._mnormalize(F_rot)                       # unit, N-orthogonal
+            dC0 = 2.0 * self._mdot(Theta, HN)                     # dC/dphi at phi=0
+
+            if not p.superlinear:
+                # --- Heyden trigonometric optimal angle (1 trial HVP / rot-iter) ---
+                phi1 = p.rot_phi_trial
+                N1 = self._rotate(N, Theta, torch.full((B,), phi1, dtype=DTYPE_BD,
+                                                       device=self.device))
+                HN1 = self._hvp(calc, N1, F0, p.delta, p.central_hvp); nfe += (2 if p.central_hvp else 1)
+                C1 = self._mdot(N1, HN1)
+                b1 = 0.5 * dC0
+                c2, s2 = math.cos(2 * phi1), math.sin(2 * phi1)
+                # C(phi) = a0 + a1 cos2phi + b1 sin2phi ; solve a1 from the trial
+                a1 = (C - C1 + b1 * s2) / (1.0 - c2 + 1e-30)
+                psi = torch.atan2(b1, a1)
+                phi = 0.5 * psi + math.pi / 2.0                   # angle of the minimum
+                # wrap to (-pi/2, pi/2] (minimal equivalent rotation)
+                phi = torch.atan2(torch.sin(phi), torch.cos(phi))
+                phi = torch.where(phi > math.pi / 2.0, phi - math.pi, phi)
+                phi = phi.clamp(-math.pi / 2.0, math.pi / 2.0)
+            else:
+                # --- superlinear: 1-D L-BFGS / damped-secant rotation, NO trial HVP ---
+                # Update the persisted rotation curvature from the slope change over
+                # the previous rotation (1-D quasi-Newton); positive floor + a bounded
+                # Newton step keep the dimer locked onto the minimum mode (raw secant
+                # over-rotated and lost the negative mode on floppy systems).
+                if dC_prev is not None:
+                    denom = torch.where(phi_prev.abs() < 1e-6,
+                                        torch.full_like(phi_prev, 1e-6), phi_prev)
+                    sec = (dC0 - dC_prev) / denom
+                    upd = phi_prev.abs() > 1e-4
+                    kap = torch.where(upd, 0.5 * kap + 0.5 * sec.abs().clamp(min=p.rot_kappa_min), kap)
+                phi = -dC0 / (2.0 * kap.clamp(min=p.rot_kappa_min))   # bounded Newton on C(phi)
+                phi = phi.clamp(-p.rot_phi_max, p.rot_phi_max)
+
+            phi = torch.where(run_mask, phi, torch.zeros_like(phi))
+            dC_prev = dC0
+            phi_prev = phi
+            N = self._rotate(N, Theta, phi)
+
+        if p.superlinear:
+            self._rot_kappa = kap.detach()       # persist across outer iterations
+
+        return N, C, max_frot, nfe
+
+    # ------------------------------------------------------------- L-BFGS (translation)
+    def _lbfgs_reset(self):
+        self._lb_S = torch.zeros(self._B, self.params.lbfgs_history, self._nmax,
+                                 dtype=DTYPE_BD, device=self.device)
+        self._lb_Y = torch.zeros_like(self._lb_S)
+        self._lb_rho = torch.zeros(self._B, self.params.lbfgs_history,
+                                   dtype=DTYPE_BD, device=self.device)
+        self._lb_k = 0
+
+    def _lbfgs_push(self, s, y):
+        """Append a per-structure (s, y) pair (s.y>0 systems only); ring buffer."""
+        m = self.params.lbfgs_history
+        sy = (s * y * self._real_mask).sum(dim=-1)
+        good = sy > 1e-12
+        rho = torch.where(good, 1.0 / sy.clamp(min=1e-12), torch.zeros_like(sy))
+        s = torch.where(good.unsqueeze(-1), s, torch.zeros_like(s))
+        y = torch.where(good.unsqueeze(-1), y, torch.zeros_like(y))
+        if self._lb_k < m:
+            i = self._lb_k
+            self._lb_S[:, i] = s; self._lb_Y[:, i] = y; self._lb_rho[:, i] = rho
+            self._lb_k += 1
+        else:
+            self._lb_S = torch.roll(self._lb_S, -1, dims=1); self._lb_S[:, -1] = s
+            self._lb_Y = torch.roll(self._lb_Y, -1, dims=1); self._lb_Y[:, -1] = y
+            self._lb_rho = torch.roll(self._lb_rho, -1, dims=1); self._lb_rho[:, -1] = rho
+
+    def _lbfgs_dir(self, grad):
+        """Two-loop recursion -> search direction d ~ -H_inv grad (per structure)."""
+        k = self._lb_k
+        q = grad.clone()
+        alphas = [None] * k
+        for i in range(k - 1, -1, -1):
+            a = self._lb_rho[:, i] * (self._lb_S[:, i] * q * self._real_mask).sum(-1)
+            q = q - a.unsqueeze(-1) * self._lb_Y[:, i]
+            alphas[i] = a
+        if k > 0:
+            s = self._lb_S[:, k - 1]; y = self._lb_Y[:, k - 1]
+            sy = (s * y * self._real_mask).sum(-1)
+            yy = (y * y * self._real_mask).sum(-1).clamp(min=1e-12)
+            gamma = (sy / yy).clamp(min=1e-6, max=1e6)
+        else:
+            gamma = torch.ones(self._B, dtype=DTYPE_BD, device=self.device)
+        r = gamma.unsqueeze(-1) * q
+        for i in range(k):
+            b = self._lb_rho[:, i] * (self._lb_Y[:, i] * r * self._real_mask).sum(-1)
+            r = r + (alphas[i] - b).unsqueeze(-1) * self._lb_S[:, i]
+        return (-r) * self._real_mask
+
+    # ------------------------------------------------------------------- run
+    def run(self, mols):
+        """Drive B dimers to their saddles in lockstep. Reads mols.multiatoms / mols.calc."""
+        p = self.params
+        device = self.device
+        atoms_list = list(mols.multiatoms)
+        calc = mols.calc
+        B = len(atoms_list)
+        if B == 0:
+            return
+        base, _ = os.path.splitext(self.output)
+
+        # --- topology: one prepare() fixes nmax, build padded masks ---
+        calc.prepare(atoms_list)
+        _, F_probe = calc.get_ef_gpu()
+        self._B = B
+        self._nmax = int(F_probe.shape[1])
+        self._A = self._nmax // 3
+        n_b = calc._n_b.to(device)                                   # (B,) atoms/struct
+        arange_dof = torch.arange(self._nmax, device=device)
+        self._real_mask = (arange_dof[None, :] < (3 * n_b)[:, None])
+        arange_a = torch.arange(self._A, device=device)
+        self._atom_mask = (arange_a[None, :] < n_b[:, None])
+        self._Leff = (3 * n_b).clamp(min=1).to(DTYPE_BD)
+
+        f_max_th = torch.tensor([getattr(a, "f_max_th", p.f_max_th) for a in atoms_list],
+                                dtype=DTYPE_BD, device=device)
+        f_rms_th = torch.tensor([getattr(a, "f_rms_th", p.f_rms_th) for a in atoms_list],
+                                dtype=DTYPE_BD, device=device)
+        dp_max_th = torch.tensor([getattr(a, "dp_max_th", p.dp_max_th) for a in atoms_list],
+                                 dtype=DTYPE_BD, device=device)
+        dp_rms_th = torch.tensor([getattr(a, "dp_rms_th", p.dp_rms_th) for a in atoms_list],
+                                 dtype=DTYPE_BD, device=device)
+
+        # --- per-structure dimer axis N (unit, rigid-body-removed) ---
+        g = torch.Generator(device="cpu").manual_seed(int(p.seed))
+        if p.n_init.lower() == "given" and getattr(p, "n_given", None) is not None:
+            N = torch.as_tensor(p.n_given, dtype=DTYPE_BD, device=device).reshape(B, self._nmax)
+        else:
+            N = torch.randn(B, self._nmax, generator=g).to(device=device, dtype=DTYPE_BD)
+        N = N * self._real_mask
+        pos0 = self._coord_padded(calc)
+        if p.remove_rigid:
+            N = self._remove_rigid(N, pos0)
+        N = self._mnormalize(N)
+
+        # --- per-structure translation/optimizer state (NOT shared) ---
+        alpha = torch.full((B,), float(p.step0), dtype=DTYPE_BD, device=device)
+        active = torch.ones(B, dtype=torch.bool, device=device)
+        final_status = ["max_iter"] * B
+        last_step = torch.zeros(B, self._nmax, dtype=DTYPE_BD, device=device)
+        g_prev = None                                # -Ftrans buffer for L-BFGS
+        self._rot_kappa = torch.full((B,), 1.0, dtype=DTYPE_BD, device=device)
+        if p.superlinear:
+            self._lbfgs_reset()
+
+        max_allow = min(p.trust_radius, p.step_max)
+        total_fe = 0
+
+        log_info([
+            "\n========================================================================\n",
+            "                 BatchDimer  (batched GPU dimer saddle search)          \n",
+            "========================================================================\n",
+            f"B systems                : {B}\n",
+            f"padded DOF (nmax)        : {self._nmax}\n",
+            f"HVP                      : {'central FD (2 eval)' if p.central_hvp else 'forward FD (1 eval, classic HJ)'}\n",
+            f"rotation                 : {'superlinear secant/L-BFGS (Kastner-Sherwood 2008)' if p.superlinear else 'Heyden trig (J.Chem.Phys.2005,123,224101)'}\n",
+            f"translation              : {'L-BFGS (Kastner-Sherwood 2008)' if p.superlinear else 'trust-radius steepest descent'}\n",
+            "Refs: HJ J.Chem.Phys.1999,111,7010 (10.1063/1.480097); "
+            "Heyden 2005 (10.1063/1.2104507); Kastner-Sherwood 2008 (10.1063/1.2815812)\n",
+            "------------------------------------------------------------------------\n",
+        ], self.output)
+
+        for it in range(1, p.max_iter + 1):
+            # (0) midpoint energy + forces -- ONE batched forward, all systems
+            E0, F0 = calc.get_ef_gpu()
+            E0 = E0.to(DTYPE_BD); F0 = (F0.to(DTYPE_BD)) * self._real_mask
+            total_fe += 1
+
+            # (1) rotation: align N with the lowest-curvature mode
+            N, C, max_frot, nfe = self._rotation_step(calc, N, F0, active)
+            total_fe += nfe
+
+            # (2) translation force: F_perp, flip F_par once curvature < 0
+            Fpar = (self._mdot(F0, N)).unsqueeze(-1) * N
+            Fperp = (F0 - Fpar) * self._real_mask
+            flip = (C < p.kappa_to_flip)
+            Ftrans = torch.where(flip.unsqueeze(-1), Fperp - Fpar, Fperp) * self._real_mask
+
+            # (3) step (frozen systems contribute nothing)
+            if p.superlinear:
+                grad = -Ftrans
+                if g_prev is not None and self._lb_k >= 0:
+                    self._lbfgs_push(last_step, grad - g_prev)
+                d = self._lbfgs_dir(grad) if self._lb_k > 0 else (alpha.unsqueeze(-1) * Ftrans)
+                step = d
+                g_prev = grad
+            else:
+                step = alpha.unsqueeze(-1) * Ftrans
+
+            step = step * active.unsqueeze(-1) * self._real_mask
+            step_atom = torch.linalg.norm(self._atomview(step), dim=-1)         # (B, A)
+            max_step = (step_atom * self._atom_mask).amax(dim=-1)               # (B,)
+            on_boundary = max_step > max_allow
+            scale = torch.where(on_boundary, max_allow / max_step.clamp(min=1e-20),
+                                torch.ones_like(max_step))
+            step = step * scale.unsqueeze(-1)
+
+            calc.step_cart_(step)
+
+            # per-structure trust update (steepest-descent path only)
+            if not p.superlinear:
+                alpha = torch.where(on_boundary & active,
+                                    torch.clamp(0.5 * alpha, min=0.1 * p.step0),
+                                    torch.minimum(1.2 * alpha,
+                                                  torch.full_like(alpha, p.step_max)))
+            last_step = step
+
+            # (4) convergence (per-atom-norm metric, same as single-structure Dimer)
+            f_atom = torch.linalg.norm(self._atomview(F0), dim=-1)
+            max_f = (f_atom * self._atom_mask).amax(dim=-1)
+            rms_f = torch.sqrt((f_atom ** 2 * self._atom_mask).sum(-1)
+                               / self._atom_mask.sum(-1).clamp(min=1))
+            dp_atom = step_atom
+            max_dp = (dp_atom * self._atom_mask).amax(dim=-1)
+            rms_dp = torch.sqrt((dp_atom ** 2 * self._atom_mask).sum(-1)
+                                / self._atom_mask.sum(-1).clamp(min=1))
+            conv = (max_f <= f_max_th) & (rms_f <= f_rms_th) & \
+                   (max_dp <= dp_max_th) & (rms_dp <= dp_rms_th) & active
+            for b in conv.nonzero(as_tuple=False).flatten().cpu().tolist():
+                final_status[b] = "converged"
+            active = active & (~conv)
+
+            if (it <= 5) or (it % 10 == 0) or (not bool(active.any())):
+                na = int(active.sum().item())
+                log_info([
+                    f"[iter {it:4d}] active={na:3d}/{B}  "
+                    f"E[min/max]={float(E0.min()):.5f}/{float(E0.max()):.5f}  "
+                    f"curv<0={int((C < 0).sum().item())}/{B}  "
+                    f"max|F|={float(max_f.max()):.5f}  "
+                    f"max|Frot|={float(max_frot.max()):.5f}  "
+                    f"rot_fe={nfe} cum_fe={total_fe}\n"
+                ], self.output)
+
+            if not bool(active.any()):
+                log_info([f"\nAll {B} dimers converged at iteration {it}.\n"], self.output)
+                break
+
+        # --- final: sync geometries back, write per-structure TS guesses ---
+        E_final, F_final = calc.get_ef_gpu()
+        E_final = E_final.to(DTYPE_BD)
+        # final curvature sign per structure (one batched HVP at the converged axis)
+        HN_final = self._hvp(calc, N, F_final.to(DTYPE_BD) * self._real_mask,
+                             p.delta, p.central_hvp)
+        C_final = self._mdot(N, HN_final)
+
+        pos = calc.coord.detach().cpu().numpy()
+        ptr = calc._ptr.detach().cpu().numpy()
+        for b, at in enumerate(atoms_list):
+            s, t = ptr[b], ptr[b + 1]
+            at.positions[:] = pos[s:t]
+            if p.save_traj:
+                write_xyz(f"{base}_bd_ts_{b}.xyz", [at], energies=[float(E_final[b])])
+
+        n_conv = sum(1 for s in final_status if s == "converged")
+        log_info([
+            "\n------------------------------------------------------------------------\n",
+            "                       BatchDimer summary                               \n",
+            "------------------------------------------------------------------------\n",
+            f"converged                : {n_conv}/{B}\n",
+            f"negative final curvature : {int((C_final < 0).sum().item())}/{B}\n",
+            f"total batched force evals: {total_fe}\n",
+            f"per-structure status     : {final_status}\n",
+            f"per-structure curvature  : {[round(float(x), 5) for x in C_final.tolist()]}\n",
+        ], self.output)
+
+        self.final_curvature = C_final.detach().cpu().numpy()
+        self.final_status = final_status
+        self.final_energy = E_final.detach().cpu().numpy()
+        self.total_force_evals = total_fe
+        self.n_iter = it
+        return
