@@ -330,6 +330,38 @@ class Dimer(JobABC):
             lines.append(f"{idx:<4d}{s:>2s}{x:18.4f}{y:18.4f}{z:18.4f}")
         return "\n".join(lines) + "\n"
 
+    def _packed_hvp(self, n):
+        """Return (Hn, forces, energy) torch tensors for direction ``n``.
+
+        D2 autodiff wiring: when an autograd HVP callback was supplied and
+        ``DimerParams.use_hvp=True`` (``self.hvp_fn`` set), use it -- Hn = H@n by
+        double-backward, with forces/energy from the SAME autograd pass (no finite
+        difference, no delta tuning). The callback may return either
+        ``(Hn, forces, energy)`` or just ``Hn`` (forces/energy then come from the
+        calculator). Falls back to ``self.atoms.calc.get_hvp`` when no callback.
+        """
+        if self.hvp_fn is not None:
+            out = self.hvp_fn(self.atoms, n)
+            if isinstance(out, (tuple, list)) and len(out) == 3:
+                Hn, forces, energy = out
+            else:
+                Hn = out
+                _, forces, energy = self.atoms.calc.get_hvp(self.atoms, n)
+            ref = Hn if isinstance(Hn, torch.Tensor) else None
+            dev = ref.device if ref is not None else torch.device("cpu")
+            dty = ref.dtype if ref is not None else torch.float64
+
+            def _t(x, shape):
+                if isinstance(x, torch.Tensor):
+                    t = x.to(device=dev, dtype=dty)
+                else:
+                    t = torch.as_tensor(np.asarray(x, dtype=np.float64),
+                                        device=dev, dtype=dty)
+                return t.reshape(shape) if shape is not None else t.reshape(())
+
+            return _t(Hn, (-1,)), _t(forces, (-1,)), _t(energy, None)
+        return self.atoms.calc.get_hvp(self.atoms, n)
+
     def run(self):
         """
         Main Dimer optimization loop with autograd-based Hessian-vector product (Hn).
@@ -352,7 +384,7 @@ class Dimer(JobABC):
 
         # ------------------ initial eval via autograd HVP ------------------
         # get forces & energy once (Hn unused for initial report)
-        _, forces_t, energy_t = self.atoms.calc.get_hvp(self.atoms, n)
+        _, forces_t, energy_t = self._packed_hvp(n)
         forces_np = forces_t.detach().cpu().numpy()
         E0 = float(energy_t.detach().cpu().item())
         maxF0 = float(np.max(np.linalg.norm(forces_np.reshape(-1, 3), axis=1)))
@@ -393,7 +425,7 @@ class Dimer(JobABC):
 
             for _ in range(p.rot_max_iter):
                 # Hn from autograd; discard forces/energy here
-                Hn_t, _, _ = self.atoms.calc.get_hvp(self.atoms, n_curr)
+                Hn_t, _, _ = self._packed_hvp(n_curr)
                 dev, dty = Hn_t.device, Hn_t.dtype
                 n_th = torch.tensor(n_curr, device=dev, dtype=dty)
 
@@ -425,7 +457,7 @@ class Dimer(JobABC):
             n, max_frot, rms_frot = rotate_minimize_kappa(n)
 
             # (2) translation-side evaluation in one pass
-            Hn_t, forces_t, energy_t = self.atoms.calc.get_hvp(self.atoms, n)
+            Hn_t, forces_t, energy_t = self._packed_hvp(n)
             forces_np = forces_t.detach().cpu().numpy()
             E = float(energy_t.detach().cpu().item())
 
@@ -500,7 +532,7 @@ class Dimer(JobABC):
                 break
 
         # ------------------ final write & brief summary ------------------
-        _, _, E_final_t = self.atoms.calc.get_hvp(self.atoms, n)
+        _, _, E_final_t = self._packed_hvp(n)
         E_final = float(E_final_t.detach().cpu().item())
         write_xyz(ts_file, [self.atoms], energies=[E_final])
 

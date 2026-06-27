@@ -715,3 +715,346 @@ class LQA:
             ],
             self.output,
         )
+
+
+# ======================================================================== #
+#                            BATCHED LQA-IRC                                #
+# ======================================================================== #
+# Batched IRC over B transition-state structures sharing ONE UMA *batch*
+# calculator (prepare / get_efh_gpu / step_cart_ / set_coords_). All B paths
+# are propagated in lockstep: ONE batched get_efh_gpu() per macro step drives
+# every structure's LQA propagation. Pure local-quadratic (fresh mass-weighted
+# Hessian each step, no BFGS/Bofill history) -- the natural batch form of LQA.
+#
+# Padding layout matches the calculator's (B, nmax_dof) buffer: structure i
+# fills DOF block [0, 3*n_i); the remainder is zero. Padding DOFs carry zero
+# force and a zero Hessian block, so their eigenvalues are exactly 0 and are
+# dropped by the same |lambda|>1e-8 mode mask used in the single-structure path.
+#
+# Units identical to the single-structure LQA: positions Angstrom, forces
+# Eh/Angstrom, Hessian Eh/Angstrom^2, energy Eh, MW coords sqrt(amu)*Angstrom
+# with q_mw = q_cart / D, H_mw = D (x) D * H, g_mw = D * g_cart  (D = 1/sqrt(m)).
+import torch as _torch
+
+
+def _apply_paras(p: "LQAParams", paras):
+    """Apply a {'lqa'|'irc': {...}} or flat dict of overrides onto an LQAParams.
+
+    Same alias table as LQA.__init__ (kept separate so the batch path can reuse
+    it without touching the single-structure constructor).
+    """
+    if not isinstance(paras, dict):
+        return p
+    low = {k.lower(): v for k, v in paras.items()}
+    sub = None
+    for key in ("lqa", "irc"):
+        if key in low and isinstance(low[key], dict):
+            sub = low[key]
+            break
+    if sub is None:
+        sub = low
+    sub_low = {k.lower(): v for k, v in sub.items()}
+    aliases = {
+        "sd_len_bohr": "step_length_bohr",
+        "steplength_bohr": "step_length_bohr",
+        "max_points": "max_steps",
+        "hessian_update": "hessian_update",
+        "euler_n": "euler_n",
+        "hessian_recalc": "hessian_recalc",
+        "target_mode": "target_mode",
+        "f_max_th": "f_max_th",
+        "f_rms_th": "f_rms_th",
+        "tol_maxf": "f_max_th",
+        "tol_rmsf": "f_rms_th",
+        "print_each": "print_each",
+        "write_traj": "write_traj",
+    }
+    for k, v in sub_low.items():
+        if k in aliases:
+            setattr(p, aliases[k], v)
+        elif hasattr(p, k):
+            setattr(p, k, v)
+    return p
+
+
+class LQABatch:
+    """Batched LQA-IRC integrator over B transition-state structures.
+
+    Consumes the UMA *batch* calculator API (NOT a per-atoms ASE calculator):
+        calc.prepare(atoms_list, fixed_nmax)
+        calc.get_efh_gpu() -> (E (B,), F (B,M), H (B,M,M), P (B,))   [Hartree]
+        calc.step_cart_(s (B,M))         # in-place padded Cartesian displacement
+        calc.set_coords_(coord (N,3))    # reset packed Cartesian coords
+
+    Parameters mirror LQAParams (same defaults / overrides via `paras`). The
+    algorithm is the pure local-quadratic LQA step recomputed from the fresh
+    mass-weighted Hessian at every macro step; this is the batch-natural form
+    (the single-structure LQA's optional BFGS/Bofill Hessian *update* needs a
+    per-structure history that does not vectorize cleanly -- see module docstring
+    "no DWI interp/history").
+    """
+
+    def __init__(self, atoms_list, calc, output: str = "lqa_batch.out",
+                 params=None, paras=None, device=None):
+        self.atoms_list = list(atoms_list)
+        self.calc = calc
+        self.output = output
+        self.p = params if params is not None else LQAParams()
+        _apply_paras(self.p, paras)
+
+        self.B = len(self.atoms_list)
+        if self.B == 0:
+            raise ValueError("LQABatch: empty atoms_list")
+
+        self.device = _torch.device(
+            device if device is not None
+            else ("cuda" if _torch.cuda.is_available() else "cpu")
+        )
+        self._step_len_mw = float(self.p.step_length_bohr * BOHR_TO_ANG)
+        self._build_padding()
+
+    # ----------------------------- setup ----------------------------------
+    def _build_padding(self):
+        """Build padded mass-weight vector D, DOF mask, DOF counts, TS coords."""
+        B = self.B
+        dev = self.device
+        nmax_a = max(len(a) for a in self.atoms_list)
+        M = 3 * nmax_a
+        self.nmax_dof = M
+
+        Dpad = _torch.ones((B, M), dtype=_torch.float64, device=dev)
+        dof_mask = _torch.zeros((B, M), dtype=_torch.bool, device=dev)
+        n_dof = _torch.zeros(B, dtype=_torch.float64, device=dev)
+        qcart_ts = _torch.zeros((B, M), dtype=_torch.float64, device=dev)
+        coord_rows = []
+
+        for i, a in enumerate(self.atoms_list):
+            m = np.asarray(a.get_masses(), dtype=np.float64)
+            m = np.where(m > 0.0, m, 1.0)
+            d = 1.0 / np.sqrt(np.repeat(m, 3))          # (3 n_i,)
+            ni3 = d.shape[0]
+            Dpad[i, :ni3] = _torch.tensor(d, dtype=_torch.float64, device=dev)
+            dof_mask[i, :ni3] = True
+            n_dof[i] = float(ni3)
+            pos = np.asarray(a.get_positions(), dtype=np.float64)
+            qcart_ts[i, :ni3] = _torch.tensor(pos.reshape(-1), dtype=_torch.float64, device=dev)
+            coord_rows.append(_torch.tensor(pos, dtype=_torch.float64, device=dev))
+
+        self.Dpad = Dpad
+        self.dof_mask = dof_mask
+        self.n_dof = n_dof                               # (B,) = 3 n_i
+        self._qcart_ts = qcart_ts                        # (B, M) padded TS Cartesian
+        self._q_ts_mw = qcart_ts / Dpad                  # (B, M) padded TS MW coords
+        self._ts_coord_N3 = _torch.cat(coord_rows, dim=0)  # (N, 3) packed, calc atom order
+
+    # --------------------------- small helpers ----------------------------
+    @staticmethod
+    def _unit_rows(v):
+        """Row-wise L2 normalize (B, M); zero rows stay zero."""
+        n = v.norm(dim=1, keepdim=True)
+        return v / n.clamp_min(1e-16)
+
+    def _scale_mw_step(self, direction_mw, step_umw):
+        """Scale each MW direction row to a target *unweighted* step length."""
+        denom = (direction_mw * self.Dpad).norm(dim=1)        # (B,)
+        scale = step_umw / denom.clamp_min(1e-16)
+        return direction_mw * scale[:, None]
+
+    def _force_metrics(self, F):
+        """Per-structure max|F| and rms(F) over REAL DOFs only. F: (B, M) Eh/A."""
+        maxG = F.abs().amax(dim=1)                            # padding is 0 -> ok
+        sumsq = (F * F).sum(dim=1)                            # padding 0
+        rmsG = _torch.sqrt(sumsq / self.n_dof.clamp_min(1.0))
+        return maxG, rmsG
+
+    # ------------------------- TS mode selection --------------------------
+    def _ts_modes(self):
+        """One batched get_efh_gpu() at TS -> batched eigh -> per-structure mode.
+
+        Returns (E_ts (B,), vneg (B,M) phase-canonical, eigval (B,), valid (B,),
+                 n_strong_neg (B,)).
+        """
+        self.calc.set_coords_(self._ts_coord_N3)
+        E_ts, F_ts, H_ts, _ = self.calc.get_efh_gpu()
+        Hmw = self.Dpad[:, :, None] * H_ts * self.Dpad[:, None, :]
+        Hmw = 0.5 * (Hmw + Hmw.transpose(1, 2))
+        w, V = _torch.linalg.eigh(Hmw)                       # ascending eigvals
+        k = int(self.p.target_mode)
+        idx = k - 1
+        eigval = w[:, idx]                                   # selected mode eigval
+        vneg = V[:, :, idx].clone()                          # (B, M)
+
+        # how many *strong* negative modes (clean first-order saddle == k)
+        n_strong_neg = (w < -1e-4).sum(dim=1)
+
+        # success: the selected mode is genuinely negative and exists
+        n_neg = (w < 0.0).sum(dim=1)
+        valid = (eigval < -1e-6) & (n_neg >= k)
+
+        # deterministic phase: make the largest-magnitude component positive
+        am = vneg.abs().argmax(dim=1)
+        rows = _torch.arange(self.B, device=self.device)
+        sgn = _torch.sign(vneg[rows, am])
+        sgn = _torch.where(sgn == 0, _torch.ones_like(sgn), sgn)
+        vneg = vneg * sgn[:, None]
+
+        return E_ts, vneg, eigval, valid, n_strong_neg
+
+    # --------------------------- batched LQA step -------------------------
+    def _lqa_step(self, F, H, active):
+        """Vectorized LQA propagation step. F (B,M), H (B,M,M); returns dx (B,M)."""
+        B, M = self.B, self.nmax_dof
+        dev = self.device
+        Dpad = self.Dpad
+        step = self._step_len_mw
+        euler_n = int(self.p.euler_n)
+
+        g = Dpad * (-F)                                      # MW gradient (B, M)
+        Hmw = Dpad[:, :, None] * H * Dpad[:, None, :]
+        Hmw = 0.5 * (Hmw + Hmw.transpose(1, 2))
+        w, V = _torch.linalg.eigh(Hmw)                       # (B,M),(B,M,M)
+
+        gstar = _torch.einsum('bmk,bm->bk', V, g)            # V^T g  (B, M)
+        modemask = w.abs() > 1e-8                            # drop padding/near-zero
+        gstar = gstar * modemask
+
+        gnorm = g.norm(dim=1)                                # (B,)
+        dt = step / (float(euler_n) * gnorm.clamp_min(1e-30))  # (B,)
+
+        # per-structure Euler arc-length integration to find propagation time t
+        t = dt.clone()
+        cur = _torch.zeros(B, dtype=_torch.float64, device=dev)
+        done = (~active) | (gnorm < 1e-12)
+        for _ in range(euler_n):
+            expo = _torch.exp(-2.0 * w * t[:, None])         # (B, M)
+            dsdt = _torch.sqrt((gstar * gstar * expo).sum(dim=1).clamp_min(0.0))
+            cur = _torch.where(done, cur, cur + dsdt * dt)
+            reach = cur >= step
+            done = done | reach
+            if bool(done.all()):
+                break
+            t = _torch.where(done, t, t + dt)
+
+        w_safe = _torch.where(modemask, w, _torch.ones_like(w))
+        alphas = ((_torch.exp(-w * t[:, None]) - 1.0) / w_safe) * modemask
+        dx = _torch.einsum('bmk,bk->bm', V, alphas * gstar)  # (B, M)
+
+        act = active & (gnorm >= 1e-12)
+        dx = dx * act[:, None].to(_torch.float64)
+        return dx
+
+    # --------------------------- one direction ----------------------------
+    def _propagate_side(self, sign, vneg, active_init):
+        """Propagate all B structures one side (sign=+1 forward / -1 backward).
+
+        Returns list (len B) of per-structure record dicts {E,maxG,rmsG,x}.
+        """
+        B, M = self.B, self.nmax_dof
+        p = self.p
+        Dpad = self.Dpad
+        step = self._step_len_mw
+
+        # reset calculator + state to TS, then displace 0.5*step along neg mode
+        self.calc.set_coords_(self._ts_coord_N3)
+        vdir = self._unit_rows(vneg) * sign
+        dq0_mw = self._scale_mw_step(vdir, 0.5 * step)
+        # zero the displacement for invalid structures so they sit at TS
+        dq0_mw = dq0_mw * active_init[:, None].to(_torch.float64)
+        self.calc.step_cart_(dq0_mw * Dpad)
+        q_mw = self._q_ts_mw + dq0_mw
+
+        store = [{"E": [], "maxG": [], "rmsG": [], "x": []} for _ in range(B)]
+        active = active_init.clone()
+
+        # initial eval at the displaced start point
+        E, F, H, _ = self.calc.get_efh_gpu()
+        self._record(store, E, F, q_mw, active)
+        maxG, rmsG = self._force_metrics(F)
+        conv = (maxG <= p.f_max_th) & (rmsG <= p.f_rms_th)
+        active = active & ~conv
+
+        for _it in range(1, p.max_steps + 1):
+            if not bool(active.any()):
+                break
+            dx = self._lqa_step(F, H, active)
+            q_mw = q_mw + dx
+            self.calc.step_cart_(dx * Dpad)
+            E, F, H, _ = self.calc.get_efh_gpu()
+            self._record(store, E, F, q_mw, active)
+            maxG, rmsG = self._force_metrics(F)
+            conv = (maxG <= p.f_max_th) & (rmsG <= p.f_rms_th)
+            small = dx.abs().amax(dim=1) <= 1e-12
+            active = active & ~conv & ~small
+
+        return store
+
+    def _record(self, store, E, F, q_mw, active):
+        cart = q_mw * self.Dpad                               # (B, M) padded Cartesian
+        maxG, rmsG = self._force_metrics(F)
+        Ecpu = E.detach().cpu()
+        mGcpu = maxG.detach().cpu()
+        rGcpu = rmsG.detach().cpu()
+        cart_cpu = cart.detach().cpu().numpy()
+        for i in range(self.B):
+            if not bool(active[i]):
+                continue
+            ni = len(self.atoms_list[i])
+            store[i]["E"].append(float(Ecpu[i]))
+            store[i]["maxG"].append(float(mGcpu[i]))
+            store[i]["rmsG"].append(float(rGcpu[i]))
+            store[i]["x"].append(cart_cpu[i, :3 * ni].reshape(ni, 3).copy())
+
+    # ------------------------------- run ----------------------------------
+    def run(self):
+        """Run batched forward+backward LQA-IRC for all B structures.
+
+        Returns a list (len B) of per-structure result dicts:
+            {"index": i, "valid": bool, "neg_eigval": float, "n_strong_neg": int,
+             "E_ts": float, "forward": {records}, "backward": {records}}
+        Invalid structures (no clean negative TS mode) get valid=False and empty
+        forward/backward paths (flagged, not propagated).
+        """
+        # prepare topology once for the whole batch
+        self.calc.prepare(self.atoms_list, fixed_nmax=self.nmax_dof)
+
+        E_ts, vneg, eigval, valid, n_strong = self._ts_modes()
+
+        fwd = self._propagate_side(+1.0, vneg, valid)
+        bwd = self._propagate_side(-1.0, vneg, valid)
+
+        E_ts_cpu = E_ts.detach().cpu()
+        eig_cpu = eigval.detach().cpu()
+        nstr_cpu = n_strong.detach().cpu()
+        valid_cpu = valid.detach().cpu()
+
+        results = []
+        for i in range(self.B):
+            results.append({
+                "index": i,
+                "valid": bool(valid_cpu[i]),
+                "neg_eigval": float(eig_cpu[i]),
+                "n_strong_neg": int(nstr_cpu[i]),
+                "E_ts": float(E_ts_cpu[i]),
+                "forward": {"records": fwd[i]},
+                "backward": {"records": bwd[i]},
+            })
+        return results
+
+
+def run_lqa_irc(atoms_or_list, output: str = "lqa.out", paras=None,
+                calc=None, params=None, device=None):
+    """Unified LQA-IRC entry point (single-structure backward compatible).
+
+    - If `atoms_or_list` is a single ASE Atoms with an attached ASE calculator
+      (`atoms.calc`), dispatch to the original single-structure `LQA` (unchanged
+      behaviour / units / outputs).
+    - If `atoms_or_list` is a list/tuple of Atoms, dispatch to the batched
+      `LQABatch`, consuming the supplied batch calculator `calc` (UMA batch API).
+    """
+    if isinstance(atoms_or_list, (list, tuple)):
+        if calc is None:
+            raise ValueError("run_lqa_irc(batch): a batch calculator `calc` is required")
+        return LQABatch(list(atoms_or_list), calc, output=output,
+                        params=params, paras=paras, device=device).run()
+    lqa = LQA(atoms_or_list, output=output, params=params, paras=paras)
+    return lqa.run()

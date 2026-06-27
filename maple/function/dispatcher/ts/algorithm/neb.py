@@ -14,6 +14,7 @@ import sys
 import math
 import copy
 import time
+import hashlib
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -349,20 +350,27 @@ def cineb_tangent(Rm1, R, Rp1, Em1, E, Ep1):
     return t / norm
 
 
-def neb_forces(images: List[Atoms], energies: List[float], 
+def neb_forces(images: List[Atoms], energies: List[float],
                k_spring: float = None, k_springs: List[float] = None,
-               use_dynamic_k: bool = False, k_min: float = 0.03, 
-               k_max: float = 0.3, k_decay: float = 0.5) -> Tuple[List[np.ndarray], float, int]:
+               use_dynamic_k: bool = False, k_min: float = 0.03,
+               k_max: float = 0.3, k_decay: float = 0.5,
+               raw_forces: Optional[List[np.ndarray]] = None) -> Tuple[List[np.ndarray], float, int]:
     """
     Compute NEB projected forces for internal images:
     F_NEB = F_true_perp + F_spring_parallel  (per image)
-    
+
     Parameters
     ----------
     images : List[Atoms]
         All images including endpoints
     energies : List[float]
         Energies of all images
+    raw_forces : List[np.ndarray], optional
+        Pre-computed true (calculator) forces per image, shape (N_i, 3) each, in
+        the same convention/units as ``at.get_forces()``. When provided (batched
+        evaluation path) the per-image ``at.get_forces()`` serial loop is skipped
+        entirely. When None (default) forces are read serially from each image's
+        attached calculator (backward-compatible behaviour).
     k_spring : float, optional
         Single spring constant (used if k_springs is None and use_dynamic_k=False)
     k_springs : List[float], optional
@@ -386,8 +394,12 @@ def neb_forces(images: List[Atoms], energies: List[float],
     max_fp = 0.0
     hei_idx = 1
 
-    # get raw forces and flatten
-    raw_forces = [to_numpy_f64(at.get_forces()) for at in images]
+    # get raw forces and flatten. Prefer caller-supplied batched forces; fall back
+    # to serial per-image calculator reads for non-batch calculators.
+    if raw_forces is None:
+        raw_forces = [to_numpy_f64(at.get_forces()) for at in images]
+    else:
+        raw_forces = [to_numpy_f64(f) for f in raw_forces]
     coords = [to_numpy_f64(at.get_positions()) for at in images]
     Es = [float(e) for e in energies]
 
@@ -551,8 +563,21 @@ class NEB(JobABC):
             self.input_images = atoms_or_molecules.multiatoms
             self.atoms_R = None
             self.atoms_P = None
+            # Capture the (optional) batched calculator carried by the Molecules
+            # object (e.g. UMABatchCalc). If it exposes the batch contract
+            # (prepare + get_ef_gpu) the whole band is evaluated in ONE forward
+            # per NEB iteration; otherwise we fall back to per-image serial ASE
+            # calculator reads (fully backward compatible).
+            self._mol_calc = getattr(atoms_or_molecules, "calc", None)
         else:
             raise ValueError("Please provide Molecules object containing all images")
+
+        self._use_batch = self._is_batch_calc(self._mol_calc)
+        # Single-forward-per-geometry cache (band energies + raw forces).
+        self._band_nmax = None
+        self._band_cache_key = None
+        self._band_cache_E = None
+        self._band_cache_F = None
 
         # Initialize params from paras dict
         self.params = self._init_params(NEBParams, paras, ("neb", "NEB", "ts"))
@@ -661,9 +686,96 @@ class NEB(JobABC):
         return rmsds
 
 
-    def get_energies(self, imgs): 
+    # ----------------------- batched band evaluation -------------------------
+
+    @staticmethod
+    def _is_batch_calc(calc) -> bool:
+        """A batch calculator exposes ``prepare(atoms_list)`` + ``get_ef_gpu()``
+        (UMABatchCalc / AIMNet2BatchCalc / MACE*BatchCalc contract)."""
+        return (calc is not None
+                and hasattr(calc, "prepare")
+                and hasattr(calc, "get_ef_gpu"))
+
+    @staticmethod
+    def _geom_key(images: List[Atoms]):
+        """Cheap fingerprint of the band geometry so a single batched forward is
+        reused across the multiple E/F reads issued at one (unchanged) geometry
+        within a NEB iteration (eval_grad + logging)."""
+        h = hashlib.blake2b(digest_size=16)
+        n = []
+        for at in images:
+            pos = np.ascontiguousarray(at.get_positions(), dtype=np.float64)
+            n.append(pos.shape[0])
+            h.update(pos.tobytes())
+        return (tuple(n), h.digest())
+
+    def _band_eval_batched(self, images: List[Atoms]):
+        """ONE prepare + ONE forward over the WHOLE band (all images, endpoints
+        included). Returns (Es: list[float], raw_F: list[(N_i,3) np.f64]).
+
+        UMA's per-atom ``mol_idx`` segmentation keeps every image's graph
+        block-diagonal, so a single batched forward yields each image's energy and
+        forces independently (identical to evaluating them one at a time). Frozen
+        endpoints carry constant positions and are simply part of the batch."""
+        import torch  # local import: only needed on the batch path
+
+        calc = self._mol_calc
+        nmax = self._band_nmax
+        # fixed_nmax keeps the padded (B, nmax_dof) layout stable across iters
+        # (band membership is constant; only positions move) -> matches the
+        # batch-calc contract used by BatchPRFO.
+        calc.prepare(images, fixed_nmax=nmax)
+        E_Ha, F_Ha = calc.get_ef_gpu()          # E (B,), F (B, nmax_dof)
+        if self._band_nmax is None:
+            self._band_nmax = int(F_Ha.shape[1])
+
+        if isinstance(E_Ha, torch.Tensor):
+            E_np = E_Ha.detach().to("cpu", torch.float64).numpy()
+        else:
+            E_np = np.asarray(E_Ha, dtype=np.float64)
+        if isinstance(F_Ha, torch.Tensor):
+            F_np = F_Ha.detach().to("cpu", torch.float64).numpy()
+        else:
+            F_np = np.asarray(F_Ha, dtype=np.float64)
+
+        Es, raw_F = [], []
+        for i, at in enumerate(images):
+            n_i = len(at)
+            Es.append(float(E_np[i]))
+            raw_F.append(F_np[i, :3 * n_i].reshape(n_i, 3).astype(np.float64, copy=True))
+        return Es, raw_F
+
+    def _band_eval(self, images: List[Atoms]):
+        """Return (Es, raw_F) for the band, caching one forward per geometry.
+
+        Batch path: single batched forward (UMABatchCalc). Serial path: per-image
+        ASE ``get_potential_energy`` + ``get_forces`` (original behaviour)."""
+        key = self._geom_key(images)
+        if self._band_cache_key is not None and key == self._band_cache_key:
+            return self._band_cache_E, self._band_cache_F
+
+        if self._use_batch:
+            Es, raw_F = self._band_eval_batched(images)
+        else:
+            Es = [float(at.get_potential_energy(force_consistent=True)) for at in images]
+            raw_F = [to_numpy_f64(at.get_forces()) for at in images]
+
+        self._band_cache_key, self._band_cache_E, self._band_cache_F = key, Es, raw_F
+        return Es, raw_F
+
+    def _band_forces(self, images: List[Atoms]):
+        """Raw (calculator) forces per image for the batch path; ``None`` on the
+        serial path so ``neb_forces`` keeps its original per-image reads."""
+        if not self._use_batch:
+            return None
+        return self._band_eval(images)[1]
+
+    def get_energies(self, imgs):
+        if self._use_batch:
+            return self._band_eval(imgs)[0]
         return [float(at.get_potential_energy(force_consistent=True)) for at in imgs]
-    
+
+
     def _compute_distances(self, images: List[Atoms]) -> List[float]:
         """
         Compute straight-line distances between consecutive images.
@@ -1276,7 +1388,13 @@ class NEB(JobABC):
         # ===================================================================
         # Step 1: Optional endpoint optimization
         # ===================================================================
-        if self.params.initial_opt:
+        if self.params.initial_opt and self._use_batch:
+            log_info([
+                "\ninitial_opt requested but skipped on the batched-calculator path\n",
+                "(endpoint pre-optimization uses per-image serial ASE forces; not\n",
+                "wired for the batch calculator in this phase). Endpoints used as-is.\n"
+            ], self.output)
+        elif self.params.initial_opt:
             self.atoms_R, self.atoms_P = self.optimize_endpoints(
                 images[0], images[-1],
                 f_max_th=self.params.neb_f_max_th,
@@ -1289,16 +1407,23 @@ class NEB(JobABC):
         # ===================================================================
         # Step 2: Endpoint properties and alignment
         # ===================================================================
-        def forces_info(atoms):
-            F = atoms.get_forces()
-            maxF = np.max(np.linalg.norm(F, axis=1))            
+        def forces_info(F):
+            F = to_numpy_f64(F)
+            maxF = np.max(np.linalg.norm(F, axis=1))
             rmsF = np.sqrt(np.mean(np.linalg.norm(F, axis=1) ** 2))
             return maxF, rmsF
 
-        E_R = images[0].get_potential_energy(force_consistent=True)
-        E_P = images[-1].get_potential_energy(force_consistent=True)
-        maxF_R, rmsF_R = forces_info(images[0])
-        maxF_P, rmsF_P = forces_info(images[-1])
+        if self._use_batch:
+            # One batched forward over the whole band; pull endpoint props from it.
+            Es_band0, F_band0 = self._band_eval(images)
+            E_R, E_P = Es_band0[0], Es_band0[-1]
+            maxF_R, rmsF_R = forces_info(F_band0[0])
+            maxF_P, rmsF_P = forces_info(F_band0[-1])
+        else:
+            E_R = images[0].get_potential_energy(force_consistent=True)
+            E_P = images[-1].get_potential_energy(force_consistent=True)
+            maxF_R, rmsF_R = forces_info(images[0].get_forces())
+            maxF_P, rmsF_P = forces_info(images[-1].get_forces())
 
         log_info([
             "\nProperties of fixed NEB end points:\n",
@@ -1343,8 +1468,11 @@ class NEB(JobABC):
         
         def eval_grad(x_flat):
             self._unpack_internal(x_flat, images)
-            Es = self.get_energies(images)
-            
+            # ONE prepare + ONE forward over the whole band per geometry; both the
+            # energies and the raw forces come from this single batched evaluation
+            # (serial fallback when no batch calculator).
+            Es, raw_F = self._band_eval(images) if self._use_batch else (self.get_energies(images), None)
+
             Fp_list, _, _ = neb_forces(
                 images, Es,
                 k_spring=None,
@@ -1352,29 +1480,32 @@ class NEB(JobABC):
                 use_dynamic_k=self.params.use_dynamic_k,
                 k_min=self.params.k_min,
                 k_max=self.params.k_max,
-                k_decay=self.params.k_decay
+                k_decay=self.params.k_decay,
+                raw_forces=raw_F
             )
-            
+
             grads = [(-Fp_list[i]).reshape(-1) for i in range(1, len(images) - 1)]
             return np.concatenate(grads) if grads else np.zeros_like(x_flat)
-        
+
         x = self._pack_internal(images)
         g = eval_grad(x)
         iteration = 0
-        
+
         Es = self.get_energies(images)
-        
+        raw_F = self._band_forces(images)
+
         if self.params.use_dynamic_k:
             k_springs = compute_dynamic_k(Es, self.params.k_min, self.params.k_max, self.params.k_decay)
             self._k_springs_history.append(k_springs.copy())
         else:
             k_springs = [self.params.k_max] * len(images)
-        
+
         Fp_list, maxfp, hei = neb_forces(
             images, Es,
             k_spring=None,
             k_springs=k_springs,
-            use_dynamic_k=False
+            use_dynamic_k=False,
+            raw_forces=raw_F
         )
         rmsfp = rms_force(Fp_list)
         dE_hei = Es[hei] - Es[0]
@@ -1417,20 +1548,24 @@ class NEB(JobABC):
             x = x_new
             g = g_new
             
-            # Compute forces and energies for logging
+            # Compute forces and energies for logging. Same geometry as the just
+            # finished eval_grad(x_new) -> the per-geometry cache returns without a
+            # second forward (still ONE forward per NEB iteration).
             Es = self.get_energies(images)
-            
+            raw_F = self._band_forces(images)
+
             if self.params.use_dynamic_k:
                 k_springs = compute_dynamic_k(Es, self.params.k_min, self.params.k_max, self.params.k_decay)
                 self._k_springs_history.append(k_springs.copy())
             else:
                 k_springs = [self.params.k_max] * len(images)
-            
+
             Fp_list, maxfp, hei = neb_forces(
                 images, Es,
                 k_spring=None,
                 k_springs=k_springs,
-                use_dynamic_k=False
+                use_dynamic_k=False,
+                raw_forces=raw_F
             )
             
             rmsfp = rms_force(Fp_list)
