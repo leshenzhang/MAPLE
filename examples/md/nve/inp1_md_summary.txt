@@ -1,0 +1,29 @@
+MD Simulation Summary
+============================================================
+
+Ensemble:                   NVE
+Total steps:                10
+Total time:                 1.00 fs
+Number of atoms:            5
+N_dof:                      15  isolated: 3N
+Energy reporting basis:     vv-raw
+
+Energy Statistics:
+  Mean total energy:        -40.48394581 Ha
+  Std deviation:            0.00000030 Ha
+
+Energy Conservation Metrics [NVE]:
+  σ(TE)/|⟨TE⟩|:            7.30e-09
+  Energy drift:        +0.000575 kcal/mol
+  Fit window:          0.001 ps  (full trajectory)
+  r(KE,PE):                 -1.0000
+
+Temperature Statistics:
+  Mean temperature:         278.86 K
+  Std deviation:            16.70 K
+  σ(T)/<T>:                 0.0599
+
+Performance:
+  Wall time:                1s
+  Average speed:            0.0668 ns/day
+  Time per ns:              1293124.2 s/ns

@@ -1,0 +1,201 @@
+
+**********************************************************************
+*                                                                    *
+*                        M   A   P   L   E                           *
+*                                                                    *
+*      MAchine-learning Potential for Landscape Exploration          *
+*                                                                    *
+*                                                                    *
+*      © 2025 University of Pittsburgh. All rights reserved.         *
+*      Licensed under CC BY 4.0 for academic use.                    *
+*                                                                    *
+*      Principal Developer:  Xujian Wang                             *
+*                                                                    *
+**********************************************************************
+
+
+Parsing # commands...
+Global parameter: model = uma
+Task set to 'md'
+Global parameter: device = cpu
+Parsed configuration:
+----------------------------------------
+Task: md
+model          : uma(size=uma-s-1p1)
+ensemble       : nve
+timestep       : 0.1
+steps          : 10
+temperature    : 300.0
+traj_every     : 1
+log_every      : 1
+init_velocities: True
+restart        : False
+load_state     : False
+rst_file       :
+rst_every      : 10
+remove_com     : True
+remove_com_every: 0
+remove_rotation: False
+remove_angular : True
+remove_angular_every: 0
+random_seed    : 12345
+thermostat     : langevin
+friction       : 0.001
+tau_t          : 100.0
+barostat       : c-rescale
+pressure       : 1.0
+tau_p          : 2000.0
+compressibility: 4.5e-05
+mdp            : nve.mdp
+traj_format    : xyz
+debug          : False
+device         : cpu
+
+                             Coordinates
+**********************************************************************
+
+Group 1 (inline)
+Charge: 0, Multiplicity: 1
+--------------------
+1    C              0.000000             0.000000             0.000000
+2    H              0.629118             0.629118             0.629118
+3    H             -0.629118            -0.629118             0.629118
+4    H             -0.629118             0.629118            -0.629118
+5    H              0.629118            -0.629118            -0.629118
+
+================================================================================
+                               NVE MD PARAMETERS
+================================================================================
+Ensemble:           NVE (microcanonical)
+Timestep:           0.100 fs
+Total steps:        10
+Initial temp:       300.00 K
+
+Output frequencies:
+  Log every:        1 steps
+  Traj every:       1 steps
+
+Velocity init:      True
+Restart mode:       False
+Load-state mode:    False
+RST every:          10 steps
+Remove COM:         True (initialization-only)
+Remove angular:     True (initialization-only; includes COM+rotation)
+Remove COM every:   disabled (remove_com_every=0)
+Remove angular ev.: disabled (remove_angular_every=0)
+Random seed:        12345
+================================================================================
+
+  ┌─ NVT PRE-EQUILIBRATION ADVISORY ──────────────────────────────────────┐
+  │  Starting NVE from an optimised (0 K) structure without prior NVT     │
+  │  equilibration is known to cause:                                      │
+  │    • A large initial TE drop (~5–10 kcal/mol) in the first ~20 steps  │
+  │    • Actual mean temperature well below the target value               │
+  │    • Inflated σ(TE) that cannot be reduced by decreasing dt            │
+  │                                                                        │
+  │  Recommended workflow (GROMACS Manual 2024 §3.4.2; AMBER 2023 §3.1): │
+  │    opt → NVT (≥ 10 ps, Langevin) → NVE (production)                  │
+  │                                                                        │
+  │  To suppress: set restart=true (assumes prior NVT was completed).     │
+  └────────────────────────────────────────────────────────────────────────┘
+
+
+Initializing velocities at 300.00 K...
+NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,
+  not an on/off pair. Initialization removes COM + rigid-body rotation once,
+  but runtime angular motion will not be projected out during the run.
+Initial temperature: 300.00 K
+
+================================================================================
+                                 MD SIMULATION
+================================================================================
+Ensemble:        NVE
+Timestep:        0.100 fs
+Total steps:     10
+Simulation time: 1.00 fs
+Velocity repr:   standard
+
+System:
+  Atoms:         5
+  Formula:       CH4
+  Charge:        0
+  Multiplicity:  1
+
+================================================================================
+
+       Step      Time(ps)  Progress      T(K)      E_total(Ha)  Speed(ns/day)         ETA
+  ---------  ------------  --------  --------  ---------------  -------------  ----------
+
+Starting NVE simulation...
+
+  Step        1        0.10 fs  T  299.15 K  E     -40.483946 Ha
+  Step        2        0.20 fs  T  297.21 K  E     -40.483946 Ha
+  Step        3        0.30 fs  T  294.22 K  E     -40.483946 Ha
+  Step        4        0.40 fs  T  290.21 K  E     -40.483946 Ha
+  Step        5        0.50 fs  T  285.24 K  E     -40.483946 Ha
+  Step        6        0.60 fs  T  279.37 K  E     -40.483946 Ha
+  Step        7        0.70 fs  T  272.66 K  E     -40.483946 Ha
+  Step        8        0.80 fs  T  265.20 K  E     -40.483946 Ha
+  Step        9        0.90 fs  T  257.05 K  E     -40.483945 Ha
+  Step       10        1.00 fs  T  248.32 K  E     -40.483945 Ha
+
+================================================================================
+                            MD SIMULATION COMPLETED
+================================================================================
+  Energy reporting basis:                vv-raw
+
+                            ── Energy Statistics ──
+  Mean total energy:               -40.48394581  Ha
+  Std deviation:                     0.00000030  Ha
+
+                        ── [NVE] Energy Conservation ──
+  σ(TE)/|⟨TE⟩|:                        7.30e-09
+  Energy drift:                  +0.000575  kcal/mol
+  Fit window:                     0.001  ps  (full trajectory)
+  r(KE,PE):                             -1.0000
+
+                            ── [NVE] Temperature ──
+  ⟨T⟩:                                   278.86  K
+  σ(T):                                   16.70  K
+  σ(T)/<T>:                              0.0599
+  N_dof = 15  isolated: 3N
+
+                               ── Performance ──
+  Wall time:                                  1s
+  Simulation time:                      0.001  ps
+  Average speed:                       0.0668  ns/day
+  Time per ns:                      1293124.2  s/ns
+
+                               ── Output Files ──
+  Thermodynamics:             inp1_md_thermo.dat
+  Trajectory:                 inp1_md_traj.xyz
+  Summary:                    inp1_md_summary.txt
+  Final structure:           inp1_final.xyz
+    (Structure handoff only; strict restart state is in inp1_md.rst)
+  Checkpoint:                 inp1_md.rst
+  Previous checkpoint:        inp1_md_prev.rst
+================================================================================
+
+NVE simulation completed successfully.
+
+
+
+Program started: 2026-05-26 15:01:24
+
+======================================================================
+                      TIMING SUMMARY
+======================================================================
+Input Reading.......................................   0.002 s  (   0.0 %)
+  Settings Parsing....................................   0.001 s  (  34.2 %)
+  Coordinate Section Parsing..........................   0.000 s  (  17.0 %)
+  Post-Processing Expansion...........................   0.000 s  (   0.3 %)
+MLP Initialization..................................   7.976 s  (  87.2 %)
+Job Dispatching.....................................   1.166 s  (  12.8 %)
+  MD Simulation (NVE).................................   1.166 s  ( 100.0 %)
+======================================================================
+Total wall time: 9.144 s
+Total CPU time: 24.095 s
+======================================================================
+
+Program ended: 2026-05-26 15:01:33
+TOTAL RUN TIME: 0 days 0 hours 0 minutes 9 seconds 144 msec

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=45"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maple"
+version = "0.1.4"
+description = "MAPLE: MAchine-learning Potential for Landscape Exploration"
+requires-python = ">=3.10"
+dependencies = [
+    "ase>=3.22",
+    "numpy>=1.20",
+    "scipy>=1.7",
+]
+# PyTorch/CUDA and fairchem-core are intentionally not declared here because
+# users must install versions that match their CUDA/CPU runtime before using
+# MAPLE's torch-backed and UMA/PBC-backed models. fairchem-core supplies its
+# own UMA runtime companions such as huggingface-hub and omegaconf.
+
+[project.scripts]
+maple = "maple.main:main"
+
+[tool.setuptools.packages.find]
+include = ["maple*"]

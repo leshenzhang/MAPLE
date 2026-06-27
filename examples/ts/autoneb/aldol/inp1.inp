@@ -1,0 +1,12 @@
+#model=aimnet2nse
+#ts(method=autoneb)
+#device=gpu0
+
+XYZ -1 1 rec.xyz
+
+XYZ -1 1 im.xyz
+
+XYZ -1 1 pr.xyz
+
+
+

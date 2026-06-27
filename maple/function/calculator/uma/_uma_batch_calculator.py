@@ -1,0 +1,680 @@
+# -*- coding: utf-8 -*-
+"""Batched UMA (fairchem) calculator for the MAPLE GPU-batch comp-chem library.
+
+Goal
+----
+Batch many small molecules (<= ~50 atoms) through UMA in ONE fairchem forward to
+maximize throughput and GPU utilization. Parallelism comes entirely from
+fairchem's *native* graph batching -- there is NO hand-written CUDA.
+
+Native batching path
+--------------------
+    AtomicData.from_ase(atoms, task_name="omol", ...)        # one per molecule
+    atomicdata_list_to_batch(ad_list) -> batched AtomicData  # one combined graph
+    predict_unit.predict(batch) -> {"energy": (B,), "forces": (N_total, 3), ...}
+
+The batched graph carries a per-atom ``batch`` index, so each molecule's edges
+stay within its own node block (block-diagonal); perturbing one molecule cannot
+leak into another (verified by the perturb-one byte-isolation parity gate).
+
+Contract
+--------
+Mirrors ``AIMNet2BatchCalc``:
+    prepare(atoms_list, fixed_nmax=None)
+    step_cart_(s_cart: (B, nmax_dof))
+    set_coords_(coord: (N, 3)) / backup_coords() / restore_coords()
+    get_ef_gpu()  -> (E_Ha: (B,), F_Ha: (B, nmax_dof))
+    get_efh_gpu() -> (E_Ha: (B,), F_Ha: (B, nmax_dof),
+                      H_Ha: (B, nmax_dof, nmax_dof), P: (B,) int64)
+
+Hartree units (UMA returns eV / eV.A^-1; EV2HARTREE = 1/27.211386245988).
+UMA supports a NUMERICAL Hessian only -> get_efh_gpu() uses a batched central
+finite-difference Hessian (H = -(F(x+d) - F(x-d)) / (2d)); each perturbed replica
+is an isolated graph in a chunked super-batch.
+
+Self-contained fairchem env-compat preamble
+-------------------------------------------
+This module makes ``import fairchem.core`` work in environments where it is
+otherwise broken, WITHOUT modifying the environment or any other file:
+  (1) ``torch.serialization.add_safe_globals([slice])`` -- torch>=2.6 defaults
+      ``weights_only=True``; e3nn's ``constants.pt`` and the UMA checkpoint store
+      a ``slice`` object and fail to load otherwise.
+  (2) A ``ray.serve`` stub installed into ``sys.modules`` before importing
+      fairchem -- ``fairchem.core.__init__`` pulls in a ray.serve batch-serve
+      shim whose fastapi dependency needs pydantic v2; on pydantic-v1 envs the
+      import raises even though direct inference never touches ray.serve.
+"""
+
+# --------------------------------------------------------------------------- #
+# Self-contained fairchem env-compat preamble (must run before importing       #
+# fairchem). Both steps are idempotent and only take effect when needed.       #
+# --------------------------------------------------------------------------- #
+import sys as _sys
+import types as _types
+
+import torch
+
+# (1) Allowlist `slice` for torch.load weights_only=True (e3nn / UMA checkpoint).
+try:
+    torch.serialization.add_safe_globals([slice])
+except Exception:
+    pass
+
+
+# (2) Stub ray.serve so fairchem.core import does not pull a pydantic-v2 fastapi
+#     chain. We never use ray.serve for direct inference.
+def _install_ray_serve_stub() -> None:
+    try:
+        import ray  # noqa: F401
+    except Exception:
+        return  # ray not present -> fairchem import path differs; nothing to do
+    existing = _sys.modules.get("ray.serve")
+    if existing is not None and getattr(existing, "_maple_stub", False):
+        return
+    try:
+        import ray.serve  # noqa: F401  -- imports cleanly -> leave it alone
+        return
+    except Exception:
+        pass
+    serve = _types.ModuleType("ray.serve")
+    serve._maple_stub = True
+    serve.deployment = lambda *a, **k: (lambda cls: cls)
+    serve.batch = lambda *a, **k: (lambda fn: fn)
+    serve.handle = None
+    serve.run = lambda *a, **k: None
+    serve.start = lambda *a, **k: None
+    schema = _types.ModuleType("ray.serve.schema")
+    schema.LoggingConfig = lambda *a, **k: None
+    serve.schema = schema
+    import ray
+    ray.serve = serve
+    _sys.modules["ray.serve"] = serve
+    _sys.modules["ray.serve.schema"] = schema
+
+
+_install_ray_serve_stub()
+# --------------------------------------------------------------------------- #
+
+from functools import partial
+from typing import List, Optional
+
+from ase import Atoms
+
+try:
+    from fairchem.core.calculate.ase_calculator import AtomicData
+    from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
+    from fairchem.core.units.mlip_unit import load_predict_unit
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(f"fairchem-core is not importable: {exc}")
+
+
+EV2HARTREE = 1.0 / 27.211386245988
+EH2EV = 27.211386245988
+
+
+class UMABatchCalc:
+    """Batched UMA calculator using fairchem native graph batching.
+
+    One ``prepare()`` fixes the topology of a batch of B molecules; thereafter
+    ``get_ef_gpu`` / ``get_efh_gpu`` run a single batched forward (plus, for the
+    Hessian, chunked batched finite-difference forwards). Coordinates are kept as
+    an f64 master tensor; the forward bridges through f32 (UMA runs in f32).
+    """
+
+    supported_hessian_modes = ("numerical",)
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float64,
+        task: str = "omol",
+        hessian_delta: float = 2e-3,
+        hessian_max_atoms: int = 4096,
+    ):
+        dev = str(device)
+        dev = "cuda" if dev.startswith("cuda") else "cpu"
+        self.device = torch.device(dev)
+        self.dtype = dtype
+        self.task_name = str(task).lower()
+        self.hessian = "numerical"
+        self._delta = float(hessian_delta)
+        self._h_max_atoms = int(hessian_max_atoms)
+
+        self._predictor = load_predict_unit(
+            model_path, inference_settings="default", device=dev
+        )
+        ext = bool(getattr(self._predictor.inference_settings, "external_graph_gen", False))
+        self._r_edges = ext
+        self._max_neigh = 300 if ext else None
+        self._a2g = partial(
+            AtomicData.from_ase,
+            task_name=self.task_name,
+            r_edges=self._r_edges,
+            r_data_keys=["spin", "charge"],
+            max_neigh=self._max_neigh,
+            radius=6.0,
+        )
+
+        # prepare() state
+        self._prepared = False
+        self._atoms_B = 0
+        self._ptr = None
+        self.numbers = None
+        self.mol_idx = None
+        self._local_atom = None
+        self.coord = None
+        self.N_atoms = 0
+        self.Nmax_atoms = 0
+        self.nmax_dof = 0
+        self._n_b = None
+        self._cols = None
+        self._ad_list = None
+        self._batch_ad = None
+        self._coord_backup = None
+        # Phase-1b numerical-Hessian plan cache (D3): block-diagonal batch
+        # containers + vectorized perturb/scatter index tensors, geometry
+        # independent so they are built once per prepare() and reused across
+        # every get_efh_gpu() call (e.g. a BatchPRFO RecalcFC loop).
+        self._h_plan = None
+        self._h_plan_key = None
+
+    # ------------------------------------------------------------------ utils
+    @staticmethod
+    def _ad_atoms(at: Atoms) -> Atoms:
+        """Copy with UMA-convention info: spin = multiplicity, charge = charge."""
+        at = at.copy()
+        at.info["spin"] = int(at.info.get("mult", at.info.get("spin", 1)))
+        at.info["charge"] = int(at.info.get("charge", 0))
+        return at
+
+    # ---------------------------------------------------------------- prepare
+    def prepare(self, atoms_list: List[Atoms], fixed_nmax: Optional[int] = None):
+        """Fix topology + initial coords for a batch of molecules.
+
+        ``fixed_nmax`` (optional) overrides the padded per-structure DOF size so a
+        batch-PRFO driver can share one padded layout across iterations (matches
+        AIMNet2BatchCalc semantics).
+        """
+        device, dtype = self.device, self.dtype
+        B = len(atoms_list)
+        self._atoms_B = B
+
+        ptr = [0]
+        nums, mids, locs = [], [], []
+        for i, at in enumerate(atoms_list):
+            Z = torch.tensor(at.get_atomic_numbers(), dtype=torch.int64, device=device)
+            n = int(Z.shape[0])
+            ptr.append(ptr[-1] + n)
+            nums.append(Z)
+            mids.append(torch.full((n,), i, dtype=torch.int64, device=device))
+            locs.append(torch.arange(n, dtype=torch.int64, device=device))
+
+        self._ptr = torch.tensor(ptr, dtype=torch.long, device=device)
+        self.numbers = torch.cat(nums) if nums else torch.zeros(0, dtype=torch.int64, device=device)
+        self.mol_idx = torch.cat(mids) if mids else torch.zeros(0, dtype=torch.int64, device=device)
+        self._local_atom = torch.cat(locs) if locs else torch.zeros(0, dtype=torch.int64, device=device)
+
+        self.N_atoms = int(self.numbers.numel())
+        self.Nmax_atoms = int(max((len(at) for at in atoms_list), default=0))
+        self.nmax_dof = 3 * self.Nmax_atoms if fixed_nmax is None else int(fixed_nmax)
+
+        if self.N_atoms > 0:
+            pos = torch.cat(
+                [torch.tensor(at.get_positions(), dtype=dtype) for at in atoms_list], dim=0
+            )
+        else:
+            pos = torch.zeros((0, 3), dtype=dtype)
+        self.coord = pos.to(device).contiguous()
+
+        self._n_b = (self._ptr[1:] - self._ptr[:-1])  # (B,) atoms per structure
+
+        # Vectorized scatter columns: global atom g (mol b, local a) maps to the
+        # flat index  b*nmax_dof + 3*a + {0,1,2}  inside a (B, nmax_dof) buffer.
+        if self.N_atoms > 0:
+            base = self.mol_idx * self.nmax_dof + 3 * self._local_atom  # (N,)
+            self._cols = (
+                base[:, None] + torch.arange(3, device=device)[None, :]
+            ).reshape(-1)  # (3N,)
+        else:
+            self._cols = torch.zeros(0, dtype=torch.int64, device=device)
+
+        # Per-molecule AtomicData templates + reusable batched template.
+        self._ad_list = [self._a2g(self._ad_atoms(at)) for at in atoms_list]
+        self._batch_ad = atomicdata_list_to_batch(self._ad_list) if B > 0 else None
+
+        self._coord_backup = None
+        self._h_plan = None          # invalidate cached Hessian plan (topology changed)
+        self._h_plan_key = None
+        self._prepared = True
+
+    # ------------------------------------------------------------ coord ops
+    @torch.no_grad()
+    def step_cart_(self, s_cart: torch.Tensor):
+        """In-place displacement. ``s_cart`` is (B, nmax_dof), padded per structure."""
+        assert self._prepared, "call prepare() first"
+        B = self._atoms_B
+        assert s_cart.shape == (B, self.nmax_dof), (
+            f"step_cart_ expects (B,{self.nmax_dof}), got {tuple(s_cart.shape)}"
+        )
+        if self.N_atoms == 0:
+            return
+        s = s_cart.to(self.device, dtype=self.dtype).reshape(-1)
+        disp = s[self._cols].reshape(self.N_atoms, 3)  # vectorized gather, no .item()
+        self.coord.add_(disp)
+
+    @torch.no_grad()
+    def set_coords_(self, coord: torch.Tensor):
+        assert self._prepared, "call prepare() first"
+        assert coord.shape == (self.N_atoms, 3)
+        self.coord.copy_(coord.to(self.device, dtype=self.dtype))
+
+    @torch.no_grad()
+    def backup_coords(self):
+        if self._prepared:
+            self._coord_backup = self.coord.clone()
+
+    @torch.no_grad()
+    def restore_coords(self):
+        if self._coord_backup is not None:
+            self.coord.copy_(self._coord_backup)
+            self._coord_backup = None
+
+    # -------------------------------------------------------------- forward
+    def _clone_batch(self):
+        ad = self._batch_ad
+        if hasattr(ad, "clone"):
+            return ad.clone()
+        return atomicdata_list_to_batch(self._ad_list)
+
+    def _to_device(self, ad):
+        if hasattr(ad, "to"):
+            try:
+                return ad.to(self.device)
+            except Exception:
+                return ad
+        return ad
+
+    def _predict_forces(self, batch_ad):
+        """Run predict; return (energy (Bc,), forces (Nc, 3), batch_idx (Nc,)).
+
+        UMA returns forces directly (computed inside ``predict``), so the outputs
+        carry an autograd graph; this calculator is inference-only -> detach.
+        """
+        batch_ad = self._to_device(batch_ad)
+        out = self._predictor.predict(batch_ad)
+        E = out["energy"].detach().to(self.dtype).reshape(-1)
+        F = out["forces"].detach().to(self.dtype).to(self.device)
+        bidx = batch_ad.batch.to(self.device)
+        return E, F, bidx
+
+    def _forward(self, coord: torch.Tensor):
+        """coord (N,3) f64 -> (E_eV (B,), F_eV (N,3)), single batched forward."""
+        ad = self._to_device(self._clone_batch())
+        ad.pos = coord.to(device=self.device, dtype=torch.float32)
+        E, F, _ = self._predict_forces(ad)
+        return E, F.reshape(self.N_atoms, 3)
+
+    # ------------------------------------------------------------- get_ef_gpu
+    def get_ef_gpu(self):
+        """(E_Ha: (B,), F_Ha: (B, nmax_dof)) from one batched forward."""
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return (
+                torch.zeros(0, dtype=dtype, device=device),
+                torch.zeros((0, 0), dtype=dtype, device=device),
+            )
+        E_eV, F_eV = self._forward(self.coord)
+        F_pad = torch.zeros((B, self.nmax_dof), dtype=dtype, device=device)
+        if self.N_atoms > 0:
+            F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)  # vectorized scatter
+        return E_eV * EV2HARTREE, F_pad * EV2HARTREE
+
+    # ------------------------------------------------- partial-Hessian helper
+    def _movable_key(self, movable_masks):
+        """Hashable cache key for a Hessian plan.
+
+        Includes the FD step ``self._delta`` and chunk budget ``self._h_max_atoms``
+        because the cached plan bakes BOTH in (pert_val = s*delta, fac =
+        -s/(2*delta), and the chunk boundaries are derived from h_max). An
+        adaptive-delta change (or an h_max change) must therefore invalidate a
+        stale plan -- otherwise get_efh_gpu would silently reuse a plan built for
+        the old step size. The movable spec ('full' or per-structure index
+        tuples) is the third component.
+        """
+        mv = ("full" if movable_masks is None
+              else tuple(tuple(int(x) for x in m)
+                         for m in self._resolve_movable(movable_masks)))
+        return (self._delta, self._h_max_atoms, mv)
+
+    def _resolve_movable(self, movable_masks):
+        """Per-structure list[int] of atom indices whose DOFs are perturbed.
+
+        ``movable_masks`` may be None (all atoms of every structure), or a
+        sequence of length B where entry b is None (all atoms of structure b),
+        a bool mask of length n_b, or an explicit list/array of atom indices.
+        Frozen atoms still appear in every replica (they exert forces); only
+        their columns/rows are omitted from the Hessian (the exact second-
+        derivative block of the FixAtoms-constrained PES).
+        """
+        import numpy as _np
+        B = self._atoms_B
+        n_b = self._n_b.tolist()
+        if movable_masks is None:
+            return [list(range(n_b[b])) for b in range(B)]
+        out = []
+        for b in range(B):
+            m = movable_masks[b]
+            if m is None:
+                out.append(list(range(n_b[b])))
+                continue
+            m_arr = _np.asarray(m)
+            if m_arr.dtype == bool:
+                out.append([int(i) for i in _np.nonzero(m_arr)[0]])
+            else:
+                idxs = [int(i) for i in m_arr.reshape(-1)]
+                assert all(0 <= a < n_b[b] for a in idxs), (
+                    f"movable index out of range for structure {b} "
+                    f"(n_atoms={n_b[b]}): {idxs}"
+                )
+                out.append(idxs)
+        return out
+
+    # --------------------------------------------------- Hessian plan builder
+    def _build_hessian_plan(self, movable_masks=None):
+        """Build (once, cached) the block-diagonal central-FD Hessian plan.
+
+        Eliminates the per-replica AtomicData clone + per-call ``...list_to_batch``
+        rebuild + per-DOF python scatter of the legacy path. All pieces here are
+        geometry INDEPENDENT (topology fixed by prepare()), so the plan is built
+        once and reused across every get_efh_gpu() call (BatchPRFO RecalcFC loop):
+
+          * chunk the (mol i, movable atom a, axis c, sign s) replicas under the
+            same <= hessian_max_atoms atom budget as the legacy path;
+          * for each chunk, collate the per-mol AtomicData *templates* into ONE
+            block-diagonal batch container ONCE and park it on-device (reused; the
+            untouched topology is never rebuilt again);
+          * precompute the vectorized gather (chunk node -> master coord row), the
+            vectorized perturbation (one (node,axis) += s*delta per replica), and
+            the vectorized scatter (chunk force row -> flat H index) so the whole
+            assembly is index ops with NO python loop over DOFs.
+        """
+        device = self.device
+        B = self._atoms_B
+        delta = self._delta
+        nmax = self.nmax_dof
+        nmax2 = nmax * nmax
+        n_b = self._n_b.tolist()
+        ptr = self._ptr.tolist()
+        h_max = self._h_max_atoms
+
+        mov = self._resolve_movable(movable_masks)               # list[list[int]]
+        # responding atom indices per structure = perturbed (movable) set; for the
+        # full Hessian this is every atom, so all nodes of a replica respond.
+        mov_resp = mov
+
+        # ---- enumerate replicas: (i, a, c, s) ; column k = 3*a + c -----------
+        rep_i, rep_a, rep_c, rep_s = [], [], [], []
+        for i in range(B):
+            for a in mov[i]:
+                for c in range(3):
+                    rep_i.append(i); rep_a.append(a); rep_c.append(c); rep_s.append(1.0)
+                    rep_i.append(i); rep_a.append(a); rep_c.append(c); rep_s.append(-1.0)
+        R = len(rep_i)
+
+        # ---- chunk replicas under the atom budget (legacy-identical rule) -----
+        chunks = []
+        cur, cur_atoms = [], 0
+        for r in range(R):
+            na = n_b[rep_i[r]]
+            if cur and cur_atoms + na > h_max:
+                chunks.append(cur); cur, cur_atoms = [], 0
+            cur.append(r); cur_atoms += na
+        if cur:
+            chunks.append(cur)
+
+        plan_chunks = []
+        max_atoms_in_chunk = 0
+        for chunk in chunks:
+            Rc = len(chunk)
+            # block-diagonal batch container from shared per-mol templates (ONCE)
+            mol_refs = [self._ad_list[rep_i[r]] for r in chunk]
+            cont = atomicdata_list_to_batch(mol_refs)
+            cont = self._to_device(cont)
+
+            cn = [n_b[rep_i[r]] for r in chunk]                  # atoms per replica
+            coff = [0]
+            for v in cn:
+                coff.append(coff[-1] + v)
+            Nc = coff[-1]
+            max_atoms_in_chunk = max(max_atoms_in_chunk, Nc)
+
+            # gather: chunk node -> master coord row (block order == replica order)
+            node_src = []
+            for slot, r in enumerate(chunk):
+                g0 = ptr[rep_i[r]]
+                node_src.extend(range(g0, g0 + cn[slot]))
+            node_src = torch.tensor(node_src, dtype=torch.long, device=device)
+
+            # perturbation: one (node,axis) += s*delta per replica (disjoint blocks)
+            pert_node = torch.tensor(
+                [coff[slot] + rep_a[r] for slot, r in enumerate(chunk)],
+                dtype=torch.long, device=device,
+            )
+            pert_comp = torch.tensor(
+                [rep_c[r] for r in chunk], dtype=torch.long, device=device,
+            )
+            pert_val = torch.tensor(
+                [rep_s[r] * delta for r in chunk], dtype=self.dtype, device=device,
+            )
+
+            # scatter: responding (movable) atom rows -> flat H index; fac=-s/(2d)
+            resp_node, tgt, fac = [], [], []
+            for slot, r in enumerate(chunk):
+                i = rep_i[r]; k = 3 * rep_a[r] + rep_c[r]
+                f = -rep_s[r] / (2.0 * delta)
+                base_i = i * nmax2
+                for ap in mov_resp[i]:
+                    resp_node.append(coff[slot] + ap)
+                    fac.append(f)
+                    row3 = 3 * ap
+                    tgt.append(base_i + (row3 + 0) * nmax + k)
+                    tgt.append(base_i + (row3 + 1) * nmax + k)
+                    tgt.append(base_i + (row3 + 2) * nmax + k)
+            resp_node = torch.tensor(resp_node, dtype=torch.long, device=device)
+            tgt = torch.tensor(tgt, dtype=torch.long, device=device)
+            fac = torch.tensor(fac, dtype=self.dtype, device=device)
+
+            plan_chunks.append(dict(
+                cont=cont, node_src=node_src,
+                pert_node=pert_node, pert_comp=pert_comp, pert_val=pert_val,
+                resp_node=resp_node, tgt=tgt, fac=fac,
+            ))
+
+        return dict(
+            chunks=plan_chunks, n_replicas=R, n_chunks=len(chunks),
+            max_atoms_in_chunk=max_atoms_in_chunk, nmax=nmax,
+        )
+
+    # ------------------------------------------------------------ get_efh_gpu
+    def get_efh_gpu(self, movable_masks=None):
+        """Energy + forces + per-structure NUMERICAL Hessian (batched central FD).
+
+        Returns
+        -------
+        (E_Ha: (B,), F_Ha: (B, nmax_dof),
+         H_Ha: (B, nmax_dof, nmax_dof), P: (B,) int64)
+
+        H is block-diagonal-padded: each structure fills its own (3*n_i, 3*n_i)
+        top-left block. UMA exposes a numerical Hessian only, so every column is a
+        central finite difference of forces. Each +/- displacement of each DOF of
+        each owning molecule is an *isolated* single-molecule graph; replicas are
+        packed into a chunked super-batch (<= hessian_max_atoms atoms per forward).
+
+        Phase-1b (D3) optimizations vs the legacy path, ALL parity-preserving (the
+        model force evaluations are byte-identical -- same templates, same chunk
+        budget, same central FD):
+          (a) block-diagonal container reuse -- the geometry-independent batch
+              topology (atomic_numbers/batch/natoms/charge/spin/...) is collated
+              ONCE per prepare() and parked on-device, instead of cloning every
+              per-replica AtomicData and re-collating every call;
+          (b) vectorized perturb + vectorized scatter -- positions are gathered
+              and displaced with index ops and the (i,k)-column assembly is ONE
+              ``index_add_`` instead of a python loop over DOFs;
+          (c) the base-point E/F forward is computed ONCE and returned as the
+              gradient (central FD intrinsically uses only the +/- replicas, so
+              the base point is not, and cannot be, an FD center without changing
+              the discretization and breaking byte parity).
+
+        ``movable_masks`` (D3.2) optionally restricts the perturbed/responding DOFs
+        to a per-structure flexible-atom subspace (None = full Hessian); frozen
+        atoms still appear in every replica and exert forces (exact constrained-PES
+        Hessian block).
+        """
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return (
+                torch.zeros(0, dtype=dtype, device=device),
+                torch.zeros((0, 0), dtype=dtype, device=device),
+                torch.zeros((0, 0, 0), dtype=dtype, device=device),
+                torch.zeros(0, dtype=torch.int64, device=device),
+            )
+
+        nmax_a = self.Nmax_atoms
+        nmax = self.nmax_dof
+        nmax2 = nmax * nmax
+
+        # (c) base-point energy + padded forces -- ONE forward, reused as gradient
+        E_eV, F_eV = self._forward(self.coord)
+        F_pad = torch.zeros((B, nmax), dtype=dtype, device=device)
+        if self.N_atoms > 0:
+            F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)
+        P = (nmax_a - self._n_b).to(torch.int64)
+
+        if self.N_atoms == 0:
+            H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
+            return (E_eV * EV2HARTREE, F_pad * EV2HARTREE, H_eV * EV2HARTREE, P)
+
+        # (a) build-or-reuse the cached block-diagonal Hessian plan
+        key = self._movable_key(movable_masks)
+        if self._h_plan is None or self._h_plan_key != key:
+            self._h_plan = self._build_hessian_plan(movable_masks)
+            self._h_plan_key = key
+        plan = self._h_plan
+
+        coord = self.coord  # (N,3) f64 master
+        H_flat = torch.zeros(B * nmax2, dtype=dtype, device=device)
+
+        for ch in plan["chunks"]:
+            # vectorized gather of the perturbation positions for the whole chunk
+            pos = coord[ch["node_src"]].clone()                  # (Nc,3) f64
+            pos[ch["pert_node"], ch["pert_comp"]] += ch["pert_val"]
+            # reuse the cached container; overwrite ONLY positions (clone keeps the
+            # cached template pristine against any in-place use inside predict)
+            cont = ch["cont"]
+            cont = cont.clone() if hasattr(cont, "clone") else cont
+            cont.pos = pos.to(device=device, dtype=torch.float32)
+            _, F, _ = self._predict_forces(cont)                 # (Nc,3) f64
+            # (b) ONE vectorized scatter: H[i,row,k] += -s * F[row] / (2 delta)
+            contrib = (F[ch["resp_node"]] * ch["fac"][:, None]).reshape(-1)
+            H_flat.index_add_(0, ch["tgt"], contrib)
+
+        H_eV = H_flat.reshape(B, nmax, nmax)
+        H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))               # symmetrize
+
+        return (
+            E_eV * EV2HARTREE,
+            F_pad * EV2HARTREE,
+            H_eV * EV2HARTREE,
+            P,
+        )
+
+    # ------------------------------------------------ legacy reference (parity)
+    def _get_efh_gpu_legacy(self):
+        """Verbatim pre-D3 implementation, kept ONLY as the byte-parity oracle.
+
+        Identical math to get_efh_gpu(); used by the parity gate to prove the
+        Phase-1b vectorization changes nothing numerically.
+        """
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return (
+                torch.zeros(0, dtype=dtype, device=device),
+                torch.zeros((0, 0), dtype=dtype, device=device),
+                torch.zeros((0, 0, 0), dtype=dtype, device=device),
+                torch.zeros(0, dtype=torch.int64, device=device),
+            )
+
+        delta = self._delta
+        nmax_a = self.Nmax_atoms
+        nmax = self.nmax_dof  # = 3 * nmax_a
+        n_b_list = self._n_b.tolist()
+        ptr_list = self._ptr.tolist()
+
+        E_eV, F_eV = self._forward(self.coord)
+        F_pad = torch.zeros((B, nmax), dtype=dtype, device=device)
+        if self.N_atoms > 0:
+            F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)
+
+        H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
+        P = (nmax_a - self._n_b).to(torch.int64)
+
+        replicas = []
+        meta = []
+        for k in range(3 * nmax_a):
+            a, c = k // 3, k % 3
+            for i in range(B):
+                if n_b_list[i] <= a:
+                    continue
+                g0, g1 = ptr_list[i], ptr_list[i + 1]
+                for s in (1.0, -1.0):
+                    pos_i = self.coord[g0:g1].clone()
+                    pos_i[a, c] += s * delta
+                    tmpl = self._ad_list[i]
+                    ad = tmpl.clone() if hasattr(tmpl, "clone") else self._a2g(self._ad_atoms(
+                        Atoms(numbers=self.numbers[g0:g1].tolist(),
+                              positions=pos_i.detach().cpu().numpy())
+                    ))
+                    ad.pos = pos_i.detach().to(device="cpu", dtype=torch.float32)
+                    replicas.append(ad)
+                    meta.append((i, k, s))
+
+        f_plus, f_minus = {}, {}
+
+        def _flush(ads, metas):
+            if not ads:
+                return
+            bb = atomicdata_list_to_batch(ads)
+            _, F, bidx = self._predict_forces(bb)
+            for r, (i, k, s) in enumerate(metas):
+                fr = F[bidx == r]
+                (f_plus if s > 0 else f_minus)[(i, k)] = fr
+
+        chunk_ads, chunk_meta, cur_atoms = [], [], 0
+        for ad, (i, k, s) in zip(replicas, meta):
+            na = n_b_list[i]
+            if cur_atoms + na > self._h_max_atoms and chunk_ads:
+                _flush(chunk_ads, chunk_meta)
+                chunk_ads, chunk_meta, cur_atoms = [], [], 0
+            chunk_ads.append(ad)
+            chunk_meta.append((i, k, s))
+            cur_atoms += na
+        _flush(chunk_ads, chunk_meta)
+
+        for (i, k), fp in f_plus.items():
+            fm = f_minus[(i, k)]
+            dof_i = 3 * n_b_list[i]
+            col = (-(fp - fm) / (2.0 * delta)).reshape(-1)
+            H_eV[i, :dof_i, k] = col
+
+        H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))
+
+        return (
+            E_eV * EV2HARTREE,
+            F_pad * EV2HARTREE,
+            H_eV * EV2HARTREE,
+            P,
+        )

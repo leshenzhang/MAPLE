@@ -1,0 +1,8 @@
+#model=ANI-1xnr
+#irc(method=eulerpc,step_length_bohr=0.1)
+#device=gpu0
+
+XYZ ../../ts/neb/inp1_nebts_ts.xyz
+
+
+

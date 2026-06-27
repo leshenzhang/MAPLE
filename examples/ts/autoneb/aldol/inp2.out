@@ -1,0 +1,447 @@
+
+**********************************************************************
+*                                                                    *
+*                        M   A   P   L   E                           *
+*                                                                    *
+*      MAchine-learning Potential for Landscape Exploration          *
+*                                                                    *
+*                                                                    *
+*      © 2025 University of Pittsburgh. All rights reserved.         *
+*      Licensed under CC BY 4.0 for academic use.                    *
+*                                                                    *
+*      Principal Developer:  Xujian Wang                             *
+*                                                                    *
+**********************************************************************
+
+
+Parsing # commands...
+Global parameter: model = aimnet2nse
+Task set to 'ts'
+Global parameter: device = gpu0
+Parsed configuration:
+----------------------------------------
+Task: ts
+model          : aimnet2nse
+method         : autoneb
+device         : gpu0
+
+                             Coordinates                              
+**********************************************************************
+
+======================================================================
+AutoNEB Parameters
+======================================================================
+n_images:            20
+ang_max:             0.3 Angstrom
+ang_iter:            20
+path_iter:           50
+min_e_drop:          0.001 Eh
+ep_iter:             30
+ep_e_drop:           0.0005 Eh
+autoneb_f_max_th:    0.0095
+autoneb_f_rms_th:    0.005
+max_depth:           5
+max_paths:           10
+do_final_refine:     True
+final_refine_factor: 2.0
+final_refine_max_iter: 200
+======================================================================
+
+
+======================================================================
+Starting AutoNEB Optimization
+======================================================================
+
+Initialized root path with 22 images.
+Energy range: -421.867453 to -421.500186 Eh
+
+----------------------------------------------------------------------
+Optimizing path: root (depth=0, images=22)
+----------------------------------------------------------------------
+  Iter   10  HEI=8  dE=0.165954  max|Fp|=0.216376  RMS(Fp)=0.047817
+  Iter   20  HEI=7  dE=0.062837  max|Fp|=0.110181  RMS(Fp)=0.024819
+
+[Path root] Adaptive insertion: adding 25 image(s)
+  Iter   30  HEI=45  dE=0.036169  max|Fp|=0.078941  RMS(Fp)=0.013933
+
+[Path root] Updated start point to index 2, energy: -421.883347 Eh
+
+[Path root] Updated end point to index 44, energy: -421.817208 Eh
+  Iter   40  HEI=43  dE=0.048953  max|Fp|=0.088105  RMS(Fp)=0.008668
+
+[Path root] Adaptive insertion: adding 7 image(s)
+  Iter   50  HEI=50  dE=0.060925  max|Fp|=0.111201  RMS(Fp)=0.010971
+
+======================================================================
+Path Split: root at index 16
+======================================================================
+Intermediate energy: -421.897963 Eh
+Created paths: root_L (17 images), root_R (36 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_L (depth=1, images=17)
+----------------------------------------------------------------------
+  Iter   10  HEI=2  dE=0.003923  max|Fp|=0.035010  RMS(Fp)=0.005342
+  Iter   20  HEI=1  dE=0.003368  max|Fp|=0.031861  RMS(Fp)=0.004075
+
+[Path root_L] Adaptive insertion: adding 2 image(s)
+  Iter   30  HEI=1  dE=0.005072  max|Fp|=0.044875  RMS(Fp)=0.006784
+
+[Path root_L] Updated end point to index 17, energy: -421.917625 Eh
+[Path root_R] Marked for re-optimization (shared endpoint updated)
+  Iter   40  HEI=1  dE=0.004724  max|Fp|=0.040009  RMS(Fp)=0.006809
+
+[Path root_L] Adaptive insertion: adding 4 image(s)
+  Iter   50  HEI=2  dE=0.004562  max|Fp|=0.026069  RMS(Fp)=0.004495
+
+======================================================================
+Path Split: root_L at index 4
+======================================================================
+Intermediate energy: -421.906374 Eh
+Created paths: root_L_L (5 images), root_L_R (18 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_L_L (depth=2, images=5)
+----------------------------------------------------------------------
+
+[Path root_L_L] Converged after 4 iterations.
+
+[Path root_L_L] Summary:
+  Images: 5, Iterations: 4
+  HEI index: 2
+  Forward barrier: 2.82 kcal/mol
+  Reaction energy: -14.45 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_L_R (depth=2, images=18)
+----------------------------------------------------------------------
+  Iter   10  HEI=2  dE=0.022618  max|Fp|=0.020782  RMS(Fp)=0.003128
+  Iter   20  HEI=3  dE=0.018165  max|Fp|=0.011519  RMS(Fp)=0.002060
+
+[Path root_L_R] Adaptive insertion: adding 8 image(s)
+  Iter   30  HEI=3  dE=0.020299  max|Fp|=0.064592  RMS(Fp)=0.005836
+
+[Path root_L_R] Updated start point to index 2, energy: -421.910313 Eh
+[Path root_L_L] Marked for re-optimization (shared endpoint updated)
+
+[Path root_L_R] Updated end point to index 23, energy: -421.917625 Eh
+
+----------------------------------------------------------------------
+Optimizing path: root_L_L (depth=2, images=5)
+----------------------------------------------------------------------
+
+[Path root_L_L] Converged after 4 iterations.
+
+[Path root_L_L] Summary:
+  Images: 5, Iterations: 4
+  HEI index: 2
+  Forward barrier: 2.82 kcal/mol
+  Reaction energy: -16.92 kcal/mol
+  Iter   40  HEI=1  dE=0.023894  max|Fp|=0.015072  RMS(Fp)=0.002112
+  Iter   50  HEI=1  dE=0.023403  max|Fp|=0.019801  RMS(Fp)=0.001834
+
+======================================================================
+Path Split: root_L_R at index 21
+======================================================================
+Intermediate energy: -421.927113 Eh
+Created paths: root_L_R_L (22 images), root_L_R_R (3 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_L_R_L (depth=3, images=22)
+----------------------------------------------------------------------
+  Iter   10  HEI=1  dE=0.023472  max|Fp|=0.023583  RMS(Fp)=0.002579
+  Iter   20  HEI=1  dE=0.023425  max|Fp|=0.021841  RMS(Fp)=0.002416
+
+[Path root_L_R_L] Adaptive insertion: adding 7 image(s)
+  Iter   30  HEI=1  dE=0.023489  max|Fp|=0.065929  RMS(Fp)=0.005890
+
+[Path root_L_R_L] Updated end point to index 27, energy: -421.929323 Eh
+[Path root_L_R_R] Marked for re-optimization (shared endpoint updated)
+  Iter   40  HEI=1  dE=0.023541  max|Fp|=0.025665  RMS(Fp)=0.003036
+
+[Path root_L_R_L] Converged after 48 iterations.
+
+[Path root_L_R_L] Summary:
+  Images: 28, Iterations: 48
+  HEI index: 1
+  Forward barrier: 14.84 kcal/mol
+  Reaction energy: -11.93 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_L_R_R (depth=3, images=3)
+----------------------------------------------------------------------
+
+[Path root_L_R_R] Converged after 4 iterations.
+
+[Path root_L_R_R] Summary:
+  Images: 3, Iterations: 4
+  HEI index: 1
+  Forward barrier: 2.13 kcal/mol
+  Reaction energy: 7.34 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_R (depth=1, images=36)
+----------------------------------------------------------------------
+  Iter   10  HEI=19  dE=0.061959  max|Fp|=0.178165  RMS(Fp)=0.010916
+  Iter   20  HEI=19  dE=0.039753  max|Fp|=0.079477  RMS(Fp)=0.008459
+
+[Path root_R] Adaptive insertion: adding 6 image(s)
+  Iter   30  HEI=22  dE=0.045195  max|Fp|=0.043121  RMS(Fp)=0.009323
+
+[Path root_R] Updated start point to index 2, energy: -421.924426 Eh
+[Path root_L] Marked for re-optimization (shared endpoint updated)
+
+[Path root_R] Updated end point to index 39, energy: -421.817208 Eh
+
+----------------------------------------------------------------------
+Optimizing path: root_L (depth=1, images=22)
+----------------------------------------------------------------------
+  Iter   60  HEI=1  dE=0.004036  max|Fp|=0.026120  RMS(Fp)=0.003323
+
+[Path root_L] Adaptive insertion: adding 7 image(s)
+
+[Path root_L] Updated start point to index 1, energy: -421.887416 Eh
+
+[Path root_L] Updated end point to index 26, energy: -421.926667 Eh
+[Path root_R] Marked for re-optimization (shared endpoint updated)
+  Iter   70  HEI=2  dE=0.008811  max|Fp|=0.015422  RMS(Fp)=0.002822
+  Iter   80  HEI=7  dE=0.000087  max|Fp|=0.020931  RMS(Fp)=0.002853
+
+[Path root_L] Adaptive insertion: adding 1 image(s)
+  Iter   90  HEI=2  dE=0.008406  max|Fp|=0.020195  RMS(Fp)=0.002065
+
+[Path root_L] Updated end point to index 26, energy: -421.928907 Eh
+[Path root_R] Marked for re-optimization (shared endpoint updated)
+  Iter  100  HEI=2  dE=0.007916  max|Fp|=0.022986  RMS(Fp)=0.002599
+
+[Path root_L] Adaptive insertion: adding 1 image(s)
+
+======================================================================
+Path Split: root_L at index 21
+======================================================================
+Intermediate energy: -421.913344 Eh
+Created paths: root_L_L (22 images), root_L_R (7 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_L_L (depth=2, images=22)
+----------------------------------------------------------------------
+  Iter   10  HEI=2  dE=0.007859  max|Fp|=0.020086  RMS(Fp)=0.003066
+  Iter   20  HEI=8  dE=-0.001825  max|Fp|=0.019523  RMS(Fp)=0.002065
+
+[Path root_L_L] Adaptive insertion: adding 3 image(s)
+  Iter   30  HEI=1  dE=0.007268  max|Fp|=0.026886  RMS(Fp)=0.002661
+
+[Path root_L_L] Updated end point to index 22, energy: -421.923017 Eh
+[Path root_L_R] Marked for re-optimization (shared endpoint updated)
+  Iter   40  HEI=1  dE=-0.017111  max|Fp|=0.035277  RMS(Fp)=0.003139
+
+[Path root_L_L] Adaptive insertion: adding 1 image(s)
+  Iter   50  HEI=1  dE=0.008787  max|Fp|=0.017875  RMS(Fp)=0.001526
+
+======================================================================
+Path Split: root_L_L at index 6
+======================================================================
+Intermediate energy: -421.921492 Eh
+Created paths: root_L_L_L (7 images), root_L_L_R (18 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_L_L_L (depth=3, images=7)
+----------------------------------------------------------------------
+
+[Path root_L_L_L] Converged after 2 iterations.
+
+[Path root_L_L_L] Summary:
+  Images: 7, Iterations: 2
+  HEI index: 1
+  Forward barrier: 5.51 kcal/mol
+  Reaction energy: -21.38 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_L_L_R (depth=3, images=18)
+----------------------------------------------------------------------
+
+[Path root_L_L_R] Converged after 1 iterations.
+
+[Path root_L_L_R] Summary:
+  Images: 18, Iterations: 1
+  HEI index: 2
+  Forward barrier: 20.99 kcal/mol
+  Reaction energy: -0.96 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_L_R (depth=2, images=7)
+----------------------------------------------------------------------
+
+[Path root_L_R] Converged after 5 iterations.
+
+[Path root_L_R] Summary:
+  Images: 7, Iterations: 5
+  HEI index: 2
+  Forward barrier: 7.41 kcal/mol
+  Reaction energy: -3.70 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_R (depth=1, images=40)
+----------------------------------------------------------------------
+  Iter   40  HEI=22  dE=0.044822  max|Fp|=0.042401  RMS(Fp)=0.008497
+
+[Path root_R] Adaptive insertion: adding 6 image(s)
+  Iter   50  HEI=44  dE=0.059639  max|Fp|=0.027627  RMS(Fp)=0.006975
+  Iter   60  HEI=44  dE=0.046997  max|Fp|=0.022746  RMS(Fp)=0.004077
+
+[Path root_R] Updated end point to index 43, energy: -421.891764 Eh
+  Iter   70  HEI=28  dE=0.024425  max|Fp|=0.016247  RMS(Fp)=0.003137
+  Iter   80  HEI=42  dE=0.021381  max|Fp|=0.031584  RMS(Fp)=0.002321
+
+[Path root_R] Adaptive insertion: adding 11 image(s)
+  Iter   90  HEI=53  dE=0.023510  max|Fp|=0.044021  RMS(Fp)=0.003915
+
+[Path root_R] Updated start point to index 2, energy: -421.931409 Eh
+[Path root_L] Marked for re-optimization (shared endpoint updated)
+
+[Path root_R] Updated end point to index 52, energy: -421.891764 Eh
+
+----------------------------------------------------------------------
+Optimizing path: root_L (depth=1, images=28)
+----------------------------------------------------------------------
+  Iter  110  HEI=2  dE=0.007868  max|Fp|=0.022030  RMS(Fp)=0.002599
+  Iter  120  HEI=8  dE=-0.001790  max|Fp|=0.019354  RMS(Fp)=0.001856
+
+[Path root_L] Adaptive insertion: adding 2 image(s)
+
+[Path root_L] Updated start point to index 1, energy: -421.890056 Eh
+  Iter  130  HEI=1  dE=0.009208  max|Fp|=0.032412  RMS(Fp)=0.002657
+  Iter  140  HEI=1  dE=0.009652  max|Fp|=0.011171  RMS(Fp)=0.001829
+
+[Path root_L] Adaptive insertion: adding 2 image(s)
+  Iter  150  HEI=1  dE=0.010399  max|Fp|=0.039653  RMS(Fp)=0.002630
+
+======================================================================
+Path Split: root_L at index 7
+======================================================================
+Intermediate energy: -421.921623 Eh
+Created paths: root_L_L (8 images), root_L_R (24 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_L_L (depth=2, images=8)
+----------------------------------------------------------------------
+
+[Path root_L_L] Converged after 2 iterations.
+
+[Path root_L_L] Summary:
+  Images: 8, Iterations: 2
+  HEI index: 1
+  Forward barrier: 6.48 kcal/mol
+  Reaction energy: -19.81 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_L_R (depth=2, images=24)
+----------------------------------------------------------------------
+
+[Path root_L_R] Converged after 6 iterations.
+
+[Path root_L_R] Summary:
+  Images: 24, Iterations: 6
+  HEI index: 2
+  Forward barrier: 20.95 kcal/mol
+  Reaction energy: -6.14 kcal/mol
+  Iter  100  HEI=51  dE=0.027476  max|Fp|=0.020060  RMS(Fp)=0.001731
+
+[Path root_R] Adaptive insertion: adding 1 image(s)
+  Iter  110  HEI=52  dE=0.028989  max|Fp|=0.034142  RMS(Fp)=0.003216
+  Iter  120  HEI=52  dE=0.028816  max|Fp|=0.028585  RMS(Fp)=0.002088
+
+[Path root_R] Adaptive insertion: adding 2 image(s)
+
+[Path root_R] Updated end point to index 53, energy: -421.906445 Eh
+  Iter  130  HEI=34  dE=0.019276  max|Fp|=0.023682  RMS(Fp)=0.003321
+  Iter  140  HEI=52  dE=0.017792  max|Fp|=0.018596  RMS(Fp)=0.001981
+
+[Path root_R] Adaptive insertion: adding 1 image(s)
+  Iter  150  HEI=53  dE=0.018575  max|Fp|=0.024262  RMS(Fp)=0.002813
+
+======================================================================
+Path Split: root_R at index 39
+======================================================================
+Intermediate energy: -421.931144 Eh
+Created paths: root_R_L (40 images), root_R_R (16 images)
+
+----------------------------------------------------------------------
+Optimizing path: root_R_L (depth=2, images=40)
+----------------------------------------------------------------------
+  Iter   10  HEI=36  dE=0.016844  max|Fp|=0.017156  RMS(Fp)=0.001636
+  Iter   20  HEI=35  dE=0.015694  max|Fp|=0.034116  RMS(Fp)=0.002686
+
+[Path root_R_L] Adaptive insertion: adding 10 image(s)
+
+[Path root_R_L] Converged after 28 iterations.
+
+[Path root_R_L] Summary:
+  Images: 50, Iterations: 28
+  HEI index: 44
+  Forward barrier: 10.04 kcal/mol
+  Reaction energy: 0.17 kcal/mol
+
+----------------------------------------------------------------------
+Optimizing path: root_R_R (depth=2, images=16)
+----------------------------------------------------------------------
+
+[Path root_R_R] Converged after 2 iterations.
+
+[Path root_R_R] Summary:
+  Images: 16, Iterations: 2
+  HEI index: 14
+  Forward barrier: 11.48 kcal/mol
+  Reaction energy: 15.50 kcal/mol
+
+All paths converged!
+
+======================================================================
+AutoNEB Tree Optimization Complete
+======================================================================
+Total global iterations: 564
+Total paths: 11
+Intermediates found: 7
+
+======================================================================
+Starting Final Global MEP Refinement
+======================================================================
+Final refinement: 95 images
+Convergence: f_max < 0.019000, f_rms < 0.010000
+Max iterations: 200
+  Refine Iter    1  HEI=1  dE=0.010324  max|Fp|=0.012027  RMS(Fp)=0.001624
+
+Final refinement converged after 1 iterations.
+
+Wrote global MEP to: /home/user/software/MAPLE/examples/ts/autoneb/aldol/inp2_autoneb_global_mep.xyz
+Wrote intermediates to: /home/user/software/MAPLE/examples/ts/autoneb/aldol/inp2_autoneb_intermediates.xyz
+Wrote transition states to: /home/user/software/MAPLE/examples/ts/autoneb/aldol/inp2_autoneb_ts_list.xyz
+Wrote path tree to: /home/user/software/MAPLE/examples/ts/autoneb/aldol/inp2_autoneb_tree.json
+
+Global MEP Summary:
+  Total images: 95
+  Energy range: -421.939588 to -421.879732 Eh
+  Overall barrier: 6.48 kcal/mol
+
+
+
+Program started: 2026-02-03 14:37:33
+
+======================================================================
+                      TIMING SUMMARY
+======================================================================
+Input Reading (×6)..................................   0.015 s  (   0.0 %)
+  Settings Parsing (×6)...............................   0.012 s  (  80.9 %)
+  Coordinate Section Parsing (×6).....................   0.001 s  (   9.5 %)
+  Post-Processing Expansion (×6)......................   0.000 s  (   0.1 %)
+MLP Initialization (×6).............................   0.468 s  (   0.1 %)
+Job Dispatching (×6)................................ 1066.681 s  ( 204.2 %)
+  Frequency Calculation (×4)..........................   1.438 s  (   0.1 %)
+  Transition State Optimization (×2).................. 1065.241 s  (  99.9 %)
+======================================================================
+Total wall time: 522.451 s
+Total CPU time: 522.690 s
+======================================================================
+
+Program ended: 2026-02-03 14:46:16
+TOTAL RUN TIME: 0 days 0 hours 8 minutes 42 seconds 451 msec

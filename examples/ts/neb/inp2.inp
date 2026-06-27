@@ -1,0 +1,10 @@
+#model=aimnet2
+#ts(method=neb,refine=nebts)
+#device=gpu0
+
+XYZ react.xyz
+
+XYZ prod.xyz
+
+
+

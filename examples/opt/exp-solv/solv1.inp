@@ -1,0 +1,8 @@
+#model=aimnet2nse
+#opt(lbfgs,max_iter=2048)
+#device=gpu0
+#solv(explicit=water,randomize=false)
+
+XYZ solv1opt_opt.xyz
+
+
