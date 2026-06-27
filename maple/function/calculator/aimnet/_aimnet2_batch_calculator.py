@@ -13,7 +13,29 @@ def pad_dim0(a: torch.Tensor, value=0) -> torch.Tensor:
     return torch.cat([a, pad_row], dim=0)
 
 
-def nblist_dense_padded_multi(coord: torch.Tensor, mol_idx: torch.Tensor, cutoff: float) -> torch.Tensor:
+# -----------------------------------------------------------------------------
+# Neighbour list
+# -----------------------------------------------------------------------------
+# OPT (D-16): block-diagonal neighbour list.
+#
+# The molecules are contiguous in `coord` (segmented by `mol_idx`), so the only
+# pairs that can ever survive `same-molecule` masking live inside per-molecule
+# diagonal blocks. The old dense build materialised a full (N, N, 3) diff and
+# (N, N) dist2 + an N-wide argsort + a python `for i in range(N)` fill -- O(N^2)
+# memory that OOMs at large B (~5 GB / fwd at B=256, n=50).
+#
+# The new build computes distances only WITHIN per-molecule blocks via a padded
+# (B, nmax_b, nmax_b) tensor, so peak memory is bound by B * max(n_b)^2 instead
+# of N^2 = (B*n)^2 (a factor-B reduction). The produced `nbmat` is BYTE-IDENTICAL
+# to the dense build (same dtype int64, sentinel pad index = N, neighbours sorted
+# by (dist2, ascending global index) exactly as the stable N-wide argsort gives,
+# and M = global max degree). The dense version is kept as
+# `nblist_dense_padded_multi_ref` for parity validation.
+# -----------------------------------------------------------------------------
+def nblist_dense_padded_multi_ref(coord: torch.Tensor, mol_idx: torch.Tensor, cutoff: float) -> torch.Tensor:
+    """Reference (pre-D16) DENSE neighbour list: (N,N,3) diff + N-wide argsort +
+    python fill. O(N^2) memory; OOMs at large B. Kept ONLY for parity validation
+    of the block build (nblist_block_padded_multi)."""
     device = coord.device
     dtype  = coord.dtype
     N = coord.shape[0]
@@ -40,6 +62,82 @@ def nblist_dense_padded_multi(coord: torch.Tensor, mol_idx: torch.Tensor, cutoff
             k = min(ki, M)
             nbmat[i, :k] = order[i, :k]
     return nbmat
+
+
+def _block_meta_from_mol_idx(mol_idx: torch.Tensor, N: int):
+    """Derive per-molecule block metadata (molecules assumed contiguous).
+    Returns (counts, ptr, nmax_b, valid, local2global). Uses a couple of host
+    syncs (B, nmax_b) -- only ever called in prepare(), never in the hot loop."""
+    device = mol_idx.device
+    if N == 0:
+        B = 0
+        counts       = torch.zeros((0,), dtype=torch.int64, device=device)
+        ptr          = torch.zeros((1,), dtype=torch.int64, device=device)
+        nmax_b       = 1
+        valid        = torch.zeros((0, 1), dtype=torch.bool, device=device)
+        local2global = torch.zeros((0, 1), dtype=torch.int64, device=device)
+        return counts, ptr, nmax_b, valid, local2global
+
+    B = int(mol_idx[-1].item()) + 1
+    counts = torch.bincount(mol_idx, minlength=B).to(torch.int64)        # (B,)
+    ptr = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    ptr[1:] = torch.cumsum(counts, dim=0)
+    nmax_b = int(counts.max().item())
+    ar = torch.arange(nmax_b, device=device)
+    valid = ar[None, :] < counts[:, None]                               # (B, nmax_b)
+    local2global = ptr[:-1][:, None] + ar[None, :]                      # (B, nmax_b)
+    local2global = torch.where(valid, local2global, torch.full_like(local2global, N))
+    return counts, ptr, nmax_b, valid, local2global
+
+
+def _nblist_block_core(coord: torch.Tensor, cutoff: float,
+                       ptr: torch.Tensor, nmax_b: int,
+                       valid: torch.Tensor, local2global: torch.Tensor,
+                       N: int) -> torch.Tensor:
+    """Block-diagonal neighbour list from precomputed metadata. Memory bound by
+    B * nmax_b^2. Output byte-identical to nblist_dense_padded_multi_ref."""
+    device = coord.device
+    dtype  = coord.dtype
+    if N == 0:
+        return torch.full((1, 1), 0, dtype=torch.int64, device=device)
+
+    B = ptr.shape[0] - 1
+
+    # gather per-molecule block coords via a zero pad row (invalid local -> N -> 0)
+    coord_pad = torch.cat([coord, coord.new_zeros((1, 3))], dim=0)      # (N+1, 3)
+    cb = coord_pad[local2global]                                        # (B, nmax_b, 3)
+
+    diff  = cb[:, :, None, :] - cb[:, None, :, :]                       # (B, nmax_b, nmax_b, 3)
+    dist2 = (diff * diff).sum(dim=-1)                                   # (B, nmax_b, nmax_b)
+
+    pair_valid = valid[:, :, None] & valid[:, None, :]
+    eye = torch.eye(nmax_b, dtype=torch.bool, device=device)
+    mask = (dist2 <= cutoff * cutoff) & pair_valid & (~eye[None, :, :])
+
+    deg = mask.sum(dim=-1)                                              # (B, nmax_b)
+    M   = int(max(int(deg.max().item()), 1))
+
+    big = torch.finfo(dtype).max / 4.0
+    sort_key = torch.where(mask, dist2, dist2.new_full(dist2.shape, big))
+    order = torch.argsort(sort_key, dim=-1, stable=True)               # (B, nmax_b, nmax_b) local idx
+    order_M = order[:, :, :M]                                          # (B, nmax_b, M)
+
+    nb_global = ptr[:-1][:, None, None] + order_M                      # local -> global
+    keep = torch.arange(M, device=device)[None, None, :] < deg[:, :, None]
+    nb_global = torch.where(keep, nb_global, torch.full_like(nb_global, N))
+
+    nbmat = torch.full((N + 1, M), N, dtype=torch.int64, device=device)
+    rows = local2global.reshape(-1)                                    # (B*nmax_b,); invalid -> N
+    nbmat[rows] = nb_global.reshape(B * nmax_b, M)                     # invalid rows write all-N to row N
+    return nbmat
+
+
+def nblist_block_padded_multi(coord: torch.Tensor, mol_idx: torch.Tensor, cutoff: float) -> torch.Tensor:
+    """Self-contained block-diagonal neighbour list (derives metadata from
+    mol_idx). Byte-identical to nblist_dense_padded_multi_ref."""
+    N = coord.shape[0]
+    _, ptr, nmax_b, valid, local2global = _block_meta_from_mol_idx(mol_idx, N)
+    return _nblist_block_core(coord, cutoff, ptr, nmax_b, valid, local2global, N)
 
 
 def _ptr_from_atoms(atoms_list: List[Atoms], device) -> torch.Tensor:
@@ -77,6 +175,14 @@ class AIMNet2BatchCalc:
         self.charge       = None
 
         self._coord_backup = None
+
+        # precomputed (set in prepare): block-nblist metadata + flat scatter maps
+        self._blk_ptr        = None   # (B+1,)
+        self._blk_nmax       = 1
+        self._blk_valid      = None   # (B, nmax_b) bool
+        self._blk_local2g    = None   # (B, nmax_b) int64
+        self._cart_idx_flat  = None   # (3*N,) flat map: real atom DOF -> (B, nmax_dof) flat
+        self._atom_localidx  = None   # (N,) local atom index of each global atom
 
     # -------------------------------------------------------------------------
     # prepare() modified to accept fixed_nmax
@@ -133,8 +239,41 @@ class AIMNet2BatchCalc:
         self.sentinel_mol = (int(self.mol_idx.max().item()) + 1) if self.N_atoms > 0 else 0
         self.charge       = torch.zeros(self._atoms_B + 1, dtype=dtype, device=device)
 
+        # -------------------- precompute static index maps --------------------
+        # (topology fixed across step/get_* calls; build ONCE here to remove the
+        #  per-b python .item() loops & host-device syncs from the hot path)
+        self._build_static_maps()
+
         self._coord_backup = None
         self._prepared     = True
+
+    def _build_static_maps(self):
+        """Build all coordinate/force/nblist index maps that depend only on the
+        (fixed) topology. Called once per prepare()."""
+        device = self.device
+        N      = self.N_atoms
+        B      = self._atoms_B
+
+        # block-nblist metadata
+        (_, self._blk_ptr, self._blk_nmax,
+         self._blk_valid, self._blk_local2g) = _block_meta_from_mol_idx(self.mol_idx, N)
+
+        if N == 0:
+            self._cart_idx_flat = torch.zeros((0,), dtype=torch.int64, device=device)
+            self._atom_localidx = torch.zeros((0,), dtype=torch.int64, device=device)
+            return
+
+        # local atom index of each global atom: g -> a (= g - ptr[mol_idx[g]])
+        a_local = torch.arange(N, device=device) - self._ptr[:-1].to(torch.int64)[self.mol_idx]
+        self._atom_localidx = a_local                                   # (N,)
+
+        # flat map: the 3 components of global atom g <-> (mol_idx[g], 3*a_local) in
+        # a (B, nmax_dof) padded buffer flattened. Same map drives step_cart_ gather
+        # AND the get_ef_/get_efh_ force scatter (reverse direction).
+        nmax_dof = self.nmax_dof
+        base = self.mol_idx.to(torch.int64) * nmax_dof + 3 * a_local    # (N,) start col in flat buf
+        cart_idx = base[:, None] + torch.arange(3, device=device)[None, :]   # (N, 3)
+        self._cart_idx_flat = cart_idx.reshape(-1)                      # (3*N,)
 
     # -------------------------------------------------------------------------
     # coordinate update
@@ -155,13 +294,12 @@ class AIMNet2BatchCalc:
             f"step_cart_ expects (B,{self.nmax_dof}), got {tuple(s_cart.shape)}"
         # ----------------------------------------------------------------------
 
+        if self.N_atoms == 0:
+            return
         s_cart = s_cart.to(self.device, dtype=self.dtype)
-        s = self._ptr[:-1]
-        t = self._ptr[1:]
-        for i in range(B):
-            ni = int((t[i] - s[i]).item())
-            if ni > 0:
-                self.coord[s[i]:t[i], :].add_(s_cart[i, :3*ni].reshape(ni, 3))
+        # vectorized: gather each real atom's 3 DOFs from the padded buffer -> (N,3)
+        delta = s_cart.reshape(-1)[self._cart_idx_flat].reshape(self.N_atoms, 3)
+        self.coord.add_(delta)
 
     @torch.no_grad()
     def set_coords_(self, coord: torch.Tensor):
@@ -181,16 +319,46 @@ class AIMNet2BatchCalc:
             self._coord_backup = None
 
     # -------------------------------------------------------------------------
-    # forward (unchanged)
+    # internal helpers
+    # -------------------------------------------------------------------------
+    def _nblist(self, coord: torch.Tensor) -> torch.Tensor:
+        """Fast block-diagonal neighbour list using precomputed metadata."""
+        return _nblist_block_core(coord, self.cutoff, self._blk_ptr, self._blk_nmax,
+                                  self._blk_valid, self._blk_local2g, self.N_atoms)
+
+    def _reduce_energy(self, out) -> torch.Tensor:
+        """Reduce model output to per-structure energy (B,)."""
+        B = self._atoms_B
+        N = self.N_atoms
+        e_vec = out["energy"].to(self.dtype).reshape(-1)
+        if e_vec.numel() == N + 1 or e_vec.numel() == B + 1:
+            e_vec = e_vec[:-1]
+        if e_vec.numel() == B:
+            return e_vec
+        elif e_vec.numel() == N:
+            return torch.bincount(self.mol_idx, weights=e_vec, minlength=B).to(self.dtype)
+        else:
+            raise RuntimeError(f"Unexpected energy shape {tuple(e_vec.shape)}")
+
+    def _scatter_forces(self, F_all_eV: torch.Tensor) -> torch.Tensor:
+        """Scatter per-atom (N,3) forces into the padded (B, nmax_dof) buffer
+        using the precomputed flat index map. Vectorized (no per-b loop)."""
+        B    = self._atoms_B
+        nmax = self.nmax_dof
+        F_flat = torch.zeros(B * nmax, dtype=self.dtype, device=self.device)
+        if self.N_atoms > 0:
+            F_flat[self._cart_idx_flat] = F_all_eV.reshape(-1)
+        return F_flat.view(B, nmax)
+
+    # -------------------------------------------------------------------------
+    # forward
     # -------------------------------------------------------------------------
     def _forward_energy_forces_(self, c: torch.Tensor, need_graph: bool):
         assert self._prepared, "call prepare() first"
         device, dtype = self.device, self.dtype
-        B = self._atoms_B
-        N = self.N_atoms
 
         coord_leaf = c.detach().to(device=device, dtype=dtype).requires_grad_(True)
-        nbmat = nblist_dense_padded_multi(coord_leaf, self.mol_idx, self.cutoff)
+        nbmat = self._nblist(coord_leaf)
 
         data = {
             "coord":    pad_dim0(coord_leaf, 0.0),
@@ -204,16 +372,7 @@ class AIMNet2BatchCalc:
         with torch.jit.optimized_execution(False):
             out = self.model(data)
 
-        e_vec = out["energy"].to(dtype).reshape(-1)
-        if e_vec.numel() == N + 1 or e_vec.numel() == B + 1:
-            e_vec = e_vec[:-1]
-
-        if e_vec.numel() == B:
-            E_eV = e_vec
-        elif e_vec.numel() == N:
-            E_eV = torch.bincount(self.mol_idx, weights=e_vec, minlength=B).to(dtype)
-        else:
-            raise RuntimeError(f"Unexpected energy shape {tuple(e_vec.shape)}")
+        E_eV = self._reduce_energy(out)
 
         grad = torch.autograd.grad(E_eV.sum(), coord_leaf,
                                    create_graph=need_graph, retain_graph=need_graph)[0]
@@ -221,10 +380,39 @@ class AIMNet2BatchCalc:
 
         return E_eV, F_all_eV, coord_leaf
 
+    def _forward_energy_(self, c: torch.Tensor):
+        """Energy-ONLY forward (no autograd graph / no force backward)."""
+        assert self._prepared, "call prepare() first"
+        device, dtype = self.device, self.dtype
+        coord = c.detach().to(device=device, dtype=dtype)
+        with torch.no_grad():
+            nbmat = self._nblist(coord)
+            data = {
+                "coord":    pad_dim0(coord, 0.0),
+                "numbers":  pad_dim0(self.numbers, 0).to(torch.int64),
+                "charge":   self.charge,
+                "mol_idx":  pad_dim0(self.mol_idx, self.sentinel_mol).to(torch.int64),
+                "nbmat":    nbmat,
+                "nbmat_lr": nbmat,
+            }
+            with torch.jit.optimized_execution(False):
+                out = self.model(data)
+            E_eV = self._reduce_energy(out)
+        return E_eV
+
     # -------------------------------------------------------------------------
-    # get_ef_gpu() and get_efh_gpu(): no structural change needed.
-    # They already use self.nmax_dof for padding, which now matches PRFO.
+    # public results
     # -------------------------------------------------------------------------
+    def get_e_gpu(self):
+        """Energy-only batched single point (skips the force backward). Same
+        per-structure energy as get_ef_gpu(); for SP / inner trial loops."""
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return torch.zeros((0,), dtype=dtype, device=device)
+        E_eV = self._forward_energy_(self.coord)
+        return E_eV / EH2EV
+
     def get_ef_gpu(self):
         B = self._atoms_B
         device, dtype = self.device, self.dtype
@@ -234,17 +422,73 @@ class AIMNet2BatchCalc:
 
         E_eV, F_all_eV, _ = self._forward_energy_forces_(self.coord, need_graph=False)
 
-        nmax = self.nmax_dof
-        F_eV = torch.zeros((B, nmax), dtype=dtype, device=device)
-        s = self._ptr[:-1]; t = self._ptr[1:]
-        for i in range(B):
-            ni = int((t[i] - s[i]).item())
-            if ni > 0:
-                F_eV[i, :3*ni] = F_all_eV[s[i]:t[i], :].reshape(-1)
-
+        F_eV = self._scatter_forces(F_all_eV)
         return E_eV / EH2EV, F_eV / EH2EV
 
     def get_efh_gpu(self):
+        """Energy + forces + per-structure Hessian (batched, padded to nmax).
+
+        OPTIMIZED (D-15): seeded block-diagonal analytic Hessian. Column k (local DOF)
+        of ALL B per-structure Hessians is obtained from ONE backward by seeding a
+        grad_outputs one-hot at local DOF k of every structure simultaneously; the
+        inter-molecular blocks are zero (block-diagonal nblist + per-mol energy pooling),
+        so each structure recovers its own column. Backward passes = 3*Nmax_atoms (NOT
+        3*N_total) -> ~B-fold fewer, and NO global (3*N_total)^2 matrix is ever formed.
+        Reference (slow, global) kept as _get_efh_gpu_global_ref for parity validation.
+
+        OPT (D-16): the per-k python scatter loop (.nonzero().tolist()) and the per-b
+        force scatter are replaced by sync-free vectorized scatters; the seed one-hot is
+        built from the precomputed local-atom-index map. Results stay byte-identical to
+        _get_efh_gpu_global_ref.
+        """
+        B = self._atoms_B
+        device, dtype = self.device, self.dtype
+        if B == 0:
+            return (torch.zeros((0,), dtype=dtype, device=device),
+                    torch.zeros((0, 0), dtype=dtype, device=device),
+                    torch.zeros((0, 0, 0), dtype=dtype, device=device),
+                    torch.zeros((0,), dtype=torch.int64, device=device))
+
+        E_eV, F_all_eV, coord_leaf = self._forward_energy_forces_(self.coord, need_graph=True)
+
+        N      = self.N_atoms
+        nmax   = self.nmax_dof
+        nmax_a = self.Nmax_atoms
+        s = self._ptr[:-1]; t = self._ptr[1:]
+        n_b = (t - s)                                   # (B,) atom count per structure
+        P   = (nmax_a - n_b).to(torch.int64)
+
+        # forces scatter (padded) -- vectorized
+        F_eV = self._scatter_forces(F_all_eV)
+
+        H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
+        local_atom = self._atom_localidx                # (N,) local atom index per global atom
+
+        # seeded block-diagonal Hessian: 3*Nmax_atoms backward passes for the WHOLE batch
+        for k in range(3 * nmax_a):
+            a_local, comp = k // 3, k % 3
+            # one-hot seed: component `comp` set on every global atom whose local
+            # index == a_local (== exactly the structures owning local atom a_local)
+            go = torch.zeros((N, 3), dtype=dtype, device=device)
+            go[:, comp] = (local_atom == a_local).to(dtype)
+            col = torch.autograd.grad(
+                F_all_eV, coord_leaf, grad_outputs=go,
+                retain_graph=True, create_graph=False)[0]   # (N,3); Hessian col = -col (H=-dF/dx)
+            # scatter -col (N,3) into padded column k for ALL structures at once.
+            # invalid structures (k >= dof) write 0 into a padding column -> harmless.
+            H_eV[:, :, k] = -self._scatter_forces(col)
+
+        H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))      # symmetrize per structure
+
+        return (E_eV / EH2EV,
+                F_eV / EH2EV,
+                H_eV / EH2EV,
+                P)
+
+    def _get_efh_gpu_global_ref(self):
+        """Reference (pre-D15) global-matrix Hessian: 3*N_total serial backward +
+        dense (3*N_total)^2 stack. Kept ONLY for parity validation of get_efh_gpu;
+        OOMs at large B (do not use in production)."""
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:

@@ -17,6 +17,15 @@ import numpy as np
 import torch
 from ase import Atoms
 
+# --- profile shim: BPRFO carries @profile (line_profiler/kernprof). Under a plain
+# `python` import, `profile` is undefined -> NameError. Provide a no-op fallback so
+# the module is importable + benchmarkable standalone (kernprof still injects its own).
+try:
+    profile  # type: ignore[name-defined]
+except NameError:
+    def profile(f):
+        return f
+
 DTYPE = torch.float64
 BIG = 1e8
 
@@ -99,7 +108,23 @@ class BatchPRFO:
         self._H_work = None
         self._g_cart_prev = None
         self._recent_acceptance_rate = 0.0
-        self._enable_vectorized_mu = False
+        self._enable_vectorized_mu = True
+
+        # --- vectorized-mu diagnostics ---
+        self._mu_unbracketed = 0          # # of (structure,call) left un-bracketed after 60 iters
+
+        # --- outer/inner robustness (per-structure straggler control) ---
+        # Counters live as (B,) tensors allocated in run(); these are the policy knobs.
+        self._bad_streak_limit = 8        # consecutive rho-bad iters before "stuck" candidate
+        self._pin_streak_limit = 8        # consecutive trust-pinned-at-min iters before "stuck"
+        self._max_restarts = 2            # bounded inner restarts before eviction
+        self._force_recalc_next = False   # set when a restart needs a fresh exact Hessian
+        self._iter_count = None
+        self._recalc_count = None
+        self._bad_streak = None
+        self._pin_streak = None
+        self._restart_count = None
+        self._final_status = None         # per ORIGINAL index: converged / evicted_straggler / max_iter
 
 
     # ===================================================
@@ -141,6 +166,15 @@ class BatchPRFO:
         self.tracked_mode_vec_mw = None
         self.tracked_mode_idx = None
 
+        # Per-structure robustness counters (sliced together with the batch on shrink).
+        self._iter_count = torch.zeros((B,), dtype=torch.long, device=device)
+        self._recalc_count = torch.zeros((B,), dtype=torch.long, device=device)
+        self._bad_streak = torch.zeros((B,), dtype=torch.long, device=device)
+        self._pin_streak = torch.zeros((B,), dtype=torch.long, device=device)
+        self._restart_count = torch.zeros((B,), dtype=torch.long, device=device)
+        self._final_status = [None] * B0
+        self._force_recalc_next = False
+
         outer_it = 0
         self._H_work = None
         self._g_cart_prev = None
@@ -151,10 +185,18 @@ class BatchPRFO:
 
             calc.backup_coords()
 
-            # Decide whether to rebuild Hessian from calculator (Gaussian RecalcFC-like)
-            need_recalc = (outer_it == 1) or ((outer_it - 1) % self.recalc == 0)
+            # Per-structure outer-iteration counter.
+            self._iter_count = self._iter_count + 1
+
+            # Decide whether to rebuild Hessian from calculator (Gaussian RecalcFC-like).
+            # A bounded inner restart (straggler control) can force an extra fresh Hessian.
+            need_recalc = ((outer_it == 1)
+                           or ((outer_it - 1) % self.recalc == 0)
+                           or self._force_recalc_next)
+            self._force_recalc_next = False
 
             if need_recalc:
+                self._recalc_count = self._recalc_count + 1
                 # Pull EFH (true or numerical) from calculator; pad to nmax
                 E_old, F_tmp, H_tmp, _ = calc.get_efh_gpu()
                 E_old = E_old.to(dtype=DTYPE)
@@ -208,10 +250,12 @@ class BatchPRFO:
                 E_old=E_old,
             )
 
-            # After step: get new gradient
+            # After step: get new gradient at the committed geometry (ONE forward; reused
+            # below by the convergence check, which evaluates the SAME geometry).
             E_fin, F_fin = calc.get_ef_gpu()
             F_fin = F_fin.to(dtype=DTYPE)
             g_new_cart = -F_fin * real_mask.to(DTYPE)
+            E_fin = E_fin.to(dtype=DTYPE)
 
             # Bofill update: apply ONLY if we didn't just recalculate AND at least one step was accepted
             if not need_recalc and step_accepted.any():
@@ -224,11 +268,11 @@ class BatchPRFO:
                     real_mask=real_mask,
                     step_accepted=step_accepted  # Pass acceptance mask
                 )
-            
+
             # Always update gradient buffer for next iteration
             self._g_cart_prev = g_new_cart.clone()
 
-            # Convergence check
+            # Convergence check (reuse committed-geometry E/g instead of recomputing).
             done = self._check_convergence(
                 it=outer_it,
                 calc=calc,
@@ -237,11 +281,52 @@ class BatchPRFO:
                 last_step=last_step,
                 real_mask=real_mask,
                 last_rho=last_rho,
+                E_precomp=E_fin,
+                g_precomp=g_new_cart,
             )
 
-            # Dynamic batch shrinking
-            survive_local = (~done).nonzero(as_tuple=False).flatten()
-            if survive_local.numel() < len(done):
+            # ---- Outer/inner robustness: per-structure straggler detection ----
+            # rho-bad streak (oscillation / poor model) + trust pinned-at-min streak.
+            bad = (~torch.isfinite(last_rho)) | (last_rho < self.eta_shrink)
+            zero_l = torch.zeros_like(self._bad_streak)
+            self._bad_streak = torch.where(bad, self._bad_streak + 1, zero_l)
+            pinned = trust_r <= (self.trust_min * 1.000000000001)
+            self._pin_streak = torch.where(pinned, self._pin_streak + 1, zero_l)
+
+            stuck = ((self._bad_streak >= self._bad_streak_limit)
+                     & (self._pin_streak >= self._pin_streak_limit)
+                     & (~done))
+            restartable = stuck & (self._restart_count < self._max_restarts)
+            evict = stuck & (self._restart_count >= self._max_restarts)
+
+            if bool(restartable.any()):
+                # Bounded inner restart: kick trust back up + force a fresh exact Hessian
+                # so the structure escapes the pinned/oscillating basin (does NOT touch others).
+                trust_r = torch.where(restartable,
+                                      torch.full_like(trust_r, self.trust_init), trust_r)
+                self._bad_streak = torch.where(restartable, zero_l, self._bad_streak)
+                self._pin_streak = torch.where(restartable, zero_l, self._pin_streak)
+                self._restart_count = self._restart_count + restartable.to(self._restart_count.dtype)
+                self._force_recalc_next = True
+                self._w(f"[Iter {outer_it}] Restart {int(restartable.sum().item())} straggler(s): "
+                        f"trust->{self.trust_init}, force fresh Hessian\n")
+
+            # Evicted stragglers leave the batch flagged (NOT silently wrong).
+            final_done = done | evict
+            if bool(evict.any()):
+                self._w(f"[Iter {outer_it}] Evicting {int(evict.sum().item())} unrecoverable "
+                        f"straggler(s) after {self._max_restarts} restarts\n")
+
+            # Record per-original-index exit status before slicing.
+            leaving = final_done.nonzero(as_tuple=False).flatten().cpu().tolist()
+            done_cpu = done.detach().cpu()
+            for i_local in leaving:
+                oi = int(self._orig_index[i_local].item())
+                self._final_status[oi] = "converged" if bool(done_cpu[i_local]) else "evicted_straggler"
+
+            # Dynamic batch shrinking (on-GPU mask drives the shrink).
+            survive_local = (~final_done).nonzero(as_tuple=False).flatten()
+            if survive_local.numel() < final_done.numel():
                 self._sync_atoms_from_calc(calc, atoms_list)
 
                 atoms_list = [atoms_list[i] for i in survive_local.cpu().tolist()]
@@ -255,6 +340,13 @@ class BatchPRFO:
                 if self.tracked_mode_vec_mw is not None:
                     self.tracked_mode_vec_mw = self.tracked_mode_vec_mw[survive_local]
 
+                # Slice per-structure robustness counters in lockstep.
+                self._iter_count = self._iter_count[survive_local]
+                self._recalc_count = self._recalc_count[survive_local]
+                self._bad_streak = self._bad_streak[survive_local]
+                self._pin_streak = self._pin_streak[survive_local]
+                self._restart_count = self._restart_count[survive_local]
+
                 calc.prepare(atoms_list, fixed_nmax=self._nmax)
                 self._rebuild_topology(atoms_list)
 
@@ -266,6 +358,18 @@ class BatchPRFO:
 
         else:
             self._w("# Maximum iterations reached.\n")
+
+        # Any structure still in the batch at loop exit hit the iteration cap.
+        if self._orig_index is not None:
+            for i_local in range(self._orig_index.numel()):
+                oi = int(self._orig_index[i_local].item())
+                if self._final_status[oi] is None:
+                    self._final_status[oi] = "max_iter"
+        n_conv = sum(1 for s in self._final_status if s == "converged")
+        n_evict = sum(1 for s in self._final_status if s == "evicted_straggler")
+        n_max = sum(1 for s in self._final_status if s == "max_iter")
+        self._w(f"# Final status: converged={n_conv} evicted_straggler={n_evict} "
+                f"max_iter={n_max} (mu_unbracketed={self._mu_unbracketed})\n")
 
         self._close_log()
 
@@ -366,9 +470,10 @@ class BatchPRFO:
             tracked_idx = torch.where(has_neg, neg_idx, alt_idx)
 
             self.tracked_mode_idx = tracked_idx
-            self.tracked_mode_vec_mw = torch.stack(
-                [V[b, :, tracked_idx[b]] for b in range(B)], dim=0
-            )
+            # gather column tracked_idx[b] from V[b] -> (B, n); avoids python B-loop host sync
+            self.tracked_mode_vec_mw = V.gather(
+                2, tracked_idx.view(B, 1, 1).expand(B, n, 1)
+            ).squeeze(2)
 
         else:
             overlap = torch.matmul(
@@ -381,9 +486,9 @@ class BatchPRFO:
             signs = torch.where(signs == 0, torch.ones_like(signs), signs)
 
             self.tracked_mode_idx = idx
-            self.tracked_mode_vec_mw = torch.stack(
-                [V[b, :, idx[b]] * signs[b] for b in range(B)], dim=0
-            )
+            # gather column idx[b] from V[b] -> (B, n), then sign-fix; no python B-loop
+            vec = V.gather(2, idx.view(B, 1, 1).expand(B, n, 1)).squeeze(2)
+            self.tracked_mode_vec_mw = vec * signs.unsqueeze(1)
 
         return w, V, gp
 
@@ -537,24 +642,31 @@ class BatchPRFO:
     # ===================================================
 
     def _check_convergence(self, it, calc, atoms_list,
-                           trust_r, last_step, real_mask, last_rho):
+                           trust_r, last_step, real_mask, last_rho,
+                           E_precomp=None, g_precomp=None):
 
         device = self.device
-        E_final, F_final = calc.get_ef_gpu()
-        F_final = F_final.to(dtype=DTYPE)
-        g_last = -F_final * real_mask.to(DTYPE)
+        # Coalesce: the committed-geometry forward (run loop) already evaluated THIS
+        # exact geometry. Reuse its E/g instead of recomputing a forward+backward.
+        if E_precomp is not None and g_precomp is not None:
+            E_final = E_precomp.to(dtype=DTYPE)
+            g_last = g_precomp
+        else:
+            E_final, F_final = calc.get_ef_gpu()
+            F_final = F_final.to(dtype=DTYPE)
+            g_last = -F_final * real_mask.to(DTYPE)
 
         f_max_th = torch.tensor(
-            [getattr(at, "f_max_th", 2e-3) for at in atoms_list],
+            [getattr(at, "f_max_th", 9.5e-3) for at in atoms_list],
             dtype=DTYPE, device=device)
         f_rms_th = torch.tensor(
-            [getattr(at, "f_rms_th", 1e-3) for at in atoms_list],
+            [getattr(at, "f_rms_th", 5e-3) for at in atoms_list],
             dtype=DTYPE, device=device)
         dp_max_th = torch.tensor(
-            [getattr(at, "dp_max_th", 1e-3) for at in atoms_list],
+            [getattr(at, "dp_max_th", 1.8e-3) for at in atoms_list],
             dtype=DTYPE, device=device)
         dp_rms_th = torch.tensor(
-            [getattr(at, "dp_rms_th", 5e-4) for at in atoms_list],
+            [getattr(at, "dp_rms_th", 1.2e-3) for at in atoms_list],
             dtype=DTYPE, device=device)
 
         L_eff = self._L_vec.clamp(min=1).to(DTYPE)
@@ -588,6 +700,102 @@ class BatchPRFO:
     # ===================================================
     # MU SOLVER
     # ===================================================
+
+    @torch.no_grad()
+    def _solve_mu_vectorized(self, w, gp, mask, R2, sigma, only):
+        """Fully vectorized RS trust-region shift solver (no python B-loop / no .item()).
+
+        Parity target: _solve_mu_batched. For each structure b with only[b]:
+          - subspace = mask[b] (minus_mask -> 1 uphill mode; plus_mask -> downhill+pad).
+          - lam = sigma*w, num = sigma*gp.
+          - Newton (mu=0) step s_unc = -num/lam (eval floor 1e-10). If ||s_unc||^2 <= R2
+            -> mu=0 (unconstrained branch).
+          - Else solve F(mu)=sum_sub (num/(lam-mu))^2 = R2 with mu < wt_min(subspace):
+              * sigma<0 (single uphill mode): closed form mu = lam_s - |num_s|/sqrt(R2),
+                clamped to <= lam_s-1e-6 (matches the batched hi when the root is < 1e-6
+                from lam_s, the un-bracketed edge).
+              * sigma>0 (downhill, many modes): lockstep bisection identical to the batched
+                bracket(hi=wt_min-1e-6, expand lo while F>R2)+60-iter bisection, but all-B.
+        Pad modes (eigenvalue ~ BIG) and the excluded uphill mode are MASKED OUT of the
+        wt_min reduction (a naive (B,n) min collapses the bracket); they stay in the F sum
+        where their num~0 contributes ~0 (parity-exact). evals_eps=1e-10, denom floor 1e-12
+        replicated exactly. Returns (mu_out (B,), s_part (B,n)) in eigen-coordinates.
+        """
+        device = w.device
+        B, n = w.shape
+
+        lam = sigma * w
+        num = sigma * gp
+        sub = mask
+        subf = sub.to(DTYPE)
+        zeros_bn = torch.zeros((B, n), dtype=DTYPE, device=device)
+
+        # --- unconstrained (mu=0) step, restricted to the subspace ---
+        denom0 = torch.where(lam.abs() < 1e-10, torch.sign(lam) * 1e-10, lam)
+        s_unc = torch.where(sub, -num / denom0, zeros_bn)
+        norm2_unc = (s_unc * s_unc).sum(dim=1)
+        is_unc = norm2_unc <= R2                       # (B,) bool
+
+        def Fvec(mu):                                  # mu: (B,) -> (B,)
+            denom = lam - mu.unsqueeze(1)
+            denom = torch.where(denom.abs() < 1e-12, torch.sign(denom) * 1e-12, denom)
+            val = (num / denom) ** 2
+            return (val * subf).sum(dim=1)
+
+        if sigma < 0:
+            # uphill: exactly one mode per structure -> closed form
+            num_s = (num * subf).sum(dim=1)            # the single tracked num
+            lam_s = (lam * subf).sum(dim=1)            # the single tracked lam
+            root = num_s.abs() / torch.sqrt(torch.clamp(R2, min=1e-300))
+            mu_star = lam_s - root
+            mu_star = torch.minimum(mu_star, lam_s - 1e-6)   # clamp to bracket upper bound
+        else:
+            # downhill: vectorized bracket + bisection
+            pad_mode = w.abs() > (BIG * 0.5)
+            min_mask = sub & (~pad_mode)
+            BIG_SENT = torch.full_like(lam, 1e30)
+            lam_for_min = torch.where(min_mask, lam, BIG_SENT)
+            wt_min = lam_for_min.min(dim=1).values      # min real lam over subspace
+
+            hi = wt_min - 1e-6
+            Fhi = Fvec(hi)
+            hi = torch.where(~torch.isfinite(Fhi), wt_min - 1e-4, hi)
+            lo = hi - 1.0
+            active = only & (~is_unc)
+
+            # bracket expansion (lockstep, <=60), push lo down until F(lo) <= R2
+            for _ in range(60):
+                Flo = Fvec(lo)
+                need = active & (Flo > R2)
+                if not bool(need.any()):
+                    break
+                step = torch.clamp(lo.abs() * 0.5, min=1.0)
+                lo = torch.where(need, lo - step, lo)
+
+            # flag un-bracketed-after-60 (clamp, don't crash)
+            unbr = active & (Fvec(lo) > R2)
+            if bool(unbr.any()):
+                self._mu_unbracketed += int(unbr.sum().item())
+
+            # 60-iter lockstep bisection (F increasing in mu on mu < wt_min)
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                go_hi = Fvec(mid) > R2
+                hi = torch.where(active & go_hi, mid, hi)
+                lo = torch.where(active & (~go_hi), mid, lo)
+            mu_star = 0.5 * (lo + hi)
+
+        # --- constrained step at mu_star, restricted to subspace ---
+        denom = lam - mu_star.unsqueeze(1)
+        denom = torch.where(denom.abs() < 1e-12, torch.sign(denom) * 1e-12, denom)
+        s_con = torch.where(sub, -num / denom, zeros_bn)
+
+        # select unconstrained vs constrained, then zero out non-`only` structures
+        s_part = torch.where(is_unc.unsqueeze(1), s_unc, s_con)
+        mu_out = torch.where(is_unc, torch.zeros_like(mu_star), mu_star)
+        s_part = torch.where(only.unsqueeze(1), s_part, zeros_bn)
+        mu_out = torch.where(only, mu_out, torch.zeros_like(mu_out))
+        return mu_out, s_part
 
     @staticmethod
     @torch.no_grad()

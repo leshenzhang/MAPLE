@@ -78,12 +78,20 @@ class BatchLBFGS:
 
         self._ptr = None
         self._L_vec = None
+        self._L_eff = None
         self._nmax = 0
         self._B = 0
         self._symbols_per_batch = None
         self._arange_n = None
         self._real_mask = None
         self._orig_index = None
+
+        # Per-structure convergence thresholds, precomputed once per topology
+        # (rebuilt only on batch shrink) instead of every iteration.
+        self._f_max_th = None
+        self._f_rms_th = None
+        self._dp_max_th = None
+        self._dp_rms_th = None
 
         # Per-batch L-BFGS history
         self.S_history = []  # List of (B, nmax) tensors per history step
@@ -113,13 +121,16 @@ class BatchLBFGS:
         self._init_xyz_paths(B0)
         self._symbols_per_batch = _symbols_flat(atoms_list)
 
-        # === First prepare to fix nmax ===
+        # === Single initial forward: fixes nmax AND provides E0/F0 ===
+        # (OPT: the original did two get_ef_gpu() forwards on the *same* initial
+        #  geometry -- one to read nmax, one for E0/F0. They are bit-identical, so
+        #  one forward suffices.)
         calc.prepare(atoms_list)
-        _, F0 = calc.get_ef_gpu()
+        E0, F0 = calc.get_ef_gpu()
         self._nmax = int(F0.shape[1])
         self._arange_n = torch.arange(self._nmax, device=device)
 
-        # Build topology (nmax fixed)
+        # Build topology (nmax fixed) + precompute per-structure thresholds/masks
         self._rebuild_topology(atoms_list)
         self._dump_xyz_all(calc, atoms_list, tag="init")
 
@@ -127,22 +138,19 @@ class BatchLBFGS:
         B = self._B
         self.history_valid = torch.zeros((B, self.memory), dtype=torch.bool, device=device)
 
-        # Collect initial trajectory
-        E0, F0 = calc.get_ef_gpu()
-        E0 = E0.to(dtype=DTYPE)
-        
         iteration = 0
-        
+
         # Get initial energy and forces
-        E_old = E0
+        E_old = E0.to(dtype=DTYPE)
         F_old = F0.to(dtype=DTYPE)
-        
+
         while iteration < self.maxiter and len(atoms_list) > 0:
             iteration += 1
             real_mask = self._real_mask
+            rmask = real_mask.to(DTYPE)              # cast once, reused for g_cart & g_new
 
             # Current gradient (negative force)
-            g_cart = -F_old * real_mask.to(DTYPE)
+            g_cart = -F_old * rmask
 
             # Compute L-BFGS search direction
             search_dir = self._two_loop_batched(g_cart)
@@ -156,32 +164,43 @@ class BatchLBFGS:
             # Take step
             calc.step_cart_(step_cart)
 
-            # Evaluate new point
+            # Evaluate new (committed) point -- THE single calculator forward/iter.
+            # (OPT: the committed-geometry energy E_new is threaded straight into
+            #  the convergence logging below; the original recomputed E via a second
+            #  full get_ef_gpu() forward at the identical geometry inside the
+            #  convergence check -- a 100% redundant forward+backward every iter.)
             E_new, F_new = calc.get_ef_gpu()
             E_new = E_new.to(dtype=DTYPE)
             F_new = F_new.to(dtype=DTYPE)
-            g_new = -F_new * real_mask.to(DTYPE)
+            g_new = -F_new * rmask
 
             # Update L-BFGS history
             s_vec = step_cart
             y_vec = g_new - g_cart
             self._update_history_batched(s_vec, y_vec)
 
+            # Convergence/log metrics: compute the four batched reductions ONCE and
+            # share between the iteration log and the convergence check (the original
+            # computed each of them twice -- once per helper).
+            L_eff = self._L_eff
+            max_f = F_new.abs().amax(dim=-1)
+            rms_f = torch.sqrt((F_new ** 2).sum(-1) / L_eff)
+            max_dp = step_cart.abs().amax(dim=-1)
+            rms_dp = torch.sqrt((step_cart ** 2).sum(-1) / L_eff)
+
             # Log iteration info
-            self._log_iteration(iteration, E_new, step_cart, F_new, real_mask)
+            self._log_iteration(iteration, E_new, max_f, rms_f, max_dp, rms_dp)
 
             # Write trajectory for accepted steps
             if self.write_traj and iteration % self.traj_every == 0:
                 self._dump_xyz_all(calc, atoms_list, tag=f"iter={iteration}")
 
-            # Check convergence
+            # Check convergence (uses threaded E_new + shared metrics; no extra fwd)
             done = self._check_convergence(
                 it=iteration,
-                calc=calc,
-                atoms_list=atoms_list,
-                step_cart=step_cart,
-                F=F_new,
-                real_mask=real_mask,
+                E=E_new,
+                max_f=max_f, rms_f=rms_f,
+                max_dp=max_dp, rms_dp=rms_dp,
             )
 
             # Dynamic batch shrinking
@@ -361,55 +380,36 @@ class BatchLBFGS:
     # ===================================================
     # CONVERGENCE CHECK
     # ===================================================
-    def _check_convergence(self, it, calc, atoms_list, step_cart, F, real_mask):
+    def _check_convergence(self, it, E, max_f, rms_f, max_dp, rms_dp):
         """
         Check convergence criteria for each batch.
-        
+
+        Thresholds and the four batched metrics are precomputed/passed in:
+          * thresholds (self._f_max_th, ...) are built ONCE per topology in
+            _rebuild_topology (they only change when the batch shrinks), instead
+            of being rebuilt from python lists every iteration;
+          * (max_f, rms_f, max_dp, rms_dp) are the shared reductions already
+            computed in run();
+          * the per-structure energy E is the committed-geometry energy threaded
+            from run() -- the original recomputed it with a second full forward.
+
         Returns:
             done: (B,) boolean tensor indicating converged batches
         """
-        device = self.device
-        B = len(atoms_list)
-
-        # Get convergence thresholds
-        f_max_th = torch.tensor(
-            [getattr(at, "f_max_th", 2e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
-        f_rms_th = torch.tensor(
-            [getattr(at, "f_rms_th", 1e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
-        dp_max_th = torch.tensor(
-            [getattr(at, "dp_max_th", 1e-3) for at in atoms_list],
-            dtype=DTYPE, device=device)
-        dp_rms_th = torch.tensor(
-            [getattr(at, "dp_rms_th", 5e-4) for at in atoms_list],
-            dtype=DTYPE, device=device)
-
-        L_eff = self._L_vec.clamp(min=1).to(DTYPE)
-
-        # Compute metrics
-        max_f = F.abs().amax(dim=-1)
-        rms_f = torch.sqrt((F ** 2).sum(-1) / L_eff)
-        max_dp = step_cart.abs().amax(dim=-1)
-        rms_dp = torch.sqrt((step_cart ** 2).sum(-1) / L_eff)
-
-        # Check convergence
+        # Check convergence (fully vectorized over the batch)
         done = (
-            (max_f <= f_max_th)
-            & (rms_f <= f_rms_th)
-            & (max_dp <= dp_max_th)
-            & (rms_dp <= dp_rms_th)
+            (max_f <= self._f_max_th)
+            & (rms_f <= self._f_rms_th)
+            & (max_dp <= self._dp_max_th)
+            & (rms_dp <= self._dp_rms_th)
         )
 
-        # Log convergence table
-        E_final, _ = calc.get_ef_gpu()
+        # Log convergence table (sync-light)
         self._w(self._fmt_convergence_table(
             it=it,
-            E=E_final.to(dtype=DTYPE),
+            E=E,
             max_f=max_f, rms_f=rms_f,
             max_dp=max_dp, rms_dp=rms_dp,
-            f_max_th=f_max_th, f_rms_th=f_rms_th,
-            dp_max_th=dp_max_th, dp_rms_th=dp_rms_th,
             done=done
         ))
 
@@ -426,9 +426,29 @@ class BatchLBFGS:
         self._ptr = _ptr_from_atoms(atoms_list, device)
         L_list = [3 * len(at) for at in atoms_list]
         self._L_vec = torch.tensor(L_list, dtype=torch.int64, device=device)
+        # effective DOF count per structure (for RMS denominators); cached so the
+        # hot loop never re-derives it.
+        self._L_eff = self._L_vec.clamp(min=1).to(DTYPE)
 
         # real_mask padded to fixed nmax
         self._real_mask = (self._arange_n[None, :] < self._L_vec[:, None])
+
+        # Precompute per-structure convergence thresholds ONCE per topology.
+        # These only change when the batch shrinks (which re-calls this method),
+        # so rebuilding them from python lists every iteration (host->device copy
+        # + sync x4) was pure overhead.
+        self._f_max_th = torch.tensor(
+            [getattr(at, "f_max_th", 2e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+        self._f_rms_th = torch.tensor(
+            [getattr(at, "f_rms_th", 1e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+        self._dp_max_th = torch.tensor(
+            [getattr(at, "dp_max_th", 1e-3) for at in atoms_list],
+            dtype=DTYPE, device=device)
+        self._dp_rms_th = torch.tensor(
+            [getattr(at, "dp_rms_th", 5e-4) for at in atoms_list],
+            dtype=DTYPE, device=device)
 
     def _sync_atoms_from_calc(self, calc, atoms_list):
         with torch.no_grad():
@@ -454,29 +474,43 @@ class BatchLBFGS:
             self.log_fp.write(s)
             self.log_fp.flush()
 
-    def _log_iteration(self, it, E, step_cart, F, real_mask):
-        """Log iteration information."""
+    def _log_iteration(self, it, E, max_f, rms_f, max_dp, rms_dp):
+        """Log iteration information. Metrics are passed in (already computed in
+        run()). The five batch means are stacked into ONE tensor so the whole line
+        costs a single device->host sync instead of five .item() calls."""
         if self.verbose == 0:
             return
 
-        L_eff = self._L_vec.clamp(min=1).to(DTYPE)
-        max_f = F.abs().amax(dim=-1)
-        rms_f = torch.sqrt((F ** 2).sum(-1) / L_eff)
-        max_dp = step_cart.abs().amax(dim=-1)
-        rms_dp = torch.sqrt((step_cart ** 2).sum(-1) / L_eff)
+        means = torch.stack([
+            E.mean(), max_f.mean(), rms_f.mean(), max_dp.mean(), rms_dp.mean()
+        ]).tolist()
+        e_m, maxf_m, rmsf_m, maxdp_m, rmsdp_m = means
 
         msg = f"\nIter {it}: "
-        msg += f"E_mean={E.mean().item():.6f} "
-        msg += f"max|F|_mean={max_f.mean().item():.6f} "
-        msg += f"rms|F|_mean={rms_f.mean().item():.6f} "
-        msg += f"max|dX|_mean={max_dp.mean().item():.6f} "
-        msg += f"rms|dX|_mean={rms_dp.mean().item():.6f}\n"
-        
+        msg += f"E_mean={e_m:.6f} "
+        msg += f"max|F|_mean={maxf_m:.6f} "
+        msg += f"rms|F|_mean={rmsf_m:.6f} "
+        msg += f"max|dX|_mean={maxdp_m:.6f} "
+        msg += f"rms|dX|_mean={rmsdp_m:.6f}\n"
+
         self._w(msg)
 
-    def _fmt_convergence_table(self, it, E, max_f, rms_f, max_dp, rms_dp,
-                               f_max_th, f_rms_th, dp_max_th, dp_rms_th, done):
-        """Format convergence table."""
+    def _fmt_convergence_table(self, it, E, max_f, rms_f, max_dp, rms_dp, done):
+        """Format convergence table (byte-identical output to the original).
+
+        The original did ~6*B `.item()` calls (one device->host sync each) per
+        iteration -- 384 syncs/iter at B=64. Here every per-structure scalar is
+        moved to host in batched `.tolist()` transfers (3 syncs total: the 5
+        stacked float metrics, the bool `done` vector, the original-index map),
+        then formatted purely on CPU.
+        """
+        B = E.shape[0]
+        # one batched D2H transfer for all five float metrics
+        E_l, maxf_l, rmsf_l, maxdp_l, rmsdp_l = torch.stack(
+            [E, max_f, rms_f, max_dp, rms_dp], dim=0).tolist()
+        done_l = done.tolist()
+        orig_l = self._orig_index.tolist()
+
         lines = []
         lines.append("-" * 70 + "\n")
         lines.append(f"{('Batch L-BFGS Iteration ' + str(it)).center(70)}\n")
@@ -486,17 +520,15 @@ class BatchLBFGS:
         )
         lines.append("-" * 70 + "\n")
 
-        B = E.shape[0]
         for b in range(B):
-            idx_orig = int(self._orig_index[b].item())
             lines.append(
-                f"[{idx_orig:2d}] "
-                f"{E[b].item():14.6f} "
-                f"{max_f[b].item():12.6f} "
-                f"{rms_f[b].item():10.6f} "
-                f"{max_dp[b].item():12.6f} "
-                f"{rms_dp[b].item():10.6f} "
-                f"{('YES' if bool(done[b]) else 'NO')}\n"
+                f"[{orig_l[b]:2d}] "
+                f"{E_l[b]:14.6f} "
+                f"{maxf_l[b]:12.6f} "
+                f"{rmsf_l[b]:10.6f} "
+                f"{maxdp_l[b]:12.6f} "
+                f"{rmsdp_l[b]:10.6f} "
+                f"{('YES' if done_l[b] else 'NO')}\n"
             )
 
         lines.append("\n")
