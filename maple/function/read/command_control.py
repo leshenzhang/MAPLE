@@ -66,6 +66,7 @@ class CommandControl:
             "debug": False,
             "plumed": "",   # PLUMED enhanced-sampling input file; empty = off
             "colvars": "",  # Colvars (eABF/ABF) input file; empty = off
+            "precision": "fp64",  # MACE force-path float precision: fp64 (default) | fp32 | tf32
         },
     }
 

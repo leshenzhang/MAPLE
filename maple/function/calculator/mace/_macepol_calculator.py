@@ -7,7 +7,13 @@ import numpy as np
 import torch
 from ase.calculators.calculator import all_changes
 
-from ..calculator_base import CalcABC, hessian_via_double_autograd, register_calculator
+from ..calculator_base import (
+    CalcABC,
+    apply_tf32_backend_flags,
+    hessian_via_double_autograd,
+    normalize_precision,
+    register_calculator,
+)
 from ._common import one_hot_node_attrs, radius_graph_no_pbc
 
 
@@ -48,6 +54,7 @@ class MACEPolCalculator(CalcABC):
     MODEL_ENERGY_UNIT = 'eV'
     SUPPORTED_HESSIAN_MODES = ('analytic', 'numerical')
     SUPPORTS_CHARGE_MULT = True
+    SUPPORTS_PRECISION = True
     SUPPORTS_PBC = False
     CHECKPOINT_FILENAME = None
     REQUIRES_LOCAL_MODEL_FILE = True
@@ -67,6 +74,7 @@ class MACEPolCalculator(CalcABC):
         model_path: str = None,
         implicit: Literal['gbsa', 'none'] = 'none',
         solvent: str = 'none',
+        precision: str = 'fp64',
         ):
         """
         Args:
@@ -91,6 +99,11 @@ class MACEPolCalculator(CalcABC):
             p.requires_grad_(False)
 
         self.device = device
+        # MACE-POLAR traced models are natively f32, so true fp64 is unavailable;
+        # the data path stays float32 regardless of `precision`. The selector
+        # only toggles A100 TF32 tensor cores (tf32) vs true IEEE single (fp32).
+        self.precision = normalize_precision(precision)
+        apply_tf32_backend_flags(self.precision)
         self.dtype = torch.float32  # MACE-POLAR traced models are f32
         self.r_max = float(self.model.r_max)
         self.atomic_numbers = [int(z) for z in self.model.atomic_numbers]

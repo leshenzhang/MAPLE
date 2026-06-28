@@ -25,7 +25,12 @@ import numpy as np
 import torch
 from ase.calculators.calculator import all_changes
 
-from ..calculator_base import CalcABC, register_calculator
+from ..calculator_base import (
+    CalcABC,
+    apply_tf32_backend_flags,
+    normalize_precision,
+    register_calculator,
+)
 
 
 def _device_str(device) -> str:
@@ -45,6 +50,7 @@ class MACEMPCalculator(CalcABC):
     MODEL_ENERGY_UNIT = 'eV'
     SUPPORTED_HESSIAN_MODES = ('numerical',)
     SUPPORTS_CHARGE_MULT = False
+    SUPPORTS_PRECISION = True
     SUPPORTS_PBC = True
     CHECKPOINT_FILENAME = None
     REQUIRES_LOCAL_MODEL_FILE = False
@@ -69,6 +75,7 @@ class MACEMPCalculator(CalcABC):
         overwrite: bool = False,
         implicit: Literal['gbsa', 'none'] = 'none',
         solvent: str = 'none',
+        precision: str = 'fp64',
         ):
         """
         Args:
@@ -85,17 +92,25 @@ class MACEMPCalculator(CalcABC):
         self.device = device
         dev = _device_str(device)
 
+        # Mixed-precision selector (B-29). fp64 (default) preserves the historical
+        # float64 condensed-phase force path bit-for-bit; fp32/tf32 drop the model
+        # weights + neighbour graph to single precision for ~2-4x A100 throughput.
+        # tf32 additionally enables TensorFloat-32 matmul on the big linear layers.
+        self.precision = normalize_precision(precision)
+        apply_tf32_backend_flags(self.precision)
+        default_dtype = 'float64' if self.precision == 'fp64' else 'float32'
+
         # Import upstream MACE lazily so MAPLE only needs it when this backend is
         # actually requested (keeps gas-phase-only environments importable).
         from mace.calculators import MACECalculator, mace_mp
 
         if model_path is not None:
             self._mace = MACECalculator(
-                model_paths=model_path, device=dev, default_dtype='float64',
+                model_paths=model_path, device=dev, default_dtype=default_dtype,
             )
         else:
             self._mace = mace_mp(
-                model=mace_model, device=dev, default_dtype='float64',
+                model=mace_model, device=dev, default_dtype=default_dtype,
             )
 
         self.overwrite = overwrite

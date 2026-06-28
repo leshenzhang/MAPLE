@@ -17,6 +17,7 @@ from .calculator_base import (
     import_calculator_plugin,
     load_calculator_plugins_from_env,
     normalize_none_option,
+    normalize_precision,
     validate_implicit_solvent_choice,
 )
 
@@ -113,6 +114,7 @@ class SetCalculator:
         solvent: str = 'None',
         model_options: Optional[dict] = None,
         solvation_options: Optional[dict] = None,
+        precision: str = 'fp64',
     ) -> None:
         self.output = output
         self.model = str(model).strip().lower()
@@ -123,6 +125,7 @@ class SetCalculator:
         self.solvent = normalize_none_option(solvent)
         self.model_options = _normalize_model_options(model_options)
         self.solvation_options = solvation_options or {}
+        self.precision = normalize_precision(precision)
         self._model_error_logged = False
 
     def _model_dir(self) -> Path:
@@ -499,6 +502,19 @@ class SetCalculator:
 
         resolved_path_str = str(resolved_model_path) if resolved_model_path is not None else None
         kwargs = cls.build_kwargs_from_options(name, options, resolved_model_path=resolved_path_str)
+
+        # Thread the MD float-precision selector to backends that opt in via
+        # SUPPORTS_PRECISION; warn (and ignore) for backends that don't so a
+        # user asking fp32 on an unsupported model is never silently misled.
+        if getattr(cls, 'SUPPORTS_PRECISION', False):
+            kwargs['precision'] = self.precision
+        elif self.precision != 'fp64':
+            self.log_info(
+                [
+                    f"\n [WARNING] Model '{self.model}' does not support mixed precision; "
+                    f"precision='{self.precision}' ignored (model-native dtype used).\n"
+                ]
+            )
 
         calculator = cls(
             device=self.device,

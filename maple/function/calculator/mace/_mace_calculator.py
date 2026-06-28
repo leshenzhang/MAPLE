@@ -7,7 +7,13 @@ import numpy as np
 import torch
 from ase.calculators.calculator import all_changes
 
-from ..calculator_base import CalcABC, hessian_via_double_autograd, register_calculator
+from ..calculator_base import (
+    CalcABC,
+    apply_tf32_backend_flags,
+    hessian_via_double_autograd,
+    normalize_precision,
+    register_calculator,
+)
 from ._common import (
     model_float_dtype,
     one_hot_node_attrs,
@@ -99,6 +105,7 @@ class MACECalculator(CalcABC):
     MODEL_ENERGY_UNIT = 'eV'
     SUPPORTED_HESSIAN_MODES = ('analytic', 'numerical')
     SUPPORTS_CHARGE_MULT = False
+    SUPPORTS_PRECISION = True
     SUPPORTS_PBC = False
     # Only the auto-downloaded variants. maceoff23s and maceoff23l are
     # local-only (REQUIRES_LOCAL_MODEL_FILE) — the factory falls back to
@@ -122,6 +129,7 @@ class MACECalculator(CalcABC):
         overwrite: bool = False,
         implicit: Literal['gbsa', 'none'] = 'none',
         solvent: str = 'none',
+        precision: str = 'fp64',
         ):
         """
         Args:
@@ -143,7 +151,17 @@ class MACECalculator(CalcABC):
             p.requires_grad_(False)
 
         self.device = device
-        self.dtype = model_float_dtype(self.model)
+        # Mixed precision (B-29): fp64 keeps the scripted model's native dtype;
+        # fp32/tf32 cast the scripted weights/buffers to float32 and run the
+        # neighbour-graph + autograd in single precision. tf32 also enables
+        # TensorFloat-32 matmul tensor cores.
+        self.precision = normalize_precision(precision)
+        apply_tf32_backend_flags(self.precision)
+        if self.precision == 'fp64':
+            self.dtype = model_float_dtype(self.model)
+        else:
+            self.model = self.model.float()
+            self.dtype = torch.float32
         self.overwrite = overwrite
 
         self.r_max = float(self.model.r_max)
