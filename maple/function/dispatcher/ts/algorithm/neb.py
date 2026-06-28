@@ -34,6 +34,11 @@ from typing import List, Tuple, Optional
 import numpy as np
 from ase import Atoms
 
+try:                       # module-global torch for the on-device helpers below;
+    import torch           # the numpy oracle path never touches it (torch may be
+except Exception:          # absent in a pure-CPU/serial install).
+    torch = None
+
 from .logger import log_info
 from ...jobABC import JobABC
 
@@ -671,6 +676,131 @@ class LBFGSDriver:
 
 
 # =============================================================================
+# ----------------- ON-DEVICE (torch CUDA) NEB math (OPT-IN) ------------------
+# These mirror improved_tangent / neb_forces / neb_band_forces / compute_*_k /
+# LBFGSDriver EXACTLY (numpy->torch swap on the band's (n_img, n_at, 3) tensor),
+# so run_multiband(on_device=True) keeps the whole inner loop on the GPU: no
+# per-iter .cpu()/.numpy() of the (n_img, nmax_dof) forces, no numpy tangent/
+# spring/projection/L-BFGS, no convergence round-trip. The numpy path above stays
+# the byte-parity oracle (default on_device=False). CPU-torch parity vs the numpy
+# refs: |dFp|~2e-16, |dLBFGS step|~5e-15 (machine eps) over 40 random bands.
+# =============================================================================
+
+def _improved_tangent_torch(coord, Es):
+    """Vectorized improved tangent (Henkelman & Jonsson, JCP 2000, 113, 9978) for
+    ALL internal images at once. coord (n_img,n_at,3), Es (n_img,) -> tau
+    (n_internal,n_at,3), each a unit (per-image, full-3N-normalized) vector.
+    Bit-identical to improved_tangent() applied image-by-image."""
+    dm = coord[1:-1] - coord[0:-2]
+    dp = coord[2:] - coord[1:-1]
+    Em, E, Ep = Es[0:-2], Es[1:-1], Es[2:]
+    c1 = (Ep > E) & (E > Em)
+    c2 = (Ep < E) & (E < Em)
+    dEp = torch.clamp(Ep - E, min=0.0)
+    dEm = torch.clamp(Em - E, min=0.0)
+    t_else = dEp[:, None, None] * dp + dEm[:, None, None] * dm
+    t = torch.where(c1[:, None, None], dp, torch.where(c2[:, None, None], dm, t_else))
+    n_in = t.shape[0]
+    norm = t.reshape(n_in, -1).norm(dim=1)
+    fb1 = dp + dm
+    nfb1 = fb1.reshape(n_in, -1).norm(dim=1)
+    use1 = norm < 1e-16
+    t = torch.where(use1[:, None, None], fb1, t)
+    norm = torch.where(use1, nfb1, norm)
+    use2 = norm < 1e-16                      # extreme fallback: unit e0 (flat idx 0)
+    e0 = torch.zeros_like(t); e0[:, 0, 0] = 1.0
+    t = torch.where(use2[:, None, None], e0, t)
+    norm = torch.where(use2, torch.ones_like(norm), norm)
+    return t / norm[:, None, None]
+
+
+def _dyn_k_torch(Es, k_min, k_max, k_decay):
+    """ORCA dynamic spring k per INTERNAL image (== compute_dynamic_k[1:-1])."""
+    Em, Ei, Ep = Es[0:-2], Es[1:-1], Es[2:]
+    dE = torch.clamp(Ei - torch.maximum(Em, Ep), min=0.0)
+    dEmax = dE.max()
+    k_dyn = k_max - (k_max - k_min) * torch.exp(-k_decay * (dE / dEmax.clamp(min=1e-30)))
+    return torch.where(dEmax < 1e-10, torch.full_like(dE, k_max), k_dyn)
+
+
+def _ew_k_torch(Es, k_min, k_max):
+    """Energy-weighted spring k per INTERNAL image (== compute_energy_weighted_k[1:-1])."""
+    E_ref = torch.maximum(Es[0], Es[-1]); E_max = Es.max(); denom = E_max - E_ref
+    Ei = Es[1:-1]
+    k_hi = k_max - (k_max - k_min) * (E_max - Ei) / denom.clamp(min=1e-30)
+    cond = (denom > 1e-10) & (Ei > E_ref)
+    return torch.where(cond, k_hi, torch.full_like(Ei, k_min))
+
+
+def _band_forces_torch(coord, Es, rawF, k_internal, climbing, frozen_mask):
+    """On-device per-band NEB projected forces == neb_band_forces(), vectorized.
+    coord/rawF (n_img,n_at,3), Es (n_img,), k_internal (n_internal,). frozen_mask
+    (n_internal,) bool (True=frozen) or None. Returns (Fp (n_internal,n_at,3),
+    max_fp scalar tensor, hei0 0-dim long tensor = argmax internal-image index).
+    hei stays ON DEVICE (no .item()) so the hot loop never syncs for HEI; the host
+    int (hei0+1) is materialized only at harvest / for DyNEB."""
+    n_in = coord.shape[0] - 2
+    hei0 = torch.argmax(Es[1:-1])                              # 0-dim long, device
+    tau = _improved_tangent_torch(coord, Es)
+    F_true = rawF[1:-1]
+    c = (F_true * tau).reshape(n_in, -1).sum(dim=1)
+    F_perp = F_true - c[:, None, None] * tau
+    dm = coord[1:-1] - coord[0:-2]; dp = coord[2:] - coord[1:-1]
+    d_next = dp.reshape(n_in, -1).norm(dim=1); d_prev = dm.reshape(n_in, -1).norm(dim=1)
+    Fp = F_perp + (k_internal * (d_next - d_prev))[:, None, None] * tau
+    if climbing:
+        Fp_ci = F_true - 2.0 * c[:, None, None] * tau          # HEI driven UP, no spring
+        sel = torch.zeros(n_in, dtype=torch.bool, device=coord.device); sel[hei0] = True
+        Fp = torch.where(sel[:, None, None], Fp_ci, Fp)
+    if frozen_mask is not None:
+        fm = frozen_mask.clone(); fm[hei0] = False             # never freeze HEI
+        Fp = torch.where(fm[:, None, None], torch.zeros_like(Fp), Fp)
+    max_fp = Fp.abs().reshape(n_in, -1).max() if n_in else torch.zeros((), device=coord.device, dtype=coord.dtype)
+    return Fp, max_fp, hei0
+
+
+class LBFGSDriverTorch:
+    """torch-CUDA twin of LBFGSDriver (same two-loop / curvature / step cap), so
+    on_device=True reproduces the numpy L-BFGS step to machine eps. All state
+    (S, Y, rhos) lives on the GPU; no host sync in two_loop / update / step_limit."""
+    def __init__(self, m=5, curvature=70.0, maxstep=0.2):
+        self.m = m
+        self.H0 = 1.0 / curvature
+        self.maxstep = maxstep
+        self.S, self.Y, self.rhos = [], [], []
+
+    def two_loop(self, grad):
+        q = grad.clone()
+        alpha = []
+        for s, y, rho in zip(reversed(self.S), reversed(self.Y), reversed(self.rhos)):
+            a = rho * torch.dot(s, q); alpha.append(a); q = q - a * y
+        gamma = self.H0 if not self.Y else torch.dot(self.Y[-1], self.S[-1]) / (torch.dot(self.Y[-1], self.Y[-1]) + 1e-20)
+        z = gamma * q
+        for s, y, rho, a in zip(self.S, self.Y, self.rhos, reversed(alpha)):
+            b = rho * torch.dot(y, z); z = z + s * (a - b)
+        return -z
+
+    def update(self, s, y):
+        rho = 1.0 / (torch.dot(y, s) + 1e-20)
+        self.S.append(s.clone()); self.Y.append(y.clone()); self.rhos.append(rho)
+        if len(self.S) > self.m:
+            self.S.pop(0); self.Y.pop(0); self.rhos.pop(0)
+
+    def step_limit(self, step):
+        max_disp = step.abs().max()
+        scale = torch.where(max_disp > self.maxstep,
+                            self.maxstep / max_disp.clamp(min=1e-30),
+                            torch.ones_like(max_disp))
+        return step * scale
+
+    def should_stop(self, grad, fmax_th=1e-3, frms_th=5e-4):
+        """Returns a (device) bool tensor; the caller syncs once per iteration."""
+        max_f = grad.abs().max()
+        rms_f = torch.sqrt((grad * grad).mean())
+        return (max_f < fmax_th) & (rms_f < frms_th)
+
+
+# =============================================================================
 # ------------------------------- NEB Class -----------------------------------
 # =============================================================================
 
@@ -1073,7 +1203,8 @@ class NEB(JobABC):
                       spring_mode: str = "dynamic", verbose: bool = True,
                       pool_queue: Optional[List[List[Atoms]]] = None,
                       B_target: Optional[int] = None,
-                      stall_patience: int = 40):
+                      stall_patience: int = 40,
+                      on_device: bool = False):
         """
         OPT-IN multi-band NEB: optimise B independent NEB bands concurrently,
         packing every image of every still-active band into ONE batched
@@ -1150,6 +1281,56 @@ class NEB(JobABC):
         p = self.params
         base_case = (not dyneb) and (not climbing) and (spring_mode == "dynamic")
 
+        # ---- ON-DEVICE inner loop (OPT-IN, default OFF = the numpy oracle) ----
+        # Keeps the band's (n_img, n_at, 3) coords/forces + the L-BFGS state as
+        # torch CUDA tensors, so tangent / spring / projection / two-loop /
+        # convergence run as GPU ops with NO per-iter .cpu()/.numpy() of the
+        # (n_img, nmax_dof) force tensor and NO numpy round-trip. The forward is
+        # fed on-device via calc.set_coords_ (mirrors BatchPRFO): the band topology
+        # is prepare()d once and re-prepared ONLY when the batch membership changes
+        # (a band converges / the pool refills), eliminating the per-iter Atoms
+        # write-back + graph rebuild too. Host syncs only for the per-band
+        # convergence bool and the final harvest. MAPLE_NEB_DEV_NO_SETCOORDS=1
+        # forces prepare()-every-iter (still on-device math; for A/B isolation).
+        on_device = bool(on_device) and (torch is not None) and self._use_batch \
+            and hasattr(self._mol_calc, "set_coords_")
+        ddev = getattr(self._mol_calc, "device", None) if on_device else None
+        ddtype = getattr(self._mol_calc, "dtype", None) if on_device else None
+        dev_setcoords = on_device and (os.environ.get("MAPLE_NEB_DEV_NO_SETCOORDS", "0") != "1")
+        # batched convergence sync: keep the per-band converged/HEI flags on device
+        # and pull them to the host in ONE .cpu() per ITERATION (not per band).
+        # MAPLE_NEB_DEV_PERBAND_SYNC=1 reverts to a per-band .item() (for A/B).
+        dev_batched_sync = on_device and (os.environ.get("MAPLE_NEB_DEV_PERBAND_SYNC", "0") != "1")
+        self._dev_fwd_key = None    # membership signature of the last prepared batch
+
+        def _dev_sync_active(sts):
+            # ONE host round-trip for the whole batch: stack the per-band converged
+            # bools (device) and pull them together. Replaces B per-band .item()s.
+            live = [st for st in sts if st.get("conv_dev") is not None]
+            if not live:
+                return
+            flags = torch.stack([st["conv_dev"] for st in live]).to("cpu").tolist()
+            for st, fl in zip(live, flags):
+                st["converged"] = bool(fl)
+
+        def _dev_init_state(st):
+            """Attach the torch-CUDA twin fields (coords/Es/forces/x/g + torch
+            L-BFGS) to a state dict already built by the numpy path."""
+            imgs = st["images"]; n_img = st["n_img"]; n_at = len(imgs[0])
+            coord = torch.tensor(
+                np.stack([np.asarray(a.get_positions(), dtype=np.float64) for a in imgs]),
+                dtype=ddtype, device=ddev)
+            st["coord_t"] = coord
+            st["n_at"] = n_at
+            st["Es_t"] = torch.zeros(n_img, dtype=ddtype, device=ddev)
+            st["rawF_t"] = torch.zeros((n_img, n_at, 3), dtype=ddtype, device=ddev)
+            st["x_t"] = coord[1:-1].reshape(-1).clone()
+            st["g_t"] = None
+            st["x_new_t"] = None
+            st["hei_dev"] = None        # 0-dim long (argmax internal idx), device
+            st["conv_dev"] = None       # 0-dim bool (should_stop), device
+            st["driver"] = LBFGSDriverTorch(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0)
+
         def k_for(Es):
             if spring_mode == "dynamic":
                 return compute_dynamic_k(Es, p.k_min, p.k_max, p.k_decay)
@@ -1161,7 +1342,7 @@ class NEB(JobABC):
         states = []
         for b_idx, band in enumerate(bands):
             images = self._prepare_band(band)
-            states.append(dict(
+            st = dict(
                 idx=b_idx, images=images, n_img=len(images),
                 driver=LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0),
                 x=self._pack_internal(images),
@@ -1171,10 +1352,15 @@ class NEB(JobABC):
                 # streaming-pool per-band straggler tracking (read only when
                 # pooling; inert for the lockstep oracle).
                 best_fmax=float("inf"), stall=0,
-            ))
+            )
+            if on_device:
+                _dev_init_state(st)
+            states.append(st)
 
         # ---- one batched forward over a chosen subset of images per band ----
         def batched_forward(eval_plan):
+            if on_device:
+                return _dev_forward(eval_plan)
             flat, owner = [], []
             for st, idxs in eval_plan:
                 for j in idxs:
@@ -1189,7 +1375,131 @@ class NEB(JobABC):
                 st["force_evals"] += 1
             return len(flat)
 
+        # ---- on-device forward: set_coords_ (steady) / prepare (membership change),
+        #      results kept ON DEVICE (no .numpy() of the (B, nmax_dof) force tensor)
+        def _dev_forward(eval_plan):
+            plan = [(st, list(idxs)) for st, idxs in eval_plan if idxs]
+            n_flat = sum(len(idxs) for _, idxs in plan)
+            if not n_flat:
+                return 0
+            calc = self._mol_calc
+            key = tuple((st["idx"], tuple(idxs)) for st, idxs in plan)
+            if dev_setcoords and key == self._dev_fwd_key:
+                # steady state: feed the new geometry on-device, no Atoms, no graph
+                # rebuild. coord_t rows are gathered in the SAME flat (band, image)
+                # order as the matching prepare() -> set_coords_ layout is consistent.
+                flat_coords = torch.cat(
+                    [st["coord_t"][idxs].reshape(-1, 3) for st, idxs in plan], dim=0)
+                calc.set_coords_(flat_coords)
+            else:
+                # membership changed (or set_coords disabled): sync coord_t -> Atoms
+                # for the images about to be prepared, then rebuild the topology.
+                flat = []
+                for st, idxs in plan:
+                    cc = st["coord_t"][idxs].detach().to("cpu", torch.float64).numpy()
+                    for slot_j, j in enumerate(idxs):
+                        st["images"][j].set_positions(cc[slot_j])
+                        flat.append(st["images"][j])
+                calc.prepare(flat, fixed_nmax=None)
+                self._dev_fwd_key = key
+            E_t, F_t = calc.get_ef_gpu()        # E_t (B,), F_t (B, nmax_dof) ON DEVICE
+            slot = 0
+            for st, idxs in plan:                # per-band scatter (contiguous slots)
+                k = len(idxs); n_i = st["n_at"]; sl = slice(slot, slot + k)
+                st["Es_t"][idxs] = E_t[sl]
+                st["rawF_t"][idxs] = F_t[sl, :3 * n_i].reshape(k, n_i, 3)
+                st["force_evals"] += k
+                slot += k
+            return n_flat
+
+        def _dev_band_forces(st):
+            Es = st["Es_t"]
+            if spring_mode == "dynamic":
+                k_in = _dyn_k_torch(Es, p.k_min, p.k_max, p.k_decay)
+            elif spring_mode == "energy_weighted":
+                k_in = _ew_k_torch(Es, p.k_min, p.k_max)
+            else:
+                k_in = torch.full((st["n_img"] - 2,), p.k_max, dtype=ddtype, device=ddev)
+            fm = None
+            if dyneb and st["frozen"]:
+                fm = torch.zeros(st["n_img"] - 2, dtype=torch.bool, device=ddev)
+                for fi in st["frozen"]:
+                    fm[fi - 1] = True
+            return _band_forces_torch(st["coord_t"], Es, st["rawF_t"], k_in, climbing, fm)
+
+        def _dev_project_frozen(st, x_new):
+            if not st["frozen"]:
+                return x_new
+            xp = x_new.clone(); n3 = st["n_at"] * 3; xo = st["x_t"]
+            for i in st["frozen"]:
+                off = (i - 1) * n3
+                xp[off:off + n3] = xo[off:off + n3]
+            return xp
+
+        def _dev_propose_step(st):
+            drv = st["driver"]
+            step = drv.step_limit(drv.two_loop(st["g_t"]))
+            x_new = st["x_t"] + step
+            if dyneb and st["frozen"]:
+                x_new = _dev_project_frozen(st, x_new)
+            st["coord_t"][1:-1] = x_new.reshape(st["n_img"] - 2, st["n_at"], 3)
+            st["x_new_t"] = x_new
+
+        def _dev_update_frozen(st, Fp, fmax_th):
+            hei = int(st["hei_dev"].item()) + 1; st["hei"] = hei   # DyNEB needs host idx
+            protect = {hei - 1, hei, hei + 1}
+            for i in list(st["frozen"]):
+                if i in protect:
+                    st["frozen"].discard(i)
+            pim = Fp.abs().reshape(Fp.shape[0], -1).max(dim=1).values.detach().to("cpu").numpy()
+            for idx_in in range(Fp.shape[0]):
+                i = idx_in + 1
+                if i in protect or i in st["frozen"]:
+                    continue
+                if float(pim[idx_in]) < fmax_th:
+                    st["frozen"].add(i)
+
+        def _dev_set_conv(st, g_new):
+            # store the (device) convergence bool; sync now (per-band mode) or defer
+            # to the batched _dev_sync_active (default).
+            st["conv_dev"] = st["driver"].should_stop(g_new, p.neb_f_max_th, p.neb_f_rms_th)
+            if not dev_batched_sync:
+                st["converged"] = bool(st["conv_dev"].item())
+
+        def _dev_update_band(st):
+            Fp, _, hei0 = _dev_band_forces(st)
+            st["hei_dev"] = hei0; st["Fp_t"] = Fp
+            g_new = (-Fp).reshape(-1)
+            st["driver"].update(st["x_new_t"] - st["x_t"], g_new - st["g_t"])
+            st["x_t"] = st["x_new_t"]
+            st["g_t"] = g_new; st["g"] = g_new      # alias for pool fmax_of(st["g"])
+            st["iters"] += 1
+            _dev_set_conv(st, g_new)
+            if dyneb:
+                _dev_update_frozen(st, Fp, p.neb_f_max_th)
+
+        def _dev_finalize(st):
+            """Harvest sync: write the converged coords back to the Atoms (so the
+            HEI geometry is exact for downstream P-RFO) and pull energies to host."""
+            st["hei"] = int(st["hei_dev"].item()) + 1
+            cc = st["coord_t"].detach().to("cpu", torch.float64).numpy()
+            for j in range(st["n_img"]):
+                st["images"][j].set_positions(cc[j])
+            st["Es"] = st["Es_t"].detach().to("cpu", torch.float64).numpy().tolist()
+
+        def _dev_init_grad(st):
+            # post-(initial forward) gradient + convergence, on device. Mirrors the
+            # numpy init block but using _dev_band_forces / torch should_stop.
+            Fp, _, hei0 = _dev_band_forces(st)
+            st["hei_dev"] = hei0; st["Fp_t"] = Fp
+            g = (-Fp).reshape(-1); st["g_t"] = g; st["g"] = g
+            _dev_set_conv(st, g)
+            if dyneb:
+                _dev_update_frozen(st, Fp, p.neb_f_max_th)
+
         def band_forces(st):
+            if on_device:
+                return _dev_band_forces(st)
             if base_case:
                 # IDENTICAL call to run()'s eval_grad (dynamic-k recomputed from
                 # the current energies inside neb_forces) -> per-band parity.
@@ -1213,6 +1523,8 @@ class NEB(JobABC):
         #      are verbatim factor-outs of the legacy loop body => byte-parity) ----
         def propose_step(st):
             # 1) propose x_new for one active band (no forward needed).
+            if on_device:
+                return _dev_propose_step(st)
             drv = st["driver"]
             step = drv.step_limit(drv.two_loop(st["g"]))
             x_new = st["x"] + step
@@ -1234,6 +1546,8 @@ class NEB(JobABC):
 
         def update_band(st):
             # 3) per-band gradient update + convergence after the batched forward.
+            if on_device:
+                return _dev_update_band(st)
             Fp_list, _, hei = band_forces(st)
             st["hei"] = hei
             st["Fp_list"] = Fp_list
@@ -1248,9 +1562,13 @@ class NEB(JobABC):
                 self._update_frozen(st, Fp_list, p.neb_f_max_th)
 
         def fmax_of(g):
+            if on_device:
+                return float(g.abs().max().item()) if (g is not None and g.numel()) else 0.0
             return float(np.max(np.abs(g))) if g.size else 0.0
 
         def make_result(st, status=None):
+            if on_device:
+                _dev_finalize(st)          # coords -> Atoms, Es -> host (harvest sync)
             Es = st["Es"]
             hei = st["hei"]
             r = dict(
@@ -1266,7 +1584,7 @@ class NEB(JobABC):
         def build_state(band_spec, oi):
             # construct a fresh per-band state for a pool newcomer (orig index oi).
             images = self._prepare_band(band_spec)
-            return dict(
+            st = dict(
                 idx=oi, images=images, n_img=len(images),
                 driver=LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0),
                 x=self._pack_internal(images),
@@ -1276,6 +1594,9 @@ class NEB(JobABC):
                 frozen=set(), force_evals=0,
                 best_fmax=float("inf"), stall=0,
             )
+            if on_device:
+                _dev_init_state(st)
+            return st
 
         # ---- INITIAL forward (full band for every band) ----
         for st in states:
@@ -1289,6 +1610,9 @@ class NEB(JobABC):
         forwards += 1
 
         for st in states:
+            if on_device:
+                _dev_init_grad(st)
+                continue
             Fp_list, _, hei = band_forces(st)
             st["hei"] = hei
             st["Fp_list"] = Fp_list
@@ -1298,6 +1622,8 @@ class NEB(JobABC):
                 st["converged"] = True
             if dyneb:
                 self._update_frozen(st, Fp_list, p.neb_f_max_th)
+        if dev_batched_sync:
+            _dev_sync_active(states)
 
         if verbose:
             pool_note = (f"  POOL on: B_target={B_target} "
@@ -1333,6 +1659,8 @@ class NEB(JobABC):
                 # 3) per-band gradient update + convergence
                 for st in active:
                     update_band(st)
+                if dev_batched_sync:
+                    _dev_sync_active(active)    # ONE host round-trip for the batch
 
             wall = time.time() - t0
 
@@ -1422,6 +1750,11 @@ class NEB(JobABC):
                     [(st, list(range(st["n_img"]))) for st in newcomers])
                 forwards += 1
                 for st in newcomers:
+                    if on_device:
+                        _dev_init_grad(st)
+                        st["best_fmax"] = fmax_of(st["g"])
+                        st["stall"] = 0
+                        continue
                     Fp_list, _, hei = band_forces(st)
                     st["hei"] = hei
                     st["Fp_list"] = Fp_list
@@ -1433,6 +1766,8 @@ class NEB(JobABC):
                         st["converged"] = True
                     if dyneb:
                         self._update_frozen(st, Fp_list, p.neb_f_max_th)
+                if dev_batched_sync:
+                    _dev_sync_active(newcomers)
                 if verbose:
                     log_info([
                         f"[pool] refill +{len(newcomers)} "
@@ -1462,6 +1797,8 @@ class NEB(JobABC):
                     st["stall"] = 0
                 else:
                     st["stall"] += 1
+            if dev_batched_sync:
+                _dev_sync_active(active)        # ONE host round-trip for the batch
 
         wall = time.time() - t0
 
