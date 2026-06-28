@@ -192,6 +192,8 @@ class UMABatchCalc:
         hessian_mode: str = "numerical",
         hessian_chunk_size: Optional[int] = None,
         disable_activation_checkpointing: bool = False,
+        fast_inference: bool = False,
+        compile_model: bool = False,
     ):
         dev = str(device)
         dev = "cuda" if dev.startswith("cuda") else "cpu"
@@ -209,6 +211,18 @@ class UMABatchCalc:
                                     if hessian_chunk_size is not None else None)
         self._disable_ac = bool(disable_activation_checkpointing)
         self._warned_autograd = False   # one-time eSCN double-backward caveat
+        # ---- OPT-IN fast forward (umas_fast_gpu, ACCURACY-PRESERVING subset) ----
+        # default OFF -> string "default" -> byte-identical to the base (oracle).
+        # fast_inference=True flips on the parity-safe speedups of fairchem's turbo
+        # preset but DELIBERATELY KEEPS tf32=False so the fp32 matmul precision is
+        # unchanged: merge_mole (exact fusion of the omol mixture-of-experts into
+        # dense ops) + activation_checkpointing=False (recompute->store, exact, ~2x).
+        # compile_model=True additionally torch.compiles the model graph (numerically
+        # ~1e-6, helps STABLE batch shapes; recompiles when B changes, so off by
+        # default for the shrinking-batch NEB loop). NONE of these change the model
+        # math or the algorithm -- they are kernel/graph optimizations only.
+        self._fast_inference = bool(fast_inference)
+        self._compile_model = bool(compile_model)
 
         # ---- inference settings ------------------------------------------
         # Default path keeps the string "default" -> byte-identical to the base.
@@ -217,9 +231,18 @@ class UMABatchCalc:
         # ~2x speed, parity-safe) OR because the autograd Hessian needs it off
         # (torch.utils.checkpoint reentrancy is incompatible with double-backward).
         _need_ac_off = self._disable_ac or (self.hessian_mode == "autograd")
-        if _need_ac_off and inference_settings_default is not None:
+        if (_need_ac_off or self._fast_inference) and inference_settings_default is not None:
             _isett = inference_settings_default()
             _isett.activation_checkpointing = False
+            if self._fast_inference:
+                # graph speedups only; tf32 stays False (precision unchanged).
+                # NOTE: merge_mole is INCOMPATIBLE with a multi-molecule batch
+                # (fairchem escn_md asserts natoms.numel()==1) -> NOT used here.
+                # activation_checkpointing=False (set above) is the ~2x parity-safe
+                # win; compile=torch.compile (exact ~1e-6) on top, multi-system OK.
+                _isett.merge_mole = False
+                _isett.tf32 = False
+                _isett.compile = bool(self._compile_model)
             self._inference_settings_arg = _isett
         else:
             self._inference_settings_arg = "default"
