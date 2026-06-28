@@ -66,6 +66,12 @@ class CommandControl:
             "debug": False,
             "plumed": "",   # PLUMED enhanced-sampling input file; empty = off
             "colvars": "",  # Colvars (eABF/ABF) input file; empty = off
+            # --- Optional energy-minimization (EM) pre-stage (GROMACS-style) ---
+            # em selects the pre-MD minimizer; reuses opt-task sd/cg/lbfgs.
+            "em": "off",          # off / steep / cg / lbfgs
+            "emtol": 0.02,        # EM force-convergence threshold (Eh/Ang, MAPLE-native)
+            "emstep": 0.1,        # EM max displacement per step (Ang)
+            "em_maxsteps": 200,   # EM max iterations
         },
     }
 
@@ -794,6 +800,34 @@ class CommandControl:
                 raise ValueError(msg)
 
     @classmethod
+    def _validate_em(cls, params: Dict[str, Any], output_path: Optional[str]) -> None:
+        """Validate optional EM pre-stage keys for MD tasks."""
+        em = params.get("em", "off")
+        if not isinstance(em, str):
+            cls._log_error(output_path, "MD em must be one of: off, steep, cg, lbfgs.")
+            raise ValueError("MD em must be one of: off, steep, cg, lbfgs.")
+        em_norm = em.strip().lower()
+        params["em"] = em_norm
+        allowed_em = {"off", "steep", "cg", "lbfgs"}
+        if em_norm not in allowed_em:
+            cls._log_error(output_path, f"MD em '{em}' not supported. Choose from: {sorted(allowed_em)}.")
+            raise ValueError(f"MD em '{em}' not supported. Choose from: {sorted(allowed_em)}.")
+        if em_norm == "off":
+            return
+        for key in ("emtol", "emstep"):
+            val = params.get(key)
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                cls._log_error(output_path, f"MD {key} must be a positive number.")
+                raise ValueError(f"MD {key} must be a positive number.")
+            if val <= 0:
+                cls._log_error(output_path, f"MD {key} must be > 0.")
+                raise ValueError(f"MD {key} must be > 0.")
+        maxsteps = params.get("em_maxsteps")
+        if isinstance(maxsteps, bool) or not isinstance(maxsteps, int) or maxsteps <= 0:
+            cls._log_error(output_path, "MD em_maxsteps must be a positive integer.")
+            raise ValueError("MD em_maxsteps must be a positive integer.")
+
+    @classmethod
     def _validate(cls, params: Dict[str, Any], task: str, output_path: Optional[str]) -> None:
         model = params.get("model")
         # Calculator names and class-declared model_options are registry-owned:
@@ -846,6 +880,7 @@ class CommandControl:
             if ensemble not in allowed:
                 cls._log_error(output_path, f"MD ensemble '{ensemble}' not supported.")
                 raise ValueError(f"MD ensemble '{ensemble}' not supported. Choose from: {sorted(allowed)}")
+            cls._validate_em(params, output_path)
         elif "ensemble" in params:
             cls._log_error(output_path, f"'ensemble' is only valid for MD tasks, not '{task}'.")
             raise ValueError(f"'ensemble' is only valid for MD tasks, not '{task}'.")
