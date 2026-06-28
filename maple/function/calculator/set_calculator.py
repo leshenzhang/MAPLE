@@ -45,6 +45,8 @@ _BUILTIN_NAME_TO_MODULE = {
     'macepolm': 'maple.function.calculator.mace._macepol_calculator',
     'macepoll': 'maple.function.calculator.mace._macepol_calculator',
     'uma': 'maple.function.calculator.uma._uma_calculator',
+    'mace-mp-0': 'maple.function.calculator.mace._mace_mp_calculator',
+    'macemp0': 'maple.function.calculator.mace._mace_mp_calculator',
 }
 
 
