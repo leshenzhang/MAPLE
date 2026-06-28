@@ -57,8 +57,12 @@ class BatchLBFGS:
                  device: str = "cuda",
                  write_traj: bool = False,
                  traj_every: int = 1,
-                 verbose: int = 1):
-        
+                 verbose: int = 1,
+                 precon: Optional[str] = None,
+                 precon_exp_A: float = 3.0,
+                 precon_exp_rcut_mult: float = 2.0,
+                 precon_stabilize: float = 0.1):
+
         self.memory = memory
         self.curvature = curvature
         self.maxstep = maxstep
@@ -67,7 +71,30 @@ class BatchLBFGS:
         self.write_traj = write_traj
         self.traj_every = traj_every
         self.verbose = verbose
-        
+
+        # ---- OPT-IN preconditioner (default None = current oracle, byte-identical).
+        # When set ('exp' or 'lindh') the L-BFGS initial inverse-Hessian H_0^{-1} in
+        # the two-loop recursion is replaced by a cheap geometry-only preconditioner
+        # P^{-1} (P approximates the Hessian), dropping the effective condition number
+        # -> far fewer steps on large/floppy minimizations (gain ~sqrt(N)). P is built
+        # from geometry ONLY -> ZERO extra MLIP forwards. The L-BFGS (s, y) history is
+        # preconditioner-independent, so only H_0 changes: the stationary point (g=0)
+        # is IDENTICAL to the oracle; only the path (condition number) changes.
+        #   Refs: Packwood, Kermode, Mones, Bernstein, Woolley, Gould, Ortner, Csanyi,
+        #   J. Chem. Phys. 144, 164109 (2016), DOI 10.1063/1.4947024 (Exp precon);
+        #   Lindh, Bernhardsson, Karlstrom, Malmqvist, Chem. Phys. Lett. 241, 423
+        #   (1995), DOI 10.1016/0009-2614(95)00646-L (Lindh model Hessian, reused from
+        #   ts/algorithm/initial_hessian.py); ASE PreconLBFGS.
+        self._precon_mode = (str(precon).lower() if precon is not None else None)
+        if self._precon_mode not in (None, "exp", "lindh"):
+            raise ValueError(
+                f"precon must be None | 'exp' | 'lindh', got {precon!r}")
+        self._precon_exp_A = float(precon_exp_A)
+        self._precon_exp_rcut_mult = float(precon_exp_rcut_mult)
+        self._precon_stab = float(precon_stabilize)
+        # (B, nmax, nmax) batched lower-Cholesky factor of P, or None when disabled.
+        self._precon_L = None
+
         self.output = os.path.abspath(output)
         self.out_dir = os.path.dirname(self.output) or "."
         os.makedirs(self.out_dir, exist_ok=True)
@@ -271,21 +298,42 @@ class BatchLBFGS:
         # Reverse alpha_list for forward pass
         alpha_list = list(reversed(alpha_list))
 
-        # Initial Hessian approximation
+        # Initial Hessian approximation H_0^{-1}.
+        #
+        # Default (no preconditioner): H_0^{-1} = gamma * I with the standard
+        # Oren-Luenberger scalar gamma = (y^T s)/(y^T y)  -- ORACLE PATH, unchanged.
+        #
+        # OPT-IN preconditioner: H_0^{-1} = gamma * P^{-1}, P = geometry-only Hessian
+        # model (exp/Lindh) factored once per topology. gamma is the *preconditioned*
+        # Oren-Luenberger refinement gamma = (y^T s)/(y^T P^{-1} y) (-> 1 when P
+        # matches the true Hessian); the no-history seed is gamma=1 because P is
+        # normalized to carry the 1/curvature scale itself.
+        precon_on = self._precon_L is not None
         if num_history > 0:
-            # gamma = (y^T s) / (y^T y)
+            # gamma = (y^T s) / (y^T y)   [precon: (y^T s)/(y^T P^{-1} y)]
             s_last = self.S_history[-1]
             y_last = self.Y_history[-1]
             valid_last = self.history_valid[:, -1]
-            
-            ys = (y_last * s_last).sum(dim=-1)
-            yy = (y_last * y_last).sum(dim=-1)
-            gamma = ys / (yy + 1e-20)
-            gamma = torch.where(valid_last, gamma, torch.ones_like(gamma) / self.curvature)
-        else:
-            gamma = torch.full((B,), 1.0 / self.curvature, dtype=DTYPE, device=device)
 
-        z = gamma.unsqueeze(-1) * q
+            ys = (y_last * s_last).sum(dim=-1)
+            if precon_on:
+                ypy = (y_last * self._apply_pinv(y_last)).sum(dim=-1)
+                gamma = ys / (ypy + 1e-20)
+                gamma = torch.where(valid_last, gamma, torch.ones_like(gamma))
+            else:
+                yy = (y_last * y_last).sum(dim=-1)
+                gamma = ys / (yy + 1e-20)
+                gamma = torch.where(valid_last, gamma, torch.ones_like(gamma) / self.curvature)
+        else:
+            if precon_on:
+                gamma = torch.ones((B,), dtype=DTYPE, device=device)
+            else:
+                gamma = torch.full((B,), 1.0 / self.curvature, dtype=DTYPE, device=device)
+
+        if precon_on:
+            z = gamma.unsqueeze(-1) * self._apply_pinv(q)
+        else:
+            z = gamma.unsqueeze(-1) * q
 
         # Forward pass through history (oldest first)
         for t in range(num_history):
@@ -303,6 +351,131 @@ class BatchLBFGS:
             z = z + s_t * (alpha_t - beta).unsqueeze(-1)
 
         return -z
+
+    # ===================================================
+    # PRECONDITIONER (OPT-IN; default path never reaches here)
+    # ===================================================
+    def _apply_pinv(self, v: torch.Tensor) -> torch.Tensor:
+        """Apply P^{-1} to a (B, nmax) batch via the cached Cholesky factor of P.
+
+        P is block-diagonal (a real SPD (3n_i x 3n_i) block + curvature*I on the pad
+        DOFs); v is 0 on the pad DOFs (gradients are real-masked), so the pad solve
+        returns 0 and the real DOFs get the exact preconditioner solve. Fully
+        batched over B via ``torch.cholesky_solve`` (NO MLIP forward)."""
+        sol = torch.cholesky_solve(v.unsqueeze(-1), self._precon_L).squeeze(-1)
+        return sol * self._real_mask.to(sol.dtype)
+
+    def _build_precon(self, atoms_list):
+        """(Re)build the per-structure preconditioner P and cache its Cholesky factor.
+
+        No-op (sets ``_precon_L=None``) when ``precon`` is disabled -> the default
+        optimizer path is byte-identical to the oracle. Otherwise P (B, nmax, nmax)
+        is assembled from the CURRENT geometry by either the Lindh model Hessian
+        (reused verbatim from ts/algorithm/initial_hessian.py) or the exponential
+        (Packwood-Csanyi) graph-Laplacian model, then per structure:
+          (i)  symmetrized;
+          (ii) stabilized -- add ``stab * mean(diag) * I`` on the real block to lift
+               the translational/rotational null space so the block is SPD;
+          (iii)normalized so the real-DOF diagonal mean == ``curvature`` -- this makes
+               P^{-1} carry the SAME 1/curvature scale as the unpreconditioned
+               H_0^{-1}=I/curvature seed, so only the *conditioning* (off-diagonal
+               structure), not the step magnitude, is changed;
+          (iv) pad DOFs set to ``curvature * I`` (decoupled; gradients are 0 there).
+        Built once per topology (run start + each batch shrink); the inner per-
+        structure assembly loop is acceptable (validation batches are small, matching
+        the Lindh builder's own per-structure loop), while the hot per-iteration
+        apply (``_apply_pinv``) is fully batched."""
+        if self._precon_mode is None:
+            self._precon_L = None
+            return
+        device = self.device
+        B, nmax = self._B, self._nmax
+        if B == 0 or nmax == 0:
+            self._precon_L = None
+            return
+
+        if self._precon_mode == "lindh":
+            from maple.function.dispatcher.ts.algorithm.initial_hessian import (
+                lindh_initial_hessian,
+            )
+            P = lindh_initial_hessian(atoms_list, nmax, device, dtype=DTYPE)
+        else:  # "exp"
+            P = self._build_exp_precon(atoms_list, nmax)
+
+        eye_n = torch.eye(nmax, dtype=DTYPE, device=device)
+        stab = self._precon_stab
+        curv = float(self.curvature)
+        diag_idx = torch.arange(nmax, device=device)
+        for b, at in enumerate(atoms_list):
+            L = 3 * len(at)
+            Pb = P[b]
+            if L < nmax:                       # kill any real<->pad coupling
+                Pb[L:, :] = 0.0
+                Pb[:, L:] = 0.0
+            if L == 0:
+                Pb[diag_idx, diag_idx] = curv
+                continue
+            sub = 0.5 * (Pb[:L, :L] + Pb[:L, :L].t())
+            dmean = sub.diagonal().mean().clamp(min=1e-12)
+            sub = sub + (stab * dmean) * eye_n[:L, :L]
+            sub = sub * (curv / sub.diagonal().mean().clamp(min=1e-12))
+            Pb[:L, :L] = sub
+            if L < nmax:                       # pad block = curvature * I
+                Pb[diag_idx[L:], diag_idx[L:]] = curv
+        self._precon_L = self._batched_cholesky(P, curv)
+
+    def _build_exp_precon(self, atoms_list, nmax) -> torch.Tensor:
+        """Exponential (Packwood-Csanyi) preconditioner as an isotropic graph
+        Laplacian, padded to (B, nmax, nmax).
+
+        For each structure: pairwise distances r_ij; nearest-neighbour distance
+        r_nn = min positive r; coupling c_ij = exp(-A (r_ij/r_nn - 1)) zeroed beyond
+        r_cut = rcut_mult * r_nn and on the diagonal; graph Laplacian L = diag(sum_j
+        c) - c (PSD, single translational null space lifted later by the common
+        stabilizer); expanded isotropically to 3N via the Kronecker product
+        ``L (x) I_3``. Geometry-only. DOI 10.1063/1.4947024."""
+        device = self.device
+        B = len(atoms_list)
+        A = self._precon_exp_A
+        rcut_mult = self._precon_exp_rcut_mult
+        P = torch.zeros((B, nmax, nmax), dtype=DTYPE, device=device)
+        for b, at in enumerate(atoms_list):
+            N = len(at)
+            if N == 0:
+                continue
+            Ldof = 3 * N
+            pos = torch.tensor(np.asarray(at.get_positions(), dtype=np.float64),
+                               dtype=DTYPE, device=device)          # (N,3)
+            d = pos.unsqueeze(0) - pos.unsqueeze(1)                  # (N,N,3)
+            r = d.norm(dim=-1)                                       # (N,N)
+            eye = torch.eye(N, dtype=torch.bool, device=device)
+            r_nn = r.masked_fill(eye, float("inf")).min().clamp(min=1e-6)
+            r_cut = rcut_mult * r_nn
+            C = torch.exp(-A * (r / r_nn - 1.0))                     # (N,N)
+            C = C.masked_fill(eye, 0.0).masked_fill(r > r_cut, 0.0)
+            Lap = torch.diag(C.sum(dim=1)) - C                       # (N,N) PSD
+            # isotropic 3N expansion: kron(Lap, I_3)
+            Lap3 = Lap.repeat_interleave(3, dim=0).repeat_interleave(3, dim=1)
+            comp = torch.arange(Ldof, device=device) % 3
+            iso = (comp.unsqueeze(0) == comp.unsqueeze(1)).to(DTYPE)
+            P[b, :Ldof, :Ldof] = Lap3 * iso
+        return P
+
+    @staticmethod
+    def _batched_cholesky(P: torch.Tensor, scale: float) -> torch.Tensor:
+        """Batched lower-Cholesky factor of an SPD batch, with a diagonal-jitter
+        fallback for numerical safety (the assembled P is SPD by construction)."""
+        n = P.shape[-1]
+        eye = torch.eye(n, dtype=P.dtype, device=P.device)
+        base = max(float(scale), 1.0) * 1e-10
+        jit = 0.0
+        for _ in range(8):
+            try:
+                return torch.linalg.cholesky(P if jit == 0.0 else P + jit * eye)
+            except Exception:
+                jit = base if jit == 0.0 else jit * 10.0
+        d = P.diagonal(dim1=-2, dim2=-1).clamp(min=base)
+        return torch.linalg.cholesky(torch.diag_embed(d))
 
     # ===================================================
     # STEP CLIPPING
@@ -449,6 +622,11 @@ class BatchLBFGS:
         self._dp_rms_th = torch.tensor(
             [getattr(at, "dp_rms_th", 5e-4) for at in atoms_list],
             dtype=DTYPE, device=device)
+
+        # OPT-IN: (re)build the per-structure preconditioner for the current
+        # topology + geometry. Cheap, geometry-only, no MLIP forward. No-op (sets
+        # _precon_L=None) when precon is disabled, so the default path is untouched.
+        self._build_precon(atoms_list)
 
     def _sync_atoms_from_calc(self, calc, atoms_list):
         with torch.no_grad():
