@@ -98,6 +98,14 @@ class MACEMPCalculator(CalcABC):
                 model=mace_model, device=dev, default_dtype='float64',
             )
 
+        # Expose the MLIP receptive-field radius (graph edge cutoff) so the
+        # MD box-size preflight guard can enforce the minimum-image criterion.
+        # The upstream periodic MACECalculator stores it as ``r_max``.
+        try:
+            self.r_max = float(self._mace.r_max)
+        except (AttributeError, TypeError, ValueError):
+            self.r_max = None
+
         self.overwrite = overwrite
         self.hessian = 'numerical'
         self.implicit_solv_init(implicit=implicit, solvent=solvent)

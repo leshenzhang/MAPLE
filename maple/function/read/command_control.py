@@ -72,6 +72,7 @@ class CommandControl:
             "posres_fc": 0.0,      # restraint force constant, Ha/Å² (GROMACS 1000 kJ/mol/nm² ≈ 3.81e-3)
             "posres_group": "heavy",  # restrained atoms: all / heavy / explicit "0,1,5-10"
             "posres_ramp": "",     # descending k schedule (Ha/Å²), e.g. "4e-3,2e-3,5e-4,0"; empty = constant fc
+            "box_check": "strict",  # minimum-image box guard: strict|warn|off
         },
     }
 

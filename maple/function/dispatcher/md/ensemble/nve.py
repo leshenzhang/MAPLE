@@ -37,6 +37,7 @@ from ..constraints import build_constraint_manager
 
 
 from ..bias import maybe_wrap_bias
+from ..box_guard import check_box_size, composition_sanity
 
 
 @dataclass
@@ -185,6 +186,14 @@ class NVEParams:
     constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
     constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
 
+    # ------------------------------------------------------------------
+    # box_check: minimum-image box-size guard severity (strict|warn|off).
+    # strict (default) = GROMACS-style fatal abort when the shortest periodic
+    # box width drops below 2*r_max (the MLIP receptive field); warn = log and
+    # continue; off = disable. Only acts for PBC calculators (finite r_max).
+    # ------------------------------------------------------------------
+    box_check:       str   = "strict"
+
 
 class NVE(JobABC):
     """
@@ -216,6 +225,14 @@ class NVE(JobABC):
         # [TASK#9 constraints] frozen constraint set (None if constraints=none)
         self._constraints = build_constraint_manager(self.atoms, self.params)
         self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        # --- GROMACS-grompp-style physical preflight (box size + composition) ---
+        # Reject a periodic box shorter than 2*r_max (MLIP receptive field),
+        # which would cause silent minimum-image self-interaction. Self-skips
+        # for non-PBC calculators. See dispatcher/md/box_guard.py.
+        check_box_size(self.atoms, self.atoms.calc, self.params.box_check,
+                       context="NVE setup preflight")
+        composition_sanity(self.atoms, self.atoms.calc, self.params.box_check,
+                           context="NVE setup preflight")
 
         # Initialize components
         self.logger = MDLogger(
