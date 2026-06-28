@@ -62,6 +62,9 @@ from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
 
 
+from ..bias import maybe_wrap_bias
+
+
 @dataclass
 class NPTParams:
     """
@@ -182,6 +185,8 @@ class NPTParams:
     remove_angular:   bool  = False  # initialization-only COM + rotation; parallel to remove_com
     remove_com_every: int   = 100    # runtime-only COM removal
     remove_angular_every: int = 0    # runtime-only COM + rotation; parallel to remove_com_every
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
     random_seed: Optional[int] = None
 
 
@@ -228,6 +233,7 @@ class NPT(JobABC):
 
         self.atoms = atoms
         self.params = self._init_params(NPTParams, paras, ("md", "MD", "npt", "NPT"))
+        maybe_wrap_bias(self.atoms, self.params, output)
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(

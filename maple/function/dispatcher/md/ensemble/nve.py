@@ -35,6 +35,9 @@ from ..utils import (
 from ..logger import MDLogger
 
 
+from ..bias import maybe_wrap_bias
+
+
 @dataclass
 class NVEParams:
     """
@@ -166,6 +169,8 @@ class NVEParams:
     # ------------------------------------------------------------------
     remove_com_every: int = 0       # runtime-only COM projection cadence; default disabled for strict NVE
     remove_angular_every: int = 0   # runtime-only angular projection cadence (includes COM first)
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
 
     # ------------------------------------------------------------------
     # Random seed
@@ -199,6 +204,7 @@ class NVE(JobABC):
 
         # Initialize params from dict
         self.params = self._init_params(NVEParams, paras, ("md", "MD", "nve", "NVE"))
+        maybe_wrap_bias(self.atoms, self.params, output)
 
         # Initialize components
         self.logger = MDLogger(

@@ -64,6 +64,8 @@ class CommandControl:
             "mdp": None,
             "traj_format": "xyz",
             "debug": False,
+            "plumed": "",   # PLUMED enhanced-sampling input file; empty = off
+            "colvars": "",  # Colvars (eABF/ABF) input file; empty = off
         },
     }
 

@@ -68,6 +68,9 @@ def _apply_projection_with_work(
     return projected, projection, kinetic_after - kinetic_before
 
 
+from ..bias import maybe_wrap_bias
+
+
 @dataclass
 class NVTParams:
     """
@@ -202,6 +205,8 @@ class NVTParams:
     remove_angular:   bool  = False  # initialization-only COM + rotation; parallel to remove_com
     remove_com_every: int   = 100    # runtime-only COM removal
     remove_angular_every: int = 0    # runtime-only COM + rotation; parallel to remove_com_every
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
     random_seed: Optional[int] = None
 
 
@@ -222,6 +227,7 @@ class NVT(JobABC):
 
         self.atoms = atoms
         self.params = self._init_params(NVTParams, paras, ("md", "MD", "nvt", "NVT"))
+        maybe_wrap_bias(self.atoms, self.params, output)
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(
