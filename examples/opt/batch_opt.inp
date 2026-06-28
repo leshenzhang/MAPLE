@@ -1,0 +1,11 @@
+#model=uma(size=uma-s-1p1)
+#opt()
+#device=gpu0
+
+XYZ 0 1 batch_mol0.xyz
+
+XYZ 0 1 batch_mol1.xyz
+
+XYZ 0 1 batch_mol2.xyz
+
+XYZ 0 1 batch_mol3.xyz

@@ -1,9 +1,109 @@
+import os
 from typing import List, Union
 
 from ase import Atoms
 from ..utility import Molecules
 
 from maple.function.timer import timer
+
+
+# ====================================================================== #
+# OPT-IN GPU-batched calc acquisition (Task: ai-maple-gpu dispatch wiring)
+#
+# The single-structure job paths keep using the per-Atoms ASE calculator the
+# engine attaches (the oracle). When a job is submitted with a list/Molecules,
+# the batched optimizers / saddle searchers / LQA-IRC need a *batched*
+# calculator implementing the (prepare / get_ef_gpu [+ get_efh_gpu] /
+# set_coords_ / step_cart_ / backup_coords) contract. These module-level
+# helpers resolve that batched calc, mirroring scan._resolve_batched_calc and
+# sp._get_batch_calc. They live here so dispatcher.py, optimization.py, ts/ts.py
+# and irc/irc.py share ONE acquisition path. Torch / fairchem imports stay lazy
+# (inside the functions) so importing this module pulls no torch.
+# ====================================================================== #
+def batch_device_str(params) -> str:
+    """Map a job's device setting to the 'cuda'|'cpu' token the batched calc /
+    optimizers expect. Honors an explicit ``params['batch_device']``; else
+    derives from ``params['device']`` ('gpu*'/'cuda*' -> cuda when available)."""
+    import torch
+    dev = str(params.get("batch_device") or params.get("device") or "").lower()
+    if dev.startswith("gpu") or dev.startswith("cuda") or dev in ("", "auto"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return "cpu"
+
+
+def _is_batch_calc(calc) -> bool:
+    """Duck-typed test: a batched calculator exposes prepare() + get_ef_gpu()."""
+    return (calc is not None
+            and callable(getattr(calc, "prepare", None))
+            and callable(getattr(calc, "get_ef_gpu", None)))
+
+
+def _uma_task(params, attached_calc=None) -> str:
+    """Resolve the UMA task for the batched calc: explicit model_options['task'],
+    else the single calc's task_name, else 'omol'."""
+    task = (params.get("model_options") or {}).get("task")
+    if task:
+        return str(task).lower()
+    task = getattr(attached_calc, "task_name", None)
+    return str(task).lower() if task else "omol"
+
+
+def _derive_uma_checkpoint_path(params, attached_calc=None):
+    """Locate the UMA .pt the engine's single calc uses, so the batched calc
+    loads the IDENTICAL model. Mirrors SetCalculator/UMACalculator resolution:
+    explicit checkpoint_path/model_path, else local '<calculator>/model/<size>.pt'.
+    Returns None for non-UMA models (caller raises a clear error)."""
+    model = str(params.get("model") or "").lower()
+    mo = params.get("model_options") or {}
+    ckpt = mo.get("checkpoint_path") or mo.get("model_path")
+    if ckpt and os.path.isfile(str(ckpt)):
+        return str(ckpt)
+    is_uma = "uma" in model or (
+        attached_calc is not None
+        and type(attached_calc).__name__ == "UMACalculator")
+    if not is_uma:
+        return None
+    from pathlib import Path
+    import maple.function.calculator as _calcpkg
+    size = str(mo.get("size") or "uma-s-1p1").lower()
+    cand = Path(_calcpkg.__file__).parent / "model" / f"{size}.pt"
+    return str(cand) if cand.exists() else None
+
+
+def resolve_batched_calc(params, atoms_list, attached_calc=None):
+    """Return a GPU-batched calculator for an OPT-IN batched (list/Molecules) job.
+
+    Resolution order (first hit wins):
+      1. ``params['batched_calc']``        -- a pre-built batched calc instance.
+      2. ``attached_calc`` already batch-capable (duck-typed prepare+get_ef_gpu),
+         e.g. a UMABatchCalc someone attached by hand (the sp pattern).
+      3. ``params['batch_model_path']``    -- build a UMABatchCalc from the .pt.
+      4. derive a UMABatchCalc from the SAME UMA checkpoint the engine's single
+         calculator already uses, so a plain '#model=uma(...)' multi-structure
+         job needs NO extra params (the normal job-interface path).
+    """
+    calc = params.get("batched_calc")
+    if calc is not None:
+        return calc
+    if _is_batch_calc(attached_calc):
+        return attached_calc
+    model_path = params.get("batch_model_path") or _derive_uma_checkpoint_path(
+        params, attached_calc)
+    if not model_path:
+        raise ValueError(
+            "Batched (list/Molecules) job needs a batched calculator. Provide "
+            "params['batched_calc'] or params['batch_model_path'], attach a "
+            "batch-capable calculator, or use '#model=uma(...)' so the batched "
+            "UMA checkpoint is auto-resolved from the local model directory.")
+    import torch
+    from ..calculator.uma._uma_batch_calculator import UMABatchCalc
+    return UMABatchCalc(
+        str(model_path),
+        device=batch_device_str(params),
+        dtype=params.get("batch_dtype", torch.float64),
+        task=params.get("batch_task") or _uma_task(params, attached_calc),
+    )
+
 
 class Dispatcher():
     def __init__(self):
@@ -27,8 +127,8 @@ class Dispatcher():
         if jobtype == 'opt':
             from .optimization import Optimization
 
-            if isinstance(atoms, (list, Molecules)):
-                raise NotImplementedError('For optimization job, only one Atoms object is allowed.')
+            # OPT-IN batched optimization: a list/Molecules routes to a batched
+            # optimizer inside Optimization.run(); a single Atoms is UNCHANGED.
             opt = Optimization(output=output, atoms=atoms, params=commandcontrol.params)
             opt.run()
             
@@ -75,31 +175,42 @@ class Dispatcher():
         elif jobtype == 'ts':
             from .ts import TransitionState
             
-            # TS job allows Molecules object for methods like NEB, STRING
+            # TS job allows a Molecules/list for multi-structure methods.
             if isinstance(atoms, (list, Molecules)):
                 method = commandcontrol.params.get('method')
                 if method in ['neb', 'string', 'autoneb']:
-                    # Convert Molecules to its internal list if needed
+                    # NEB/String/AutoNEB consume the band: pass the internal list.
                     atoms_input = atoms.multiatoms if isinstance(atoms, Molecules) else atoms
                     ts = TransitionState(output=output, atoms=atoms_input, method=method, params=commandcontrol.params)
                     ts.run()
                     return
-                elif method == 'prfo':
-                    raise NotImplementedError('For transition state search job with PRFO method, only one Atoms object is allowed.')
+                elif method in ('prfo', 'dimer'):
+                    # OPT-IN batched saddle search over the B structures
+                    # (BatchPRFO / BatchDimer). Single-Atoms path UNCHANGED below.
+                    ts = TransitionState(output=output, atoms=atoms, method=method, params=commandcontrol.params)
+                    ts.run()
+                    return
                 else:
                     raise ValueError(f'Unknown TS method: {method}')
 
-            # Single Atoms object
+            # Single Atoms object (oracle path, unchanged)
             ts = TransitionState(output=output, atoms=atoms, method=commandcontrol.params.get('method'), params=commandcontrol.params)
             ts.run()
         
         elif jobtype == 'irc':
             from .irc import IRC
 
+            method = commandcontrol.params.get('method')
             if isinstance(atoms, (list, Molecules)):
-                raise NotImplementedError('For IRC job, only one Atoms object is allowed.')
-            irc = IRC(output=output, atoms=atoms, method=commandcontrol.params.get('method'), params=commandcontrol.params)
-            irc.run()
+                # OPT-IN batched IRC (LQA only). Single-Atoms path UNCHANGED.
+                if method != 'lqa':
+                    raise NotImplementedError(
+                        f"Batched IRC (list/Molecules) supports method 'lqa' only; got {method!r}.")
+                irc = IRC(output=output, atoms=atoms, method=method, params=commandcontrol.params)
+                irc.run()
+            else:
+                irc = IRC(output=output, atoms=atoms, method=method, params=commandcontrol.params)
+                irc.run()
 
         elif jobtype == 'md':
             from .md.ensemble.nve import NVE
