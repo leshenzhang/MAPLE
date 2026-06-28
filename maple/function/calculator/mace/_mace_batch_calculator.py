@@ -254,6 +254,53 @@ class MACEBatchCalc:
         return F_flat.view(B, self.nmax_dof)
 
     # =====================================================================
+    # partial-Hessian (movable-atom subspace) helpers -- mirror UMABatchCalc
+    # =====================================================================
+    def _resolve_movable(self, movable_masks):
+        """Per-structure list[int] of atom indices whose DOFs are perturbed.
+        None = all atoms; per-structure None/bool-mask/index-list otherwise. Frozen
+        atoms still appear in every forward (they exert forces); only their Hessian
+        rows/cols are omitted (exact FixAtoms-constrained PES block). Mirrors
+        UMABatchCalc._resolve_movable so all backends agree."""
+        B = self._atoms_B
+        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
+        if movable_masks is None:
+            return [list(range(n_b[b])) for b in range(B)]
+        out = []
+        for b in range(B):
+            m = movable_masks[b]
+            if m is None:
+                out.append(list(range(n_b[b])))
+                continue
+            m_arr = np.asarray(m)
+            if m_arr.dtype == bool:
+                out.append([int(i) for i in np.nonzero(m_arr)[0]])
+            else:
+                idxs = [int(i) for i in m_arr.reshape(-1)]
+                assert all(0 <= a < n_b[b] for a in idxs), (
+                    f"movable index out of range for structure {b} "
+                    f"(n_atoms={n_b[b]}): {idxs}")
+                out.append(idxs)
+        return out
+
+    def _movable_tensors(self, movable_masks):
+        """Return (movable_atom (N,) bool, movable_la (B,nmax_a) bool). Both all-True
+        within each structure's real-atom range when movable_masks is None, so the
+        seeded loop reduces byte-identically to the full Hessian."""
+        N, B, nmax_a = self.N_atoms, self._atoms_B, self.Nmax_atoms
+        device = self.device
+        mov = self._resolve_movable(movable_masks)
+        movable_atom = torch.zeros(N, dtype=torch.bool, device=device)
+        movable_la = torch.zeros((B, nmax_a), dtype=torch.bool, device=device)
+        ptr = self._ptr.tolist()
+        for i in range(B):
+            base = ptr[i]
+            for a in mov[i]:
+                movable_atom[base + a] = True
+                movable_la[i, a] = True
+        return movable_atom, movable_la
+
+    # =====================================================================
     def get_ef_gpu(self):
         B = self._atoms_B
         device, dtype = self.device, self.dtype
@@ -264,7 +311,13 @@ class MACEBatchCalc:
         F_eV = self._scatter_forces(F_all_eV.detach().to(dtype))
         return (E_eV.detach() * EV2HARTREE, F_eV * EV2HARTREE)
 
-    def get_efh_gpu(self):
+    def get_efh_gpu(self, movable_masks=None):
+        """Energy + forces + per-structure Hessian. ``movable_masks`` (mirrors
+        UMABatchCalc): None = full Hessian (byte-identical current behavior); a
+        per-structure spec restricts the perturbed/responding DOFs to a movable-atom
+        subspace -> only movable rows/cols filled, frozen atoms still exert forces
+        (exact FixAtoms-constrained block). Applies to both the seeded analytic and
+        the FD fallback path identically."""
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
@@ -279,10 +332,10 @@ class MACEBatchCalc:
                 self._hess_mode = 'fd'
         if self._hess_mode == 'analytic':
             try:
-                return self._efh_analytic()
+                return self._efh_analytic(movable_masks)
             except Exception:
                 self._hess_mode = 'fd'
-        return self._efh_fd()
+        return self._efh_fd(movable_masks=movable_masks)
 
     def isolation_check(self, perturb: float = 0.05) -> float:
         """Perturb-one byte-isolation probe: returns max cross-molecule force leak (Ha/A).
@@ -301,7 +354,7 @@ class MACEBatchCalc:
     # =====================================================================
     # seeded block-diagonal analytic Hessian (mirror AIMNet2) / FD fallback
     # =====================================================================
-    def _efh_analytic(self):
+    def _efh_analytic(self, movable_masks=None):
         B, device, dtype = self._atoms_B, self.device, self.dtype
         N, nmax, nmax_a = self.N_atoms, self.nmax_dof, self.Nmax_atoms
         E_eV, F_all_eV, coord_leaf = self._forward_ef_(self.coord, need_graph=True)
@@ -309,9 +362,13 @@ class MACEBatchCalc:
         F_eV = self._scatter_forces(F_all_eV.to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
+        # movable subspace: movable_la[:,a]=structure has movable atom a; movable_atom
+        # gates the response rows. Both reduce to the full set when movable_masks=None.
+        movable_atom, movable_la = self._movable_tensors(movable_masks)
+        row_scale = movable_atom[:, None].to(dtype)
         for k in range(3 * nmax_a):
             a_local, c = k // 3, k % 3
-            valid = (n_b > a_local)
+            valid = movable_la[:, a_local]          # was (n_b > a_local); == it when None
             if not bool(valid.any()):
                 continue
             rows = s[valid] + a_local
@@ -319,6 +376,7 @@ class MACEBatchCalc:
             go[rows, c] = 1.0
             col = torch.autograd.grad(F_all_eV, coord_leaf, grad_outputs=go,
                                       retain_graph=True, create_graph=False)[0].to(dtype)
+            col = col * row_scale                   # zero frozen response rows (no-op when None)
             for i in valid.nonzero(as_tuple=False).flatten().tolist():
                 dof = 3 * n_b_list[i]
                 if k < dof:
@@ -326,7 +384,7 @@ class MACEBatchCalc:
         H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))
         return (E_eV.detach() * EV2HARTREE, F_eV * EV2HARTREE, H_eV * EV2HARTREE, P)
 
-    def _efh_fd(self, delta: float = 2e-3):
+    def _efh_fd(self, delta: float = 2e-3, movable_masks=None):
         B, device, dtype = self._atoms_B, self.device, self.dtype
         nmax, nmax_a = self.nmax_dof, self.Nmax_atoms
         E_eV, F_all_eV, _ = self._forward_ef_(self.coord, need_graph=False)
@@ -335,9 +393,11 @@ class MACEBatchCalc:
         F_eV = self._scatter_forces(F_all_eV.detach().to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
+        movable_atom, movable_la = self._movable_tensors(movable_masks)
+        row_scale = movable_atom[:, None].to(dtype)
         for k in range(3 * nmax_a):
             a_local, c = k // 3, k % 3
-            valid = (n_b > a_local)
+            valid = movable_la[:, a_local]          # was (n_b > a_local); == it when None
             if not bool(valid.any()):
                 continue
             rows = s[valid] + a_local
@@ -345,7 +405,7 @@ class MACEBatchCalc:
             cm = base_coord.clone(); cm[rows, c] -= delta
             _, Fp, _ = self._forward_ef_(cp, need_graph=False)
             _, Fm, _ = self._forward_ef_(cm, need_graph=False)
-            col = (-(Fp - Fm) / (2.0 * delta)).to(dtype)
+            col = ((-(Fp - Fm) / (2.0 * delta)).to(dtype)) * row_scale  # zero frozen rows (no-op None)
             for i in valid.nonzero(as_tuple=False).flatten().tolist():
                 dof = 3 * n_b_list[i]
                 if k < dof:

@@ -373,6 +373,54 @@ class AIMNet2BatchCalc:
         return F_flat.view(B, nmax)
 
     # -------------------------------------------------------------------------
+    # partial-Hessian (movable-atom subspace) helpers -- mirror UMABatchCalc
+    # -------------------------------------------------------------------------
+    def _resolve_movable(self, movable_masks):
+        """Per-structure list[int] of atom indices whose DOFs are perturbed.
+
+        ``movable_masks`` may be None (all atoms of every structure), or a
+        sequence of length B where entry b is None (all atoms of structure b),
+        a bool mask of length n_b, or an explicit list/array of atom indices.
+        Frozen atoms still appear in every forward (they exert forces); only
+        their columns/rows are omitted from the Hessian (the exact second-
+        derivative block of the FixAtoms-constrained PES). Mirrors
+        UMABatchCalc._resolve_movable exactly so the two backends agree.
+        """
+        B = self._atoms_B
+        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
+        if movable_masks is None:
+            return [list(range(n_b[b])) for b in range(B)]
+        out = []
+        for b in range(B):
+            m = movable_masks[b]
+            if m is None:
+                out.append(list(range(n_b[b])))
+                continue
+            m_arr = np.asarray(m)
+            if m_arr.dtype == bool:
+                out.append([int(i) for i in np.nonzero(m_arr)[0]])
+            else:
+                idxs = [int(i) for i in m_arr.reshape(-1)]
+                assert all(0 <= a < n_b[b] for a in idxs), (
+                    f"movable index out of range for structure {b} "
+                    f"(n_atoms={n_b[b]}): {idxs}"
+                )
+                out.append(idxs)
+        return out
+
+    def _movable_atom_mask(self, mov) -> torch.Tensor:
+        """(N,) bool: global atom is movable. ``mov`` = _resolve_movable output.
+        All-True when movable_masks was None (-> full Hessian, byte-identical)."""
+        N = self.N_atoms
+        mask = torch.zeros(N, dtype=torch.bool, device=self.device)
+        ptr = self._ptr.tolist()
+        for i in range(self._atoms_B):
+            base = ptr[i]
+            for a in mov[i]:
+                mask[base + a] = True
+        return mask
+
+    # -------------------------------------------------------------------------
     # forward
     # -------------------------------------------------------------------------
     def _forward_energy_forces_(self, c: torch.Tensor, need_graph: bool):
@@ -447,7 +495,7 @@ class AIMNet2BatchCalc:
         F_eV = self._scatter_forces(F_all_eV)
         return E_eV / EH2EV, F_eV / EH2EV
 
-    def get_efh_gpu(self):
+    def get_efh_gpu(self, movable_masks=None):
         """Energy + forces + per-structure Hessian (batched, padded to nmax).
 
         OPTIMIZED (D-15): seeded block-diagonal analytic Hessian. Column k (local DOF)
@@ -462,6 +510,15 @@ class AIMNet2BatchCalc:
         force scatter are replaced by sync-free vectorized scatters; the seed one-hot is
         built from the precomputed local-atom-index map. Results stay byte-identical to
         _get_efh_gpu_global_ref.
+
+        ``movable_masks`` (mirrors UMABatchCalc.get_efh_gpu): None = full Hessian
+        (current behavior, byte-identical oracle). A per-structure spec (None / bool
+        mask / index list, see _resolve_movable) restricts the perturbed/responding
+        DOFs to a movable-atom subspace: only movable atoms are SEEDED (so frozen
+        columns stay zero -- the block-diagonal seed never lights up a frozen DOF) and
+        only movable RESPONSE rows are scattered (frozen rows zeroed). Frozen atoms
+        still exert forces (they are in every forward), so the returned block is the
+        EXACT (3k x 3k) second-derivative block of the FixAtoms-constrained PES.
         """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
@@ -486,16 +543,26 @@ class AIMNet2BatchCalc:
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         local_atom = self._atom_localidx                # (N,) local atom index per global atom
 
+        # partial-Hessian movable subspace (None -> all atoms -> byte-identical full).
+        mov = self._resolve_movable(movable_masks)
+        movable_atom = self._movable_atom_mask(mov)     # (N,) bool; all-True when None
+        row_scale = movable_atom[:, None].to(dtype)     # (N,1) 0/1 row gate (1.0 when None)
+
         # seeded block-diagonal Hessian: 3*Nmax_atoms backward passes for the WHOLE batch
         for k in range(3 * nmax_a):
             a_local, comp = k // 3, k % 3
-            # one-hot seed: component `comp` set on every global atom whose local
-            # index == a_local (== exactly the structures owning local atom a_local)
+            # one-hot seed: component `comp` set on every MOVABLE global atom whose local
+            # index == a_local (== exactly the structures owning movable local atom a_local).
+            # When movable_masks is None this is identical to (local_atom == a_local).
+            seed = (local_atom == a_local) & movable_atom
+            if not bool(seed.any()):
+                continue                                # frozen/padding column stays zero
             go = torch.zeros((N, 3), dtype=dtype, device=device)
-            go[:, comp] = (local_atom == a_local).to(dtype)
+            go[:, comp] = seed.to(dtype)
             col = torch.autograd.grad(
                 F_all_eV, coord_leaf, grad_outputs=go,
                 retain_graph=True, create_graph=False)[0]   # (N,3); Hessian col = -col (H=-dF/dx)
+            col = col * row_scale                        # zero frozen response rows (no-op when None)
             # scatter -col (N,3) into padded column k for ALL structures at once.
             # invalid structures (k >= dof) write 0 into a padding column -> harmless.
             H_eV[:, :, k] = -self._scatter_forces(col)
