@@ -115,6 +115,14 @@ class Dispatcher():
                     "Provide either 'XYZ <charge> <mult> <path>' or an inline 'charge mult' line before coordinates."
                 )
 
+            # Optional EM pre-stage (reuse opt sd/cg/lbfgs minimizers) BEFORE
+            # the integrator loop.  Skipped on restart/load_state (geometry
+            # then comes from a checkpoint, not a fresh build).
+            md_params = commandcontrol.params
+            if not (md_params.get('restart') or md_params.get('load_state')):
+                from .md.em_prestage import run_em_prestage
+                run_em_prestage(atoms, md_params, output)
+
             ensemble = commandcontrol.params.get('ensemble', 'nve').lower()
             if ensemble == 'nve':
                 md = NVE(output=output, atoms=atoms, paras=commandcontrol.params)
