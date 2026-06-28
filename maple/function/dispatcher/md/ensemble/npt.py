@@ -187,6 +187,10 @@ class NPTParams:
     remove_angular_every: int = 0    # runtime-only COM + rotation; parallel to remove_com_every
     plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
     colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
+    posres:       str   = ""        # GROMACS posres: off / ref-structure path / "initial"; empty = off
+    posres_fc:    float = 0.0       # restraint force constant, Ha/Å²
+    posres_group: str   = "heavy"   # restrained atoms: all / heavy / explicit "0,1,5-10"
+    posres_ramp:  str   = ""        # descending k schedule (Ha/Å²); empty = constant fc
     random_seed: Optional[int] = None
     constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
     constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)

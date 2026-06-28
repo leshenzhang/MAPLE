@@ -172,6 +172,10 @@ class NVEParams:
     remove_angular_every: int = 0   # runtime-only angular projection cadence (includes COM first)
     plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
     colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
+    posres:       str   = ""        # GROMACS posres: off / ref-structure path / "initial"; empty = off
+    posres_fc:    float = 0.0       # restraint force constant, Ha/Å²
+    posres_group: str   = "heavy"   # restrained atoms: all / heavy / explicit "0,1,5-10"
+    posres_ramp:  str   = ""        # descending k schedule (Ha/Å²); empty = constant fc
 
     # ------------------------------------------------------------------
     # Random seed

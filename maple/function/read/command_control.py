@@ -68,6 +68,10 @@ class CommandControl:
             "colvars": "",  # Colvars (eABF/ABF) input file; empty = off
             "constraints": "none",            # none|h-bonds|all-bonds|h-angles (GROMACS-identical)
             "constraint_algorithm": "lincs",  # lincs|shake (velocity-Verlet RATTLE solver)
+            "posres": "",          # GROMACS-style position restraints: off / ref-structure file / "initial"
+            "posres_fc": 0.0,      # restraint force constant, Ha/Å² (GROMACS 1000 kJ/mol/nm² ≈ 3.81e-3)
+            "posres_group": "heavy",  # restrained atoms: all / heavy / explicit "0,1,5-10"
+            "posres_ramp": "",     # descending k schedule (Ha/Å²), e.g. "4e-3,2e-3,5e-4,0"; empty = constant fc
         },
     }
 
