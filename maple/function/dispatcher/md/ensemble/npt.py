@@ -188,6 +188,8 @@ class NPTParams:
     plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
     colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
 
 
 class NPT(JobABC):
@@ -233,6 +235,11 @@ class NPT(JobABC):
 
         self.atoms = atoms
         self.params = self._init_params(NPTParams, paras, ("md", "MD", "npt", "NPT"))
+        if str(getattr(self.params, "constraints", "none") or "none").strip().lower() not in ("", "none"):
+            raise NotImplementedError(
+                "constraints are not yet wired into the NPT barostat loop; "
+                "use ensemble=nvt or ensemble=nve for constrained dynamics."
+            )
         maybe_wrap_bias(self.atoms, self.params, output)
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
