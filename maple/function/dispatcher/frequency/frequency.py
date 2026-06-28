@@ -109,6 +109,25 @@ class FrequencyParams:
     pressure_kpa: float = 101.325
     device: str = "cpu"
 
+    # ---- PARTIAL (PHVA) Hessian over a movable atom subset (opt-in) ----------
+    # Default (all None/False) = FULL 3N Hessian = the unchanged oracle path.
+    # A partial vibrational analysis is triggered when EITHER the atoms carry an
+    # ASE FixAtoms constraint (freeze the environment) OR a movable subset is
+    # passed here. The partial Hessian is the EXACT second-derivative block of
+    # the FixAtoms-constrained PES over the movable DOFs; its frequencies are the
+    # active-subspace normal modes (a TS shows exactly 1 imaginary mode there).
+    partial: bool = False              # force the partial branch (movable = non-frozen)
+    movable: Optional[list] = None     # explicit 0-based movable atom indices
+    hessian_delta: float = 2e-3        # central-FD step (A) for the partial Hessian
+    # Batched-calculator plumbing (mirrors scan._resolve_batched_calc): the
+    # partial Hessian is evaluated through the production batched contract
+    # (prepare + get_ef_gpu). If the attached calc already implements it, it is
+    # used directly; otherwise a prebuilt instance or a model-path build them.
+    batched_calc: object = None        # prebuilt batch calc instance (prepare/get_ef_gpu)
+    batch_model_path: Optional[str] = None
+    batch_device: str = "cuda"
+    batch_task: str = "omol"
+
 @dataclass
 class PrintParams:
     """
@@ -229,6 +248,27 @@ class FrequencyBase(JobABC):
         self.treat_imag_as_real: bool = False
         self._print = PrintParams()
 
+        # ---- PARTIAL (PHVA) state (set by the Frequency driver; defaults = FULL) -
+        # When a partial job is requested, get_hessian() builds the compact
+        # (3m x 3m) movable-subspace Hessian and swaps self.atoms -> the movable
+        # sub-Atoms so compute_frequencies/compute_thermo/_write_* all operate on
+        # the active subspace. The frozen environment anchors the fragment, so the
+        # 6 translation/rotation zero modes are absent -> NO trans/rot projection
+        # and NO gas-phase trans/rot thermochemistry for the partial branch.
+        self._partial_param: bool = False        # FrequencyParams.partial
+        self._movable_param = None               # explicit 0-based movable indices
+        self._hessian_delta: float = 2e-3
+        self._batched_calc = None
+        self._batch_model_path = None
+        self._batch_device: str = "cuda"
+        self._batch_task: str = "omol"
+        # populated by get_hessian() when the partial branch fires
+        self._is_partial: bool = False
+        self._no_trans_rot_projection: bool = False
+        self._movable_indices = None
+        self._partial_atoms = None
+        self._full_atoms = None
+
     # ---------------------- main workflow ----------------------
     def run(self) -> None:
         """
@@ -304,15 +344,27 @@ class FrequencyBase(JobABC):
 
     def get_hessian(self) -> np.ndarray:
         """
-        Retrieve the Cartesian Hessian and fix common shape issues.
+        Retrieve the Cartesian Hessian to diagonalize.
+
+        Routing:
+            * FULL (default, oracle): no FixAtoms and no movable subset requested
+              -> ``calc.get_hessian(atoms)`` (single-structure, 3N x 3N). Unchanged.
+            * PARTIAL (opt-in): FixAtoms on the atoms OR an explicit movable subset
+              -> the compact (3m x 3m) movable-subspace Hessian via the batched
+              finite-difference machinery (production batch calc) or an ASE
+              serial fallback. self.atoms is swapped to the movable sub-Atoms so
+              the downstream frequency/thermo analysis runs on the active subspace.
 
         Returns:
-            np.ndarray: Square Hessian with shape (3N, 3N).
-
-        Raises:
-            RuntimeError: If the calculator lacks `get_hessian`.
-            ValueError: If the Hessian shape does not match (3N, 3N).
+            np.ndarray: (3N, 3N) for the full path, or (3m, 3m) for the partial path.
         """
+        movable = self._resolve_partial_movable()
+        if movable is None:
+            return self._get_full_hessian()
+        return self._get_partial_hessian(movable)
+
+    def _get_full_hessian(self) -> np.ndarray:
+        """Single-structure FULL (3N x 3N) Cartesian Hessian (oracle path)."""
         calc = self.atoms.calc
         if calc is None or not hasattr(calc, "get_hessian"):
             raise RuntimeError("Atom calculator must implement get_hessian method")
@@ -340,6 +392,158 @@ class FrequencyBase(JobABC):
             raise ValueError(f"Hessian shape{hessian.shape}does not match expected{expected_shape}")
 
         return hessian
+
+    # ------------------------------------------------ PARTIAL (PHVA) helpers
+    def _resolve_partial_movable(self):
+        """0-based movable atom indices for a PARTIAL job, or None for the FULL path.
+
+        Opt-in triggers:
+          * explicit ``movable`` indices passed via params (wins), or
+          * ASE FixAtoms on self.atoms (movable = atoms NOT frozen).
+        Returns None (FULL path) when nothing is frozen / every atom is movable,
+        so the default behavior is byte-for-byte unchanged.
+        """
+        from maple.function.dispatcher.hessian.hessian import movable_from_atoms
+
+        n = len(self.atoms)
+        if self._movable_param is not None:
+            mv = sorted({int(i) for i in self._movable_param})
+            if mv and (mv[0] < 0 or mv[-1] >= n):
+                raise ValueError(
+                    f"movable index out of range [0,{n}): {mv}"
+                )
+        else:
+            mv = sorted(movable_from_atoms(self.atoms))  # excludes FixAtoms-frozen
+
+        if len(mv) >= n:
+            return None                      # nothing frozen -> FULL path (oracle)
+        if len(mv) == 0:
+            raise ValueError(
+                "Partial frequency requested but the movable subset is empty "
+                "(every atom is frozen)."
+            )
+        return mv
+
+    def _get_partial_hessian(self, movable) -> np.ndarray:
+        """Compact (3m x 3m) movable-subspace Hessian; swap self.atoms -> sub-Atoms."""
+        m = len(movable)
+        n_total = len(self.atoms)
+        H = self._partial_hessian_matrix(movable)            # numpy (3m, 3m) Ha/A^2
+        H = np.asarray(H, dtype=np.float64)
+        expected = (3 * m, 3 * m)
+        if H.shape != expected:
+            raise ValueError(
+                f"Partial Hessian shape {H.shape} does not match expected {expected}"
+            )
+
+        # Build the movable-only sub-Atoms and route the rest of the analysis at it.
+        self._movable_indices = list(movable)
+        self._partial_atoms = self._make_movable_atoms(movable)
+        self._is_partial = True
+        self._no_trans_rot_projection = True
+        self._full_atoms = self.atoms
+        self.atoms = self._partial_atoms
+
+        self.log_info([
+            f"\nPartial (PHVA) Hessian: {n_total} atoms total, {m} movable, "
+            f"{n_total - m} frozen (FixAtoms environment).\n",
+            f"Active subspace = {3 * m} DOF; trans/rot NOT projected "
+            f"(fragment anchored by the frozen environment).\n",
+        ])
+        return H
+
+    def _partial_hessian_matrix(self, movable) -> np.ndarray:
+        """Compute the compact (3m x 3m) movable-subspace Hessian (Ha/A^2).
+
+        Preferred path = the production BATCHED finite-difference machinery
+        (maple.function.dispatcher.hessian.batched_fd_hessian over the
+        prepare()/get_ef_gpu() contract): the frozen atoms stay in every
+        perturbed replica (they exert forces) while only the movable DOFs are
+        perturbed/extracted -- the EXACT constrained-PES block, enzyme-safe in
+        bounded memory. Fallback for a plain single-structure ASE calculator =
+        the shared numerical_hessian_from_atoms (full 3N, frozen rows/cols zeroed)
+        with the movable block sliced out (single-structure serial path kept).
+        """
+        calc = getattr(self.atoms, "calc", None)
+        bcalc = self._resolve_batched_calc(calc)
+        if bcalc is not None:
+            from maple.function.dispatcher.hessian.hessian import batched_fd_hessian
+            bare = self._bare_atoms(self.atoms)
+            res = batched_fd_hessian(
+                bcalc, [bare], movable_masks=[list(movable)],
+                delta=float(self._hessian_delta),
+            )
+            Hb = res["hessians"][0]
+            if _TORCH_OK and isinstance(Hb, torch.Tensor):
+                return Hb.detach().to(torch.float64).cpu().numpy()
+            return np.asarray(Hb, dtype=np.float64)
+
+        # ---- ASE serial fallback (plain single-structure calculator) ----------
+        if calc is None or not hasattr(calc, "calculate"):
+            raise RuntimeError(
+                "Partial frequency needs either a batched calculator "
+                "(prepare/get_ef_gpu), a params['batched_calc'] / "
+                "params['batch_model_path'], or a single-structure ASE "
+                "calculator exposing calculate()."
+            )
+        from maple.function.calculator.calculator_base import numerical_hessian_from_atoms
+        Hfull = np.asarray(
+            numerical_hessian_from_atoms(calc, self.atoms, float(self._hessian_delta)),
+            dtype=np.float64,
+        )
+        cols = np.array([3 * a + c for a in movable for c in range(3)], dtype=np.int64)
+        return Hfull[np.ix_(cols, cols)]
+
+    def _resolve_batched_calc(self, calc):
+        """Return a calculator implementing the batch contract, or None.
+
+        Priority (mirrors scan._resolve_batched_calc):
+          1. an explicit prebuilt batched calc in params['batched_calc'];
+          2. the attached calc already implements prepare()+get_ef_gpu();
+          3. build a UMABatchCalc from params['batch_model_path'].
+        """
+        if self._batched_calc is not None:
+            return self._batched_calc
+        if (calc is not None
+                and callable(getattr(calc, "prepare", None))
+                and callable(getattr(calc, "get_ef_gpu", None))):
+            return calc
+        if self._batch_model_path is not None:
+            import torch as _torch
+            from maple.function.calculator.uma._uma_batch_calculator import UMABatchCalc
+            return UMABatchCalc(
+                self._batch_model_path,
+                device=self._batch_device,
+                dtype=_torch.float64,
+                task=self._batch_task,
+                hessian_delta=float(self._hessian_delta),
+            )
+        return None
+
+    @staticmethod
+    def _bare_atoms(atoms) -> Atoms:
+        """A constraint/calc-free copy (numbers/positions/info) for replica builds."""
+        return Atoms(
+            numbers=atoms.get_atomic_numbers(),
+            positions=atoms.get_positions(),
+            info=dict(getattr(atoms, "info", {}) or {}),
+        )
+
+    def _make_movable_atoms(self, movable) -> Atoms:
+        """Movable-only sub-Atoms carrying the correct masses/positions/info.
+
+        Used as self.atoms for the partial analysis so get_masses()/get_positions()
+        and the normal-mode writer all refer to the active subspace.
+        """
+        a = self.atoms
+        idx = list(movable)
+        sub = Atoms(
+            numbers=np.asarray(a.get_atomic_numbers())[idx],
+            positions=np.asarray(a.get_positions())[idx],
+        )
+        sub.set_masses(np.asarray(a.get_masses())[idx])
+        sub.info = dict(getattr(a, "info", {}) or {})
+        return sub
 
     def compute_frequencies(self, hessian_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -488,14 +692,24 @@ class FrequencyBase(JobABC):
         
         # Thermal contributions
         h_vib_thermal_kjmol = u_vib_total_J * 1e-3
-        h_trans_kjmol = 2.5 * R_GAS * T * 1e-3
-        
-        is_linear = self._is_linear_molecule()
-        rot_dof = 2 if is_linear else 3
-        h_rot_kjmol = (rot_dof / 2) * R_GAS * T * 1e-3
-        
-        # Entropies
-        s_trans, s_rot = self._trans_rot_entropy()
+
+        # PARTIAL (PHVA): the movable fragment is anchored by the frozen
+        # environment, so there are no physical translation/rotation modes ->
+        # report ONLY the vibrational thermochemistry (ZPE + vib H/S). FULL path
+        # keeps the gas-phase trans/rot contributions unchanged.
+        if getattr(self, "_is_partial", False):
+            h_trans_kjmol = 0.0
+            h_rot_kjmol = 0.0
+            s_trans, s_rot = 0.0, 0.0
+        else:
+            h_trans_kjmol = 2.5 * R_GAS * T * 1e-3
+
+            is_linear = self._is_linear_molecule()
+            rot_dof = 2 if is_linear else 3
+            h_rot_kjmol = (rot_dof / 2) * R_GAS * T * 1e-3
+
+            # Entropies
+            s_trans, s_rot = self._trans_rot_entropy()
         s_vib = s_vib_total
         
         thermo = ThermoResults(
@@ -1024,12 +1238,20 @@ class MWFrequency(FrequencyBase):
                 - modes_cart: Mass-weighted normalized normal modes
         """
         masses = np.asarray(self.atoms.get_masses())
-        
-        # Step 1: Project out translations and rotations
-        if self.verbosity >= 2:
-            self.log_info(["Projecting out translations and rotations...\n"])
-        
-        hessian_proj = self._project_hessian(hessian_matrix)
+
+        # Step 1: Project out translations and rotations.
+        # PARTIAL (PHVA): the movable fragment is anchored by the frozen
+        # environment, so its (3m x 3m) block has no translation/rotation zero
+        # modes -- projecting them out would corrupt genuine vibrations. Skip the
+        # projection for the partial branch; FULL path is unchanged.
+        if getattr(self, "_no_trans_rot_projection", False):
+            if self.verbosity >= 2:
+                self.log_info(["Partial (PHVA) subspace: skipping trans/rot projection.\n"])
+            hessian_proj = np.asarray(hessian_matrix)
+        else:
+            if self.verbosity >= 2:
+                self.log_info(["Projecting out translations and rotations...\n"])
+            hessian_proj = self._project_hessian(hessian_matrix)
         
         # Step 2: Mass-weighting transformation
         # H_mw = M^{-1/2} @ H @ M^{-1/2}
@@ -1103,7 +1325,11 @@ class MWFrequency(FrequencyBase):
                 f"  Real frequencies (ν > {zero_tol} cm⁻¹):       {n_real}\n\n",
             ])
             
-            if not self._is_linear_molecule() and n_zero >= 6:
+            # The "first 6 are trans/rot zeros" expectation only holds for the
+            # FULL projected analysis; the anchored partial subspace has no zero
+            # modes, so skip this diagnostic there.
+            if (not getattr(self, "_no_trans_rot_projection", False)
+                    and not self._is_linear_molecule() and n_zero >= 6):
                 max_zero_freq = np.max(np.abs(freqs_sorted[:6]))
                 if max_zero_freq > 1.0:
                     self.log_info([
@@ -1298,6 +1524,16 @@ class Frequency:
             # pass print-layer params if available
             if hasattr(self, "print_params"):
                 job._print = self.print_params
+
+            # ---- PARTIAL (PHVA) wiring: FixAtoms/movable -> movable-subspace path
+            job._partial_param = bool(getattr(self.params, "partial", False))
+            job._movable_param = getattr(self.params, "movable", None)
+            job._hessian_delta = float(getattr(self.params, "hessian_delta", 2e-3))
+            job._batched_calc = getattr(self.params, "batched_calc", None)
+            job._batch_model_path = getattr(self.params, "batch_model_path", None)
+            job._batch_device = str(getattr(self.params, "batch_device", "cuda"))
+            job._batch_task = str(getattr(self.params, "batch_task", "omol"))
+
             job.run()
 
 # Public API
