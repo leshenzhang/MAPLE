@@ -17,10 +17,11 @@ generation + WHAM/MBAR post-processing live in :mod:`.umbrella`.
 
 from .plumed_calc import PlumedCalculator
 from .colvars_calc import ColvarsCalculator
+from .posres_calc import PosresCalculator, posres_enabled
 from . import umbrella
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
-           "umbrella"]
+           "PosresCalculator", "posres_enabled", "umbrella"]
 
 
 def maybe_wrap_bias(atoms, params, output):
@@ -33,24 +34,40 @@ def maybe_wrap_bias(atoms, params, output):
     """
     plumed_in = getattr(params, "plumed", "") or ""
     colvars_in = getattr(params, "colvars", "") or ""
-    if not plumed_in and not colvars_in:
+    posres_in = getattr(params, "posres", "")
+    want_posres = posres_enabled(posres_in)
+    if not plumed_in and not colvars_in and not want_posres:
         return atoms.calc
 
     inner = atoms.calc
     if inner is None:
         raise ValueError("maybe_wrap_bias: atoms.calc is None — set the MLIP "
-                         "calculator before applying a bias.")
+                         "calculator before applying a bias/restraint.")
     timestep_fs = float(getattr(params, "timestep", 0.5))
     temperature = float(getattr(params, "temperature", 300.0))
     restart_step = int(getattr(params, "_bias_restart_step", 0) or 0)
 
+    wrapped = inner
     if plumed_in:
-        wrapped = PlumedCalculator(inner, plumed_in, timestep_fs, temperature,
+        wrapped = PlumedCalculator(wrapped, plumed_in, timestep_fs, temperature,
                                    atoms=atoms, output=output,
                                    restart_step=restart_step)
-    else:
-        wrapped = ColvarsCalculator(inner, colvars_in, timestep_fs, temperature,
+    elif colvars_in:
+        wrapped = ColvarsCalculator(wrapped, colvars_in, timestep_fs, temperature,
                                     atoms=atoms, output=output,
                                     restart_step=restart_step)
+
+    # Position restraints (GROMACS -DPOSRES) compose on top of any active bias
+    # (additive forces) and work standalone for every ensemble — they wrap the
+    # shared force point exactly like a bias, so the integrator is untouched.
+    if want_posres:
+        wrapped = PosresCalculator(
+            wrapped, posres_in,
+            getattr(params, "posres_fc", 0.0),
+            getattr(params, "posres_group", "heavy"),
+            getattr(params, "posres_ramp", ""),
+            getattr(params, "steps", 0),
+            atoms=atoms, output=output, restart_step=restart_step)
+
     atoms.calc = wrapped
     return wrapped
