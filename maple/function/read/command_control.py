@@ -66,6 +66,8 @@ class CommandControl:
             "debug": False,
             "plumed": "",   # PLUMED enhanced-sampling input file; empty = off
             "colvars": "",  # Colvars (eABF/ABF) input file; empty = off
+            "constraints": "none",            # none|h-bonds|all-bonds|h-angles (GROMACS-identical)
+            "constraint_algorithm": "lincs",  # lincs|shake (velocity-Verlet RATTLE solver)
         },
     }
 

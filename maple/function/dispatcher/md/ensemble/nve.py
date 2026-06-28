@@ -33,6 +33,7 @@ from ..utils import (
     HA_PER_ANG_TO_AU,
 )
 from ..logger import MDLogger
+from ..constraints import build_constraint_manager
 
 
 from ..bias import maybe_wrap_bias
@@ -177,6 +178,8 @@ class NVEParams:
     # Set for reproducible velocity initialization; None = system entropy.
     # ------------------------------------------------------------------
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
 
 
 class NVE(JobABC):
@@ -205,6 +208,10 @@ class NVE(JobABC):
         # Initialize params from dict
         self.params = self._init_params(NVEParams, paras, ("md", "MD", "nve", "NVE"))
         maybe_wrap_bias(self.atoms, self.params, output)
+
+        # [TASK#9 constraints] frozen constraint set (None if constraints=none)
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
 
         # Initialize components
         self.logger = MDLogger(
@@ -457,6 +464,8 @@ class NVE(JobABC):
             remove_angular=self.params.remove_angular,
         )
         runtime_n_dof = get_n_dof_from_policy(runtime_policy)
+        # [TASK#9 constraints] subtract constrained DOF
+        runtime_n_dof = max(runtime_n_dof - self._n_constraints, 1)
 
         velocities = initialize_velocities(
             atoms=self.atoms,
@@ -514,11 +523,11 @@ class NVE(JobABC):
             temperature=self.params.temperature,
             atoms=self.atoms,
             step_offset=step_offset,
-            n_dof=get_n_dof_from_policy(get_initialization_dof_policy(
+            n_dof=max(get_n_dof_from_policy(get_initialization_dof_policy(
                 self.atoms,
                 remove_com=self.params.remove_com,
                 remove_angular=self.params.remove_angular,
-            )),
+            )) - self._n_constraints, 1),
             dof_description=describe_dof_policy(get_initialization_dof_policy(
                 self.atoms,
                 remove_com=self.params.remove_com,
@@ -529,6 +538,10 @@ class NVE(JobABC):
         self.logger.log_main(["\nStarting NVE simulation...\n\n"])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
+        # [TASK#9 constraints] attach the constraint set to the integrator
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
         # BUGFIX(ai-maple-md): NVE conserves total linear momentum (and, for an
         # isolated / non-PBC system, total angular momentum). The 3 (COM) [+3
         # rotation] DOF removed ONCE at initialization therefore stay frozen for
@@ -542,6 +555,8 @@ class NVE(JobABC):
             remove_angular=self.params.remove_angular,
         )
         runtime_n_dof = get_n_dof_from_policy(nve_policy)
+        # [TASK#9 constraints] subtract constrained DOF
+        runtime_n_dof = max(runtime_n_dof - self._n_constraints, 1)
         v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.

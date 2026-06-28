@@ -45,6 +45,7 @@ from ..utils import (
 )
 from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
+from ..constraints import build_constraint_manager
 
 
 def _apply_projection_with_work(
@@ -208,6 +209,8 @@ class NVTParams:
     plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
     colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
 
 
 class NVT(JobABC):
@@ -259,6 +262,26 @@ class NVT(JobABC):
         )
         self._runtime_n_dof = get_n_dof_from_policy(runtime_policy)
         self._runtime_dof_description = describe_dof_policy(runtime_policy)
+
+        # [TASK#9 constraints] build the frozen constraint set (None if constraints=none)
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        if self._constraints is not None:
+            # constrained dynamics use the velocity-Verlet RATTLE path (v-rescale / NVE).
+            # The Langevin LFMiddle path is not constraint-aware, so fall back to the
+            # GROMACS production thermostat (v-rescale) when constraints + Langevin.
+            if self.params.thermostat == 'langevin':
+                self.log_info([
+                    "\n*** NOTE: constraints require the velocity-Verlet RATTLE path; "
+                    "switching thermostat 'langevin' -> 'v-rescale' "
+                    "(GROMACS production default) for this constrained run.\n\n"
+                ])
+                self.params.thermostat = 'v-rescale'
+            # each distance constraint removes one DOF (rigid water = 3)
+            self._runtime_n_dof = max(self._runtime_n_dof - self._n_constraints, 1)
+            self._runtime_dof_description += (
+                f" - {self._n_constraints} constraints (3N - 3 - n_constraints)"
+            )
 
         if self.params.thermostat == 'langevin':
             self.thermostat = LangevinThermostat(
@@ -537,6 +560,10 @@ class NVT(JobABC):
         ])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
+        # [TASK#9 constraints] attach the constraint set to the integrator
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
         v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.

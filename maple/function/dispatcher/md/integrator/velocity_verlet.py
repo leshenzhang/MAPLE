@@ -58,6 +58,10 @@ class VelocityVerlet:
         # Cache masses (avoid repeated ASE calls)
         self.masses = atoms.get_masses() * AMU_TO_AU  # Convert to atomic units
 
+        # [TASK#9 constraints] optional ConstraintManager (None = unconstrained,
+        # behaves exactly as before). Set by the ensemble after construction.
+        self.constraints = None
+
     def step(self, velocities: np.ndarray,
              forces: np.ndarray = None) -> tuple:
         """
@@ -98,8 +102,15 @@ class VelocityVerlet:
 
         # A: Full-step position update (v in a.u., dt in a.u. → displacement in Bohr → Å)
         positions = self.atoms.get_positions()
+        # [TASK#9 constraints] reference geometry r(t) BEFORE the drift (SHAKE gradient ref)
+        ref_positions = positions.copy() if self.constraints is not None else None
         positions += velocities * dt * BOHR_TO_ANGSTROM
         self.atoms.set_positions(positions)
+        # [TASK#9 constraints] RATTLE position stage: restore bond lengths and
+        # correct the half-step velocities (no-op when self.constraints is None).
+        if self.constraints is not None:
+            velocities = self.constraints.project_positions(
+                self.atoms, ref_positions, velocities, dt)
         if any(self.atoms.pbc):
             self.atoms.wrap()
 
@@ -108,6 +119,11 @@ class VelocityVerlet:
 
         # B2: Final half-step velocity update
         velocities = velocities + 0.5 * forces / masses * dt
+
+        # [TASK#9 constraints] RATTLE velocity stage: zero relative velocity along
+        # each constrained bond (no-op when self.constraints is None).
+        if self.constraints is not None:
+            velocities = self.constraints.project_velocities(self.atoms, velocities)
 
         return velocities, forces
 
