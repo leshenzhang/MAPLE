@@ -123,6 +123,62 @@ def parse_bool_option(value, *, name='option'):
 EV2HARTREE = 1.0 / 27.211386245988
 
 
+_PRECISION_ALIASES = {
+    'fp64': 'fp64', 'float64': 'fp64', 'double': 'fp64', 'f64': 'fp64', '64': 'fp64',
+    'fp32': 'fp32', 'float32': 'fp32', 'single': 'fp32', 'f32': 'fp32', '32': 'fp32',
+    'tf32': 'tf32', 'tfloat32': 'tf32', 'tensorfloat32': 'tf32',
+}
+
+
+def normalize_precision(value):
+    """Normalize a user precision selector to 'fp64' | 'fp32' | 'tf32'.
+
+    fp64 (default) keeps the historical float64 MACE force path bit-for-bit.
+    fp32 runs the model + neighbour-graph in IEEE single precision with TF32
+    tensor cores OFF (a true single-precision reference). tf32 uses the same
+    float32 storage path but enables A100 TensorFloat-32 matmul (~10-bit
+    mantissa) on the big linear layers -- fastest, slightly lossier.
+    """
+    if value is None:
+        return 'fp64'
+    text = str(value).strip().lower()
+    out = _PRECISION_ALIASES.get(text)
+    if out is None:
+        raise ValueError(
+            f"Unknown precision={value!r}; use one of fp64 / fp32 / tf32."
+        )
+    return out
+
+
+def precision_to_torch_dtype(precision):
+    """Map a normalized precision string to the torch float dtype of the data path."""
+    import torch
+    precision = normalize_precision(precision)
+    return torch.float64 if precision == 'fp64' else torch.float32
+
+
+def apply_tf32_backend_flags(precision):
+    """Set the global cuBLAS/cuDNN TF32 tensor-core switches for `precision`.
+
+    tf32  -> allow TF32 ON  (A100 tensor cores, ~10-bit-mantissa matmul).
+    fp32  -> allow TF32 OFF (true IEEE single, the clean fp32 reference).
+    fp64  -> allow TF32 OFF (irrelevant at double precision).
+
+    Writes process-global torch flags, explicitly per precision, so a prior
+    tf32 calculator cannot silently bleed reduced-precision matmul into a
+    later fp32/fp64 calculator in the same process. No-op on CPU-only builds.
+    """
+    import torch
+    precision = normalize_precision(precision)
+    allow = (precision == 'tf32')
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = allow
+        torch.backends.cudnn.allow_tf32 = allow
+    except Exception:
+        pass
+    return precision
+
+
 def _convert_energy_force_units(energy, forces, *, source_unit):
     """Convert backend (energy, forces) to Hartree and Hartree/Å.
 
@@ -269,6 +325,10 @@ class CalcABC(ase.calculators.calculator.Calculator):
     MODEL_ENERGY_UNIT: str = 'eV'
     SUPPORTED_HESSIAN_MODES: tuple = ('numerical',)
     SUPPORTS_CHARGE_MULT: bool = False
+    # Backends that accept a `precision` ctor kwarg (fp64/fp32/tf32) set this
+    # True so SetCalculator threads the MD `precision` mdp key through; all
+    # other backends ignore precision and keep their model-native dtype.
+    SUPPORTS_PRECISION: bool = False
     SUPPORTS_PBC: bool = False
     CHECKPOINT_FILENAME: dict | None = None
     REQUIRES_LOCAL_MODEL_FILE: bool = False

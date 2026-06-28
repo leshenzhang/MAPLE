@@ -73,6 +73,7 @@ class CommandControl:
             "posres_group": "heavy",  # restrained atoms: all / heavy / explicit "0,1,5-10"
             "posres_ramp": "",     # descending k schedule (Ha/Å²), e.g. "4e-3,2e-3,5e-4,0"; empty = constant fc
             "box_check": "strict",  # minimum-image box guard: strict|warn|off
+            "precision": "fp64",  # MACE force-path float precision: fp64 (default) | fp32 | tf32
         },
     }
 
