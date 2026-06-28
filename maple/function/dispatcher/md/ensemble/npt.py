@@ -206,6 +206,26 @@ class NPT(JobABC):
                 "Use NVT or NVE for non-periodic systems."
             )
 
+        # --- Calculator capability gate (NPT requires a real virial/stress) ---
+        # Pressure coupling is physically meaningless without the configurational
+        # virial: for a dense/condensed phase the pressure is dominated by the
+        # stress term, not the kinetic term.  GROMACS likewise refuses pressure
+        # coupling without a virial.  We require both PBC support and a genuine
+        # stress property; a kinetic-only (ideal-gas) pressure must NOT silently
+        # drive the barostat.
+        _supports_pbc = bool(getattr(atoms.calc, "SUPPORTS_PBC", False))
+        _impl = tuple(getattr(atoms.calc, "implemented_properties", ()) or ())
+        if not (_supports_pbc and "stress" in _impl):
+            raise ValueError(
+                "NPT ensemble requires a calculator that supports periodic boundaries "
+                "AND returns a stress tensor (real configurational virial). "
+                f"Calculator '{type(atoms.calc).__name__}' reports "
+                f"SUPPORTS_PBC={_supports_pbc}, implemented_properties={_impl}. "
+                "Non-periodic gas-phase potentials (e.g. aimnet2, macepol) can only run "
+                "NVE/NVT. Use a PBC+stress calculator (e.g. UMA, or a periodic-enabled "
+                "MACE) for NPT."
+            )
+
         self.atoms = atoms
         self.params = self._init_params(NPTParams, paras, ("md", "MD", "npt", "NPT"))
 
