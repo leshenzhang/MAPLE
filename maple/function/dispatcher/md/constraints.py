@@ -204,6 +204,21 @@ class ConstraintManager:
         f -= np.round(f)
         return f @ self._cell
 
+    # -- cell refresh (NPT only) ---------------------------------------------
+    def sync_cell(self, atoms: Atoms) -> None:
+        """Refresh the cached cell used for minimum-image constraint geometry.
+
+        NVE / NVT keep a fixed cell, so the t=0 cache is exact and this is never
+        needed. NPT changes the cell every step (the barostat rescales it), so a
+        frozen t=0 cell would mis-image any constrained bond whose two atoms
+        straddle a periodic face. Call this once per NPT step (after the barostat
+        rescale) so the RATTLE position/velocity projections use the current
+        cell. No-op for non-periodic systems."""
+        if not self.pbc:
+            return
+        self._cell = np.asarray(atoms.cell.array, dtype=float)
+        self._cell_inv = np.linalg.inv(self._cell)
+
     # -- DOF bookkeeping -----------------------------------------------------
     @property
     def n_dof_removed(self) -> int:

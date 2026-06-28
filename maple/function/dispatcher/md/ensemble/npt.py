@@ -64,6 +64,7 @@ from ..logger import MDLogger
 
 from ..bias import maybe_wrap_bias
 from ..box_guard import check_box_size, composition_sanity
+from ..constraints import build_constraint_manager
 
 
 @dataclass
@@ -248,11 +249,6 @@ class NPT(JobABC):
 
         self.atoms = atoms
         self.params = self._init_params(NPTParams, paras, ("md", "MD", "npt", "NPT"))
-        if str(getattr(self.params, "constraints", "none") or "none").strip().lower() not in ("", "none"):
-            raise NotImplementedError(
-                "constraints are not yet wired into the NPT barostat loop; "
-                "use ensemble=nvt or ensemble=nve for constrained dynamics."
-            )
         maybe_wrap_bias(self.atoms, self.params, output)
 
         # --- GROMACS-grompp-style physical preflight (box size + composition) ---
@@ -303,6 +299,30 @@ class NPT(JobABC):
             self.log_info(["\n*** WARNING: remove_angular is ignored for NPT/PBC systems; only initialization COM removal remains active.\n"])
         self._runtime_n_dof = get_n_dof_from_policy(runtime_policy)
         self._runtime_dof_description = describe_dof_policy(runtime_policy)
+
+        # [TASK#9 constraints in NPT] build the frozen constraint set (None when
+        # constraints=none; the unconstrained path is untouched). Mirrors NVT:
+        # rigid water (SETTLE-equivalent) + X-H bonds let the timestep rise to
+        # ~2 fs in the condensed phase. The barostat loop re-satisfies the
+        # constraints after each cell rescale (see _run_simulation).
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        if self._constraints is not None:
+            # The Langevin LFMiddle path is not constraint-aware; fall back to the
+            # GROMACS production thermostat (v-rescale) when constraints + Langevin
+            # are both requested (identical to the NVT policy).
+            if self.params.thermostat == 'langevin':
+                self.log_info([
+                    "\n*** NOTE: constraints require the velocity-Verlet RATTLE path; "
+                    "switching thermostat langevin -> v-rescale.\n"
+                ])
+                self.params.thermostat = 'v-rescale'
+            # Each distance constraint removes one DOF (rigid water = 3); keep the
+            # thermostat target and reported temperature consistent.
+            self._runtime_n_dof = max(self._runtime_n_dof - self._n_constraints, 1)
+            self._runtime_dof_description = (
+                f"{self._runtime_dof_description} - {self._n_constraints} constraints"
+            )
 
         if self.params.thermostat == 'langevin':
             self.thermostat = LangevinThermostat(
@@ -592,6 +612,12 @@ class NPT(JobABC):
         ])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
+        # [TASK#9 constraints in NPT] attach the constraint set so the RATTLE
+        # position/velocity stages run inside integrator.step(); the barostat
+        # loop below re-satisfies the bonds after each cell rescale.
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
         v = velocities.copy()
 
         # Cache forces at t=0; the Langevin LFMiddle path reuses the same initial
@@ -608,6 +634,14 @@ class NPT(JobABC):
                 integrator.half_step_r(v)
                 v = self.thermostat.apply(v)
                 v, forces = integrator.lfmiddle_post_thermostat(v)
+            elif self._constraints is not None:
+                # Constraint-aware path: monolithic velocity-Verlet (RATTLE
+                # position + velocity stages run inside step()), then V-rescale
+                # as a separate O-block — identical to the NVT constrained path.
+                # The split_step chain is NOT constraint-aware, so constrained
+                # NPT must integrate through step() here.
+                v, forces = integrator.step(v, forces)
+                v, _delta_w = self.thermostat.apply(v)
             else:
                 # Keep the existing V-rescale split chain unchanged.
                 v_half = integrator.split_step(v, forces)
@@ -621,8 +655,31 @@ class NPT(JobABC):
                 # A(half)-B: half-position + force eval + half-kick; returns cached forces
                 v, forces = integrator.complete_split_step(v)
 
+            # [TASK#9 constraints in NPT] capture the constraint-satisfied
+            # geometry BEFORE the barostat rescale; it is the RATTLE reference
+            # for the post-rescale re-projection (the barostat scales every
+            # position by μ, stretching each constrained bond by μ).
+            ref_positions_pre_barostat = (
+                self.atoms.get_positions().copy()
+                if self._constraints is not None else None
+            )
+
             # Barostat: rescale cell after the thermostat/integrator cycle.
             self.barostat.apply(v)
+
+            # [TASK#9 constraints in NPT] the barostat scaled all positions by μ
+            # (stretching every constrained bond by μ) and changed the cell.
+            # Refresh the minimum-image cell and re-satisfy the constraints: the
+            # position stage restores bond lengths d0 + corrects velocities, the
+            # velocity stage zeroes relative velocity along each bond. The small
+            # neglected constraint contribution to the barostat virial is a
+            # documented approximation (bond-constraint pressure bias is tiny).
+            if self._constraints is not None:
+                self._constraints.sync_cell(self.atoms)
+                v = self._constraints.project_positions(
+                    self.atoms, ref_positions_pre_barostat, v, integrator.timestep)
+                v = self._constraints.project_velocities(self.atoms, v)
+
             # Runtime box guard: the barostat just rescaled the cell; fatal
             # abort if it shrank a periodic width below 2*r_max (prevents the
             # barostat from silently driving the system into a wrong-physics box).

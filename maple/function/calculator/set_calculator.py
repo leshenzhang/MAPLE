@@ -50,6 +50,7 @@ _BUILTIN_NAME_TO_MODULE = {
     'mace-off': 'maple.function.calculator.mace._mace_off_calculator',
     'macemp0': 'maple.function.calculator.mace._mace_mp_calculator',
     'mace-mp-0-generic': 'maple.function.calculator.generic._mace_mp_generic',
+    'mace-off-generic': 'maple.function.calculator.generic._mace_off_generic',
     'uma-generic': 'maple.function.calculator.generic._uma_generic',
 }
 
