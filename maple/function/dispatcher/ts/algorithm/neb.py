@@ -1070,7 +1070,10 @@ class NEB(JobABC):
 
     def run_multiband(self, bands: List[List[Atoms]],
                       dyneb: bool = False, climbing: bool = False,
-                      spring_mode: str = "dynamic", verbose: bool = True):
+                      spring_mode: str = "dynamic", verbose: bool = True,
+                      pool_queue: Optional[List[List[Atoms]]] = None,
+                      B_target: Optional[int] = None,
+                      stall_patience: int = 40):
         """
         OPT-IN multi-band NEB: optimise B independent NEB bands concurrently,
         packing every image of every still-active band into ONE batched
@@ -1095,19 +1098,54 @@ class NEB(JobABC):
                          (Asgeirsson 2021, DOI 10.1021/acs.jctc.1c00462, stiffer
                          near barrier) | 'fixed' (constant k_max).
 
-        bands : List[List[Atoms]]   B input bands (see _prepare_band).
+        Streaming pool (OPT-IN, mirrors BPRFO.run pool_queue/B_target; ports the
+        same shrink+refill+straggler pattern to NEB so a 1000-band campaign does
+        not stall on a few stuck bands):
+          pool_queue     extra band specs (each [reactant, product] or a full
+                         band, same as `bands`). When not None (with B_target),
+                         the lockstep loop becomes a streaming pool: `bands` is
+                         the initial active set (give B_target of them); when a
+                         band leaves (converged / max_iter / stalled) the active
+                         set is refilled from `pool_queue` up to B_target so the
+                         batched forward stays saturated. Each band carries its
+                         OWN per-band iteration budget (a newcomer entering at
+                         global step 500 still gets p.max_iter of its own iters).
+          B_target       active-band target the pool refills back up to.
+          stall_patience a band whose max|grad| makes no progress (does not
+                         improve) for this many of its OWN iters is evicted as
+                         a straggler (does NOT block the rest of the batch).
+        pool_queue=None  => EXACTLY the lockstep behaviour above (the oracle):
+                            no refill, no straggler eviction, byte-identical
+                            per-band barriers/HEIs to the pre-pool code.
+
+        bands : List[List[Atoms]]   B input bands (see _prepare_band). With the
+                pool on, this is the INITIAL active set (size B_target); extra
+                bands go in pool_queue.
 
         Returns (results, stats):
-          results : list of dict (one per band) with keys images, energies, hei,
-                    barrier_Eh, iterations, converged, force_evals, n_img.
+          results : list of dict, ONE PER ORIGINAL band, ordered by original
+                    index (initial `bands` first, then `pool_queue` in order),
+                    with keys images, energies, hei, barrier_Eh, iterations,
+                    converged, force_evals, n_img. With the pool on, each dict
+                    also carries status in {converged, evicted_straggler,
+                    max_iter}.
           stats   : dict forwards, total_image_evals, wall_time_s, n_bands,
-                    max_iter_reached.
+                    max_iter_reached. With the pool on, also pool_refilled
+                    (# bands pulled from the queue) and B_target.
         """
         if not self._use_batch:
             raise ValueError("run_multiband requires a batched calculator "
                              "(prepare + get_ef_gpu) on the Molecules object")
         if spring_mode not in ("dynamic", "energy_weighted", "fixed"):
             raise ValueError(f"unknown spring_mode={spring_mode!r}")
+
+        # Streaming pool is enabled iff BOTH pool_queue and B_target are given.
+        # pool_queue=None (or B_target=None) => the loop reduces EXACTLY to the
+        # legacy lockstep behaviour (the byte-identical oracle).
+        pooling = (pool_queue is not None) and (B_target is not None)
+        if (pool_queue is not None) ^ (B_target is not None):
+            raise ValueError("streaming pool needs BOTH pool_queue and B_target "
+                             "(or NEITHER, for the lockstep oracle)")
 
         p = self.params
         base_case = (not dyneb) and (not climbing) and (spring_mode == "dynamic")
@@ -1130,6 +1168,9 @@ class NEB(JobABC):
                 Es=None, raw_F=None, g=None, Fp_list=None, x_new=None,
                 k_springs=None, hei=1, converged=False, iters=0,
                 frozen=set(), force_evals=0,
+                # streaming-pool per-band straggler tracking (read only when
+                # pooling; inert for the lockstep oracle).
+                best_fmax=float("inf"), stall=0,
             ))
 
         # ---- one batched forward over a chosen subset of images per band ----
@@ -1167,6 +1208,75 @@ class NEB(JobABC):
                 st["images"], st["Es"], st["raw_F"], ks,
                 climbing=climbing, hei_fixed=None, active_mask=mask)
 
+        # ---- per-band step helpers (shared by the lockstep AND pool loops, so a
+        #      pooled band follows the SAME trajectory as a lockstep band; these
+        #      are verbatim factor-outs of the legacy loop body => byte-parity) ----
+        def propose_step(st):
+            # 1) propose x_new for one active band (no forward needed).
+            drv = st["driver"]
+            step = drv.step_limit(drv.two_loop(st["g"]))
+            x_new = st["x"] + step
+            if dyneb and st["frozen"]:
+                x_new = self._project_frozen(st, x_new)
+            self._unpack_internal(x_new, st["images"])
+            st["x_new"] = x_new
+
+        def plan_idxs(st):
+            # which images of this band to (re)evaluate in the batched forward.
+            if dyneb:
+                return [j for j in range(1, st["n_img"] - 1)
+                        if (j not in st["frozen"]) or (j == st["hei"])]
+            elif self._reuse_endpoints:
+                # FIX #3: endpoints 0 / n-1 never move and their projected NEB
+                # forces are zeroed -> evaluate INTERNAL images only.
+                return list(range(1, st["n_img"] - 1))
+            return list(range(st["n_img"]))   # full band (matches oracle)
+
+        def update_band(st):
+            # 3) per-band gradient update + convergence after the batched forward.
+            Fp_list, _, hei = band_forces(st)
+            st["hei"] = hei
+            st["Fp_list"] = Fp_list
+            g_new = self._grad_from_fp(Fp_list, st["n_img"], st["x_new"])
+            st["driver"].update(st["x_new"] - st["x"], g_new - st["g"])
+            st["x"] = st["x_new"]
+            st["g"] = g_new
+            st["iters"] += 1
+            if st["driver"].should_stop(g_new, p.neb_f_max_th, p.neb_f_rms_th):
+                st["converged"] = True
+            if dyneb:
+                self._update_frozen(st, Fp_list, p.neb_f_max_th)
+
+        def fmax_of(g):
+            return float(np.max(np.abs(g))) if g.size else 0.0
+
+        def make_result(st, status=None):
+            Es = st["Es"]
+            hei = st["hei"]
+            r = dict(
+                idx=st["idx"], images=st["images"], energies=Es, hei=hei,
+                barrier_Eh=float(Es[hei] - Es[0]),
+                iterations=st["iters"], converged=st["converged"],
+                force_evals=st["force_evals"], n_img=st["n_img"],
+            )
+            if status is not None:
+                r["status"] = status
+            return r
+
+        def build_state(band_spec, oi):
+            # construct a fresh per-band state for a pool newcomer (orig index oi).
+            images = self._prepare_band(band_spec)
+            return dict(
+                idx=oi, images=images, n_img=len(images),
+                driver=LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0),
+                x=self._pack_internal(images),
+                Es=[0.0] * len(images), raw_F=[None] * len(images),
+                g=None, Fp_list=None, x_new=None,
+                k_springs=None, hei=1, converged=False, iters=0,
+                frozen=set(), force_evals=0,
+                best_fmax=float("inf"), stall=0,
+            )
+
         # ---- INITIAL forward (full band for every band) ----
         for st in states:
             st["Es"] = [0.0] * st["n_img"]
@@ -1190,93 +1300,199 @@ class NEB(JobABC):
                 self._update_frozen(st, Fp_list, p.neb_f_max_th)
 
         if verbose:
+            pool_note = (f"  POOL on: B_target={B_target} "
+                         f"queue={len(pool_queue)} stall_patience={stall_patience}"
+                         if pooling else "")
             log_info([
                 f"\n{'='*70}\n",
                 f"Multi-band NEB: B={len(states)} bands  spring_mode={spring_mode}  "
-                f"dyneb={dyneb}  climbing={climbing}\n",
+                f"dyneb={dyneb}  climbing={climbing}{pool_note}\n",
                 f"{'='*70}\n",
                 "Image-as-batch over all bands (UMA mol_idx block-diagonal); "
                 "per-band L-BFGS; single-band run() kept as fallback + oracle.\n"
             ], self.output)
 
-        # ---- main loop: one batched forward per iteration over all bands ----
+        if not pooling:
+            # =================================================================
+            # LOCKSTEP (legacy oracle): every band steps each iter until the
+            # SLOWEST converges or the global iteration cap is hit. The step
+            # helpers below are verbatim factor-outs of the original loop body,
+            # so this path is byte-identical to the pre-pool code.
+            # =================================================================
+            it = 0
+            while it < p.max_iter and not all(st["converged"] for st in states):
+                it += 1
+                active = [st for st in states if not st["converged"]]
+                # 1) propose x_new for every active band (no forward needed)
+                for st in active:
+                    propose_step(st)
+                # 2) ONE batched forward over the images that actually moved
+                plan = [(st, plan_idxs(st)) for st in active]
+                total_image_evals += batched_forward(plan)
+                forwards += 1
+                # 3) per-band gradient update + convergence
+                for st in active:
+                    update_band(st)
+
+            wall = time.time() - t0
+
+            # ---- finalize (one result per band, states order) ----
+            results = []
+            for st in states:
+                results.append(make_result(st))
+                if verbose:
+                    Es = st["Es"]; hei = st["hei"]
+                    extra = (f" frozen={len(st['frozen'])}/{st['n_img']-2}" if dyneb else "")
+                    log_info([
+                        f"band {st['idx']:>3d}: iters={st['iters']:>4d}  "
+                        f"converged={st['converged']}  HEI={hei}  "
+                        f"barrier={(Es[hei]-Es[0])*627.509:.3f} kcal/mol  "
+                        f"force_evals={st['force_evals']}{extra}\n"
+                    ], self.output)
+            stats = dict(forwards=forwards, total_image_evals=total_image_evals,
+                         wall_time_s=wall, n_bands=len(states),
+                         max_iter_reached=(it >= p.max_iter))
+            if verbose:
+                log_info([
+                    f"\nMulti-band done: {forwards} batched forwards, "
+                    f"{total_image_evals} image-evals, wall={wall:.2f}s, iters={it}\n"
+                ], self.output)
+            return results, stats
+
+        # =====================================================================
+        # STREAMING POOL (opt-in; mirrors BPRFO.run pool_queue/B_target). The
+        # active set is kept at <= B_target by refilling from `pool_queue` as
+        # bands leave (converged / max_iter / stalled). Each band has its OWN
+        # iteration budget. Straggler bands are evicted + flagged so they do not
+        # block the rest of the batch. `bands` is the INITIAL active set.
+        # =====================================================================
+        queue = list(pool_queue)                 # remaining band specs (FIFO)
+        Bt = int(B_target)
+        next_orig = len(bands)                    # orig index for the next newcomer
+        total_orig = len(bands) + len(queue)      # every original band gets a result
+        refill_count = 0
+        results_by_oi = {}                        # orig index -> result dict
+        active = list(states)                     # live working set
+        # seed straggler trackers from each initial band's starting |g|.
+        for st in active:
+            st["best_fmax"] = fmax_of(st["g"]) if st["g"] is not None else float("inf")
+            st["stall"] = 0
+
         it = 0
-        while it < p.max_iter and not all(st["converged"] for st in states):
-            it += 1
-            active = [st for st in states if not st["converged"]]
+        # finite-loop guard: each loop iter advances >=1 still-active band by one
+        # of its own iters, and every band leaves at <= p.max_iter own-iters, so
+        # the loop is bounded by total_orig * (p.max_iter + 1) (+slack).
+        hard_cap = total_orig * (p.max_iter + 1) + 16
 
-            # 1) propose x_new for every active band (no forward needed)
+        while True:
+            # ---- (a) classify + evict any band leaving the active set ----
+            survivors = []
             for st in active:
-                drv = st["driver"]
-                step = drv.step_limit(drv.two_loop(st["g"]))
-                x_new = st["x"] + step
-                if dyneb and st["frozen"]:
-                    x_new = self._project_frozen(st, x_new)
-                self._unpack_internal(x_new, st["images"])
-                st["x_new"] = x_new
-
-            # 2) ONE batched forward over the images that actually moved
-            plan = []
-            for st in active:
-                if dyneb:
-                    idxs = [j for j in range(1, st["n_img"] - 1)
-                            if (j not in st["frozen"]) or (j == st["hei"])]
-                elif self._reuse_endpoints:
-                    # FIX #3: endpoints 0 / n-1 never move and their projected NEB
-                    # forces are zeroed -> evaluate INTERNAL images only. Their
-                    # energies were filled by the INITIAL full-band forward and stay
-                    # in st["Es"] (constant), so band_forces' tangents are unchanged.
-                    idxs = list(range(1, st["n_img"] - 1))
+                if st["converged"]:
+                    status = "converged"
+                elif st["iters"] >= p.max_iter:
+                    status = "max_iter"
+                elif st["stall"] >= stall_patience:
+                    status = "evicted_straggler"
                 else:
-                    idxs = list(range(st["n_img"]))   # full band (matches oracle)
-                plan.append((st, idxs))
+                    survivors.append(st)
+                    continue
+                results_by_oi[st["idx"]] = make_result(st, status)
+                if verbose and status != "converged":
+                    log_info([
+                        f"[pool] evict band {st['idx']:>3d} as {status} "
+                        f"(iters={st['iters']}, stall={st['stall']}, "
+                        f"fmax={fmax_of(st['g']) if st['g'] is not None else float('nan'):.3e})\n"
+                    ], self.output)
+            active = survivors
+
+            # ---- (b) refill the active set from the queue up to B_target ----
+            newcomers = []
+            while len(active) < Bt and queue:
+                spec = queue.pop(0)
+                st_new = build_state(spec, next_orig)
+                next_orig += 1
+                refill_count += 1
+                newcomers.append(st_new)
+                active.append(st_new)
+            if newcomers:
+                # initialise newcomers (full-band forward -> band_forces -> g),
+                # exactly like the pre-loop init of the initial bands.
+                total_image_evals += batched_forward(
+                    [(st, list(range(st["n_img"]))) for st in newcomers])
+                forwards += 1
+                for st in newcomers:
+                    Fp_list, _, hei = band_forces(st)
+                    st["hei"] = hei
+                    st["Fp_list"] = Fp_list
+                    g = self._grad_from_fp(Fp_list, st["n_img"], st["x"])
+                    st["g"] = g
+                    st["best_fmax"] = fmax_of(g)
+                    st["stall"] = 0
+                    if st["driver"].should_stop(g, p.neb_f_max_th, p.neb_f_rms_th):
+                        st["converged"] = True
+                    if dyneb:
+                        self._update_frozen(st, Fp_list, p.neb_f_max_th)
+                if verbose:
+                    log_info([
+                        f"[pool] refill +{len(newcomers)} "
+                        f"(active={len(active)}, queue_left={len(queue)})\n"
+                    ], self.output)
+
+            # ---- (c) termination: nothing active and nothing left to refill ----
+            if not active:
+                break
+            if it >= hard_cap:
+                # defensive: should be unreachable given the per-band budget.
+                break
+
+            # ---- (d) ONE global step over the current active set ----
+            it += 1
+            for st in active:
+                propose_step(st)
+            plan = [(st, plan_idxs(st)) for st in active]
             total_image_evals += batched_forward(plan)
             forwards += 1
-
-            # 3) per-band gradient update + convergence
             for st in active:
-                Fp_list, _, hei = band_forces(st)
-                st["hei"] = hei
-                st["Fp_list"] = Fp_list
-                g_new = self._grad_from_fp(Fp_list, st["n_img"], st["x_new"])
-                st["driver"].update(st["x_new"] - st["x"], g_new - st["g"])
-                st["x"] = st["x_new"]
-                st["g"] = g_new
-                st["iters"] += 1
-                if st["driver"].should_stop(g_new, p.neb_f_max_th, p.neb_f_rms_th):
-                    st["converged"] = True
-                if dyneb:
-                    self._update_frozen(st, Fp_list, p.neb_f_max_th)
+                update_band(st)              # advances iters + convergence
+                # straggler progress tracking on this band's own |g|.
+                fcur = fmax_of(st["g"])
+                if fcur < st["best_fmax"] - 1e-6:
+                    st["best_fmax"] = fcur
+                    st["stall"] = 0
+                else:
+                    st["stall"] += 1
 
         wall = time.time() - t0
 
-        # ---- finalize ----
-        results = []
-        for st in states:
-            Es = st["Es"]
-            hei = st["hei"]
-            results.append(dict(
-                idx=st["idx"], images=st["images"], energies=Es, hei=hei,
-                barrier_Eh=float(Es[hei] - Es[0]),
-                iterations=st["iters"], converged=st["converged"],
-                force_evals=st["force_evals"], n_img=st["n_img"],
-            ))
-            if verbose:
-                extra = (f" frozen={len(st['frozen'])}/{st['n_img']-2}" if dyneb else "")
-                log_info([
-                    f"band {st['idx']:>3d}: iters={st['iters']:>4d}  "
-                    f"converged={st['converged']}  HEI={hei}  "
-                    f"barrier={(Es[hei]-Es[0])*627.509:.3f} kcal/mol  "
-                    f"force_evals={st['force_evals']}{extra}\n"
-                ], self.output)
-        stats = dict(forwards=forwards, total_image_evals=total_image_evals,
-                     wall_time_s=wall, n_bands=len(states),
-                     max_iter_reached=(it >= p.max_iter))
+        # ---- finalize: any band still active at the cap is flagged max_iter ----
+        for st in active:
+            if st["idx"] not in results_by_oi:
+                results_by_oi[st["idx"]] = make_result(st, "max_iter")
+        results = [results_by_oi[i] for i in range(total_orig)]
         if verbose:
+            n_conv = sum(1 for r in results if r.get("status") == "converged")
+            n_evict = sum(1 for r in results if r.get("status") == "evicted_straggler")
+            n_max = sum(1 for r in results if r.get("status") == "max_iter")
+            for r in results:
+                Es = r["energies"]; hei = r["hei"]
+                log_info([
+                    f"band {r['idx']:>3d}: iters={r['iterations']:>4d}  "
+                    f"status={r['status']:>17s}  HEI={hei}  "
+                    f"barrier={(Es[hei]-Es[0])*627.509:.3f} kcal/mol  "
+                    f"force_evals={r['force_evals']}\n"
+                ], self.output)
             log_info([
-                f"\nMulti-band done: {forwards} batched forwards, "
-                f"{total_image_evals} image-evals, wall={wall:.2f}s, iters={it}\n"
+                f"\nMulti-band POOL done: {forwards} batched forwards, "
+                f"{total_image_evals} image-evals, wall={wall:.2f}s, "
+                f"global_steps={it}, pool_refilled={refill_count}\n"
+                f"# Final status: converged={n_conv} "
+                f"evicted_straggler={n_evict} max_iter={n_max}\n"
             ], self.output)
+        stats = dict(forwards=forwards, total_image_evals=total_image_evals,
+                     wall_time_s=wall, n_bands=total_orig,
+                     max_iter_reached=any(r.get("status") == "max_iter" for r in results),
+                     pool_refilled=refill_count, B_target=Bt)
         return results, stats
 
     def _compute_distances(self, images: List[Atoms]) -> List[float]:
