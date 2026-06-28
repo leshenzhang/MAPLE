@@ -46,6 +46,11 @@ class MACEOFFCalculator(MACEMPCalculator):
 
     MODEL_NAMES = ('mace-off',)
     SUPPORTS_PBC = False
+    # MACE-OFF23 loads at hardcoded float64 and its __init__ takes no
+    # `precision` kwarg (unlike the MACEMPCalculator parent, which sets
+    # SUPPORTS_PRECISION=True). Declare no mixed-precision support so
+    # SetCalculator does not thread `precision` into the constructor.
+    SUPPORTS_PRECISION = False
 
     def __init__(self,
         device,
