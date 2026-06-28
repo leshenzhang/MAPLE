@@ -66,6 +66,7 @@ class CommandControl:
             "debug": False,
             "plumed": "",   # PLUMED enhanced-sampling input file; empty = off
             "colvars": "",  # Colvars (eABF/ABF) input file; empty = off
+            "box_check": "strict",  # minimum-image box guard: strict|warn|off
         },
     }
 

@@ -63,6 +63,7 @@ from ..logger import MDLogger
 
 
 from ..bias import maybe_wrap_bias
+from ..box_guard import check_box_size, composition_sanity
 
 
 @dataclass
@@ -189,6 +190,14 @@ class NPTParams:
     colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
     random_seed: Optional[int] = None
 
+    # ------------------------------------------------------------------
+    # box_check: minimum-image box-size guard severity (strict|warn|off).
+    # strict (default) = GROMACS-style fatal abort when the shortest periodic
+    # box width drops below 2*r_max (the MLIP receptive field); warn = log and
+    # continue; off = disable. Only acts for PBC calculators (finite r_max).
+    # ------------------------------------------------------------------
+    box_check:       str   = "strict"
+
 
 class NPT(JobABC):
     """
@@ -234,6 +243,15 @@ class NPT(JobABC):
         self.atoms = atoms
         self.params = self._init_params(NPTParams, paras, ("md", "MD", "npt", "NPT"))
         maybe_wrap_bias(self.atoms, self.params, output)
+
+        # --- GROMACS-grompp-style physical preflight (box size + composition) ---
+        # Reject a periodic box shorter than 2*r_max (MLIP receptive field),
+        # which would cause silent minimum-image self-interaction. Self-skips
+        # for non-PBC calculators. See dispatcher/md/box_guard.py.
+        check_box_size(self.atoms, self.atoms.calc, self.params.box_check,
+                       context="NPT setup preflight")
+        composition_sanity(self.atoms, self.atoms.calc, self.params.box_check,
+                           context="NPT setup preflight")
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(
@@ -594,6 +612,13 @@ class NPT(JobABC):
 
             # Barostat: rescale cell after the thermostat/integrator cycle.
             self.barostat.apply(v)
+            # Runtime box guard: the barostat just rescaled the cell; fatal
+            # abort if it shrank a periodic width below 2*r_max (prevents the
+            # barostat from silently driving the system into a wrong-physics box).
+            check_box_size(
+                self.atoms, self.atoms.calc, self.params.box_check,
+                context=f"NPT runtime step {step_offset + step} (after barostat rescale)",
+            )
             v, _projection = apply_runtime_motion_projection(
                 self.atoms,
                 v,
