@@ -702,6 +702,21 @@ class NEB(JobABC):
         self._band_cache_E = None
         self._band_cache_F = None
 
+        # --- FIX #3: frozen-endpoint forward reuse (ACCURACY-PRESERVING) -------
+        # The NEB endpoints (image 0 and n-1) never move (_pack/_unpack_internal
+        # touch images 1..n-2 only), their projected forces are ZEROED in
+        # neb_forces, and their energies are constant. So the endpoints are
+        # evaluated ONCE (cached) and spliced into every later band forward; the
+        # per-iter batched forward runs over INTERNAL images only (n_img-2 instead
+        # of n_img). Default ON; MAPLE_NO_ENDPOINT_REUSE=1 forces the legacy
+        # full-band forward every iter = the byte-parity oracle.
+        self._reuse_endpoints = (os.environ.get("MAPLE_NO_ENDPOINT_REUSE", "0") != "1")
+        self._ep_E = None          # (E0, En) cached endpoint energies
+        self._ep_F = None          # (F0, Fn) cached endpoint raw forces
+        self._ep_pos = None        # (pos0, posN) guard: re-eval if endpoints move
+        self._neb_image_evals = 0  # diagnostics: total per-image forwards
+        self._neb_ep_skipped = 0   # diagnostics: endpoint image-evals eliminated
+
         # Initialize params from paras dict
         self.params = self._init_params(NEBParams, paras, ("neb", "NEB", "ts"))
 
@@ -844,13 +859,36 @@ class NEB(JobABC):
 
         calc = self._mol_calc
         nmax = self._band_nmax
+        n_img = len(images)
+
+        # FIX #3: decide whether to skip the frozen endpoints. Reuse only when the
+        # cache is warm AND the endpoint coordinates are genuinely unchanged (guard
+        # against any path that re-optimises endpoints); else evaluate the full band
+        # and (re)warm the endpoint cache from it.
+        ep_ok = (self._reuse_endpoints and n_img >= 3 and self._ep_E is not None)
+        if ep_ok:
+            ep_ok = (np.array_equal(np.asarray(images[0].get_positions(), dtype=np.float64),
+                                    self._ep_pos[0])
+                     and np.array_equal(np.asarray(images[-1].get_positions(), dtype=np.float64),
+                                        self._ep_pos[1]))
+
+        if ep_ok:
+            eval_idx = list(range(1, n_img - 1))   # INTERNAL images only
+            eval_images = [images[i] for i in eval_idx]
+        else:
+            eval_idx = list(range(n_img))          # full band (warms endpoint cache)
+            eval_images = images
+
         # fixed_nmax keeps the padded (B, nmax_dof) layout stable across iters
         # (band membership is constant; only positions move) -> matches the
         # batch-calc contract used by BatchPRFO.
-        calc.prepare(images, fixed_nmax=nmax)
-        E_Ha, F_Ha = calc.get_ef_gpu()          # E (B,), F (B, nmax_dof)
+        calc.prepare(eval_images, fixed_nmax=nmax)
+        E_Ha, F_Ha = calc.get_ef_gpu()          # E (b,), F (b, nmax_dof)
         if self._band_nmax is None:
             self._band_nmax = int(F_Ha.shape[1])
+        self._neb_image_evals += len(eval_images)
+        if ep_ok:
+            self._neb_ep_skipped += 2
 
         if isinstance(E_Ha, torch.Tensor):
             E_np = E_Ha.detach().to("cpu", torch.float64).numpy()
@@ -861,11 +899,26 @@ class NEB(JobABC):
         else:
             F_np = np.asarray(F_Ha, dtype=np.float64)
 
-        Es, raw_F = [], []
-        for i, at in enumerate(images):
-            n_i = len(at)
-            Es.append(float(E_np[i]))
-            raw_F.append(F_np[i, :3 * n_i].reshape(n_i, 3).astype(np.float64, copy=True))
+        # scatter the evaluated rows into full-length (n_img) lists
+        Es = [None] * n_img
+        raw_F = [None] * n_img
+        for slot, i in enumerate(eval_idx):
+            n_i = len(images[i])
+            Es[i] = float(E_np[slot])
+            raw_F[i] = F_np[slot, :3 * n_i].reshape(n_i, 3).astype(np.float64, copy=True)
+
+        if ep_ok:
+            # splice the cached (constant) endpoint energies/forces; the endpoint
+            # forces are unused by neb_forces (projected forces are zeroed there)
+            # but are kept exact so any logging/diagnostics stay byte-consistent.
+            Es[0], Es[-1] = self._ep_E
+            raw_F[0], raw_F[-1] = self._ep_F
+        else:
+            # (re)warm the endpoint cache from this full-band evaluation
+            self._ep_E = (Es[0], Es[-1])
+            self._ep_F = (raw_F[0], raw_F[-1])
+            self._ep_pos = (np.asarray(images[0].get_positions(), dtype=np.float64).copy(),
+                            np.asarray(images[-1].get_positions(), dtype=np.float64).copy())
         return Es, raw_F
 
     def _band_eval(self, images: List[Atoms]):
@@ -1168,6 +1221,12 @@ class NEB(JobABC):
                 if dyneb:
                     idxs = [j for j in range(1, st["n_img"] - 1)
                             if (j not in st["frozen"]) or (j == st["hei"])]
+                elif self._reuse_endpoints:
+                    # FIX #3: endpoints 0 / n-1 never move and their projected NEB
+                    # forces are zeroed -> evaluate INTERNAL images only. Their
+                    # energies were filled by the INITIAL full-band forward and stay
+                    # in st["Es"] (constant), so band_forces' tangents are unchanged.
+                    idxs = list(range(1, st["n_img"] - 1))
                 else:
                     idxs = list(range(st["n_img"]))   # full band (matches oracle)
                 plan.append((st, idxs))

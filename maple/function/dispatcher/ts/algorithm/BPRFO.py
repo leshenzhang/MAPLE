@@ -269,6 +269,29 @@ class BatchPRFO:
         self._next_orig = 0                # next free ORIGINAL index for refilled guesses
         self._pool_refilled = 0            # diagnostics: total guesses pulled from queue
 
+        # --- ACCURACY-PRESERVING forward reuse (FIX #1 + #2) -----------------
+        # Default ON. The committed-geometry E/F threaded out of iter N-1 (end-of-
+        # iter FORWARD-B + the inner loop's committed trial forward) are reused at
+        # the top of iter N (FORWARD-A) and as the post-step gradient, because the
+        # geometry does NOT change between FORWARD-B(N-1) and FORWARD-A(N) (only
+        # backup_coords clones + convergence/shrink logic), and the UMA forward is
+        # block-diagonal (one molecule's perturbation cannot leak to another). On
+        # recalc/refill/forced iters the reuse is SKIPPED -> a real forward runs.
+        # Set MAPLE_NO_FWD_REUSE=1 (or _reuse_forward=False) to force the legacy
+        # 3-forward/iter path = the byte-parity oracle.
+        self._reuse_forward = (os.environ.get("MAPLE_NO_FWD_REUSE", "0") != "1")
+        # in-run audit: when on, FORWARD-A still does a fresh forward and the abs
+        # diff vs the reused tensor is accumulated (proves geometry-unchanged,
+        # isolating reuse-legitimacy from fp32 run-to-run calculator noise).
+        self._audit_reuse = (os.environ.get("MAPLE_AUDIT_FWD_REUSE", "0") == "1")
+        self._audit_max_dE = 0.0
+        self._audit_max_dF = 0.0
+        self._fwd_calls = 0               # diagnostics: # get_ef_gpu forwards
+        self._fwd_reused = 0              # diagnostics: # forwards eliminated by reuse
+        # committed-geometry E threaded from FORWARD-B(N-1) -> FORWARD-A(N).
+        # (g is already carried by self._g_cart_prev = -F_committed*mask.)
+        self._reuse_E = None
+
 
     # ===================================================
     # PUBLIC RUN
@@ -324,11 +347,19 @@ class BatchPRFO:
         self._lanczos_unconverged = 0
         self._neg_guard_hits = 0
 
+        # reset forward-reuse state + diagnostics for this run
+        self._reuse_E = None
+        self._audit_max_dE = 0.0
+        self._audit_max_dF = 0.0
+        self._fwd_calls = 0
+        self._fwd_reused = 0
+
         self._init_xyz_paths(B0)
         self._symbols_per_batch = _symbols_flat(atoms_list)
 
         # === First prepare to fix nmax ===
         calc.prepare(atoms_list)
+        self._fwd_calls += 1
         _, F0 = calc.get_ef_gpu()
         self._nmax = int(F0.shape[1])
         self._arange_n = torch.arange(self._nmax, device=device)
@@ -378,11 +409,24 @@ class BatchPRFO:
                 # exactly each iteration by the Lanczos HVP solver in _eigh_and_track_modes.
                 # The model seed is built ONCE (or on a forced straggler restart) -- the
                 # RecalcFC cadence does NOT re-seed (that would wipe Bofill curvature).
-                E_old, F_now = calc.get_ef_gpu()
-                E_old = E_old.to(dtype=DTYPE)
-                F_now = F_now.to(dtype=DTYPE)
-                g_cart = -F_now * real_mask.to(DTYPE)
                 seed_now = (self._H_work is None) or forced
+                # FIX #1: on a non-seed iter the committed geometry is identical to the
+                # one already evaluated by FORWARD-B at the end of iter N-1 (only
+                # backup_coords clones + convergence/shrink ran in between) -> thread its
+                # E (self._reuse_E) and g (self._g_cart_prev) instead of a fresh forward.
+                # SKIP on seed/forced/refill (geometry/batch changed -> real forward).
+                if self._reuse_forward and (not seed_now) and (self._reuse_E is not None) \
+                        and (self._reuse_E.shape[0] == real_mask.shape[0]):
+                    E_old = self._reuse_E
+                    g_cart = self._g_cart_prev
+                    self._fwd_reused += 1
+                    if self._audit_reuse:
+                        self._audit_forward(calc, E_old, g_cart, real_mask)
+                else:
+                    E_old, F_now = self._ef(calc)
+                    E_old = E_old.to(dtype=DTYPE)
+                    F_now = F_now.to(dtype=DTYPE)
+                    g_cart = -F_now * real_mask.to(DTYPE)
                 if seed_now:
                     self._recalc_count = self._recalc_count + 1
                     self._H_work = self._build_seed_hessian(atoms_list, real_mask)
@@ -422,7 +466,9 @@ class BatchPRFO:
                 pass  # iterative path already produced E_old / H_cart / g_cart above
             elif need_recalc:
                 self._recalc_count = self._recalc_count + 1
-                # Pull EFH (true or numerical) from calculator; pad to nmax
+                # Pull EFH (true or numerical) from calculator; pad to nmax.
+                # A real forward (the Hessian base point) -- reuse is NOT applicable.
+                self._fwd_calls += 1
                 E_old, F_tmp, H_tmp, _ = calc.get_efh_gpu()
                 E_old = E_old.to(dtype=DTYPE)
                 F_tmp = F_tmp.to(dtype=DTYPE)
@@ -453,14 +499,25 @@ class BatchPRFO:
                 self._w(f"[Iter {outer_it}] Recalculated exact Hessian\n")
 
             else:
-                # Non-recalc step: use working Hessian; get current EF
-                E_old, F_now = calc.get_ef_gpu()
-                E_old = E_old.to(dtype=DTYPE)
-                F_now = F_now.to(dtype=DTYPE)
-
-                # Use working Hessian, compute current gradient
+                # Non-recalc step: use working Hessian; get current EF.
+                # Use working Hessian; gradient from the committed geometry.
                 H_cart = self._H_work
-                g_cart = -F_now * real_mask.to(DTYPE)
+                # FIX #1: this branch is reached ONLY when not (recalc|forced|refill)
+                # (need_recalc is False), so the committed geometry equals the one
+                # FORWARD-B already evaluated at the end of iter N-1 -> reuse its E/g
+                # (block-diagonal forward => bit-identical) instead of FORWARD-A.
+                if self._reuse_forward and (self._reuse_E is not None) \
+                        and (self._reuse_E.shape[0] == real_mask.shape[0]):
+                    E_old = self._reuse_E
+                    g_cart = self._g_cart_prev
+                    self._fwd_reused += 1
+                    if self._audit_reuse:
+                        self._audit_forward(calc, E_old, g_cart, real_mask)
+                else:
+                    E_old, F_now = self._ef(calc)
+                    E_old = E_old.to(dtype=DTYPE)
+                    F_now = F_now.to(dtype=DTYPE)
+                    g_cart = -F_now * real_mask.to(DTYPE)
 
             # Mass-weighting and eigen-decomposition
             H_mw, g_mw = self._mass_weight_hg(H_cart, g_cart, real_mask)
@@ -472,25 +529,42 @@ class BatchPRFO:
             do_check = ((outer_it % self.conv_check_interval == 0)
                         or (outer_it == self.max_outer_iter))
 
-            # Inner RS-PRFO loop
-            trust_r, last_step, last_rho, step_accepted = self._inner_rs_prfo_loop(
-                it=outer_it,
-                calc=calc,
-                w=w, V=V, gp=gp,
-                H=H_cart, g_cart=g_cart,
-                trust_r=trust_r,
-                last_step=last_step,
-                real_mask=real_mask,
-                E_old=E_old,
-                log=do_check,
-            )
+            # Inner RS-PRFO loop. FIX #2: it now ALSO returns the committed-geometry
+            # E/g it already evaluated (the accepted trial forward at line ~1204 is at
+            # base+s_cart == the committed geometry; the legacy code dropped its forces
+            # via `_` and FORWARD-B below recomputed them at the identical geometry).
+            trust_r, last_step, last_rho, step_accepted, E_committed, g_committed = \
+                self._inner_rs_prfo_loop(
+                    it=outer_it,
+                    calc=calc,
+                    w=w, V=V, gp=gp,
+                    H=H_cart, g_cart=g_cart,
+                    trust_r=trust_r,
+                    last_step=last_step,
+                    real_mask=real_mask,
+                    E_old=E_old,
+                    log=do_check,
+                )
 
-            # After step: get new gradient at the committed geometry (ONE forward; reused
-            # below by the convergence check, which evaluates the SAME geometry).
-            E_fin, F_fin = calc.get_ef_gpu()
-            F_fin = F_fin.to(dtype=DTYPE)
-            g_new_cart = -F_fin * real_mask.to(DTYPE)
-            E_fin = E_fin.to(dtype=DTYPE)
+            # After step: new E/gradient at the committed geometry. FIX #2: reuse the
+            # inner loop's committed E/g (block-diagonal forward => bit-identical to a
+            # fresh forward at the same coords) instead of FORWARD-B. The convergence
+            # check below already reuses these (E_precomp/g_precomp). On reuse-OFF the
+            # legacy real forward (FORWARD-B) runs -- the byte-parity oracle.
+            if self._reuse_forward:
+                E_fin = E_committed
+                g_new_cart = g_committed
+                self._fwd_reused += 1
+                if self._audit_reuse:
+                    self._audit_forward(calc, E_fin, g_new_cart, real_mask)
+            else:
+                E_fin, F_fin = self._ef(calc)
+                F_fin = F_fin.to(dtype=DTYPE)
+                g_new_cart = -F_fin * real_mask.to(DTYPE)
+                E_fin = E_fin.to(dtype=DTYPE)
+
+            # Thread the committed E forward for FIX #1 (FORWARD-A of the next iter).
+            self._reuse_E = E_fin
 
             # Bofill update: apply ONLY if we didn't just recalculate AND at least one step was accepted
             if not need_recalc and step_accepted.any():
@@ -612,6 +686,12 @@ class BatchPRFO:
                     self._H_work = self._H_work[survive_local]
                 if self._g_cart_prev is not None:
                     self._g_cart_prev = self._g_cart_prev[survive_local]
+                # FIX #1: keep the threaded committed-E aligned with the shrunk batch
+                # (survivors' geometry is unchanged, so the sliced value stays valid
+                # for the next FORWARD-A). A refill below sets _force_recalc_next=True,
+                # so the post-refill iter does a real forward anyway (no stale reuse).
+                if self._reuse_E is not None:
+                    self._reuse_E = self._reuse_E[survive_local]
 
                 # ---- Streaming pool refill (INVERSE of the shrink above) ----
                 # Pull up to (B_target - active) fresh guesses and torch.cat new rows
@@ -759,6 +839,12 @@ class BatchPRFO:
                     f"unconverged_ritz={self._lanczos_unconverged}\n")
         if self.mode_follow_guard:
             self._w(f"# mode_follow_guard: neg_num==0 flags={self._neg_guard_hits}\n")
+        # FIX #1/#2 forward accounting: real forwards executed vs reuses eliminated.
+        self._w(f"# forward_reuse: reuse_forward={self._reuse_forward} "
+                f"fwd_calls={self._fwd_calls} fwd_reused={self._fwd_reused}\n")
+        if self._audit_reuse:
+            self._w(f"# forward_reuse_audit: max|dE|={self._audit_max_dE:.3e} Ha "
+                    f"max|dg|={self._audit_max_dF:.3e} Ha/A\n")
 
         self._close_log()
 
@@ -1108,6 +1194,31 @@ class BatchPRFO:
         return lam_out, vec_out
 
     # ===================================================
+    # FORWARD ACCOUNTING + REUSE AUDIT
+    # ===================================================
+    def _ef(self, calc):
+        """calc.get_ef_gpu() with a forward counter (diagnostics / forward-count
+        parity gate). Every REAL forward in the run loop goes through here."""
+        self._fwd_calls += 1
+        return calc.get_ef_gpu()
+
+    @torch.no_grad()
+    def _audit_forward(self, calc, E_reuse, g_reuse, real_mask):
+        """Audit the legitimacy of a reused forward: do a FRESH forward at the
+        current (supposedly unchanged) coords and accumulate max|reuse-fresh| for
+        E and g. If the geometry truly did not move, this is at the UMA fp32 run-to-
+        run noise floor (~1e-7), proving the reuse is exact up to calculator noise
+        (NOT an algorithmic change). Enabled only by MAPLE_AUDIT_FWD_REUSE=1; it
+        ADDS a forward so it is never on in production."""
+        self._fwd_calls += 1
+        E_fresh, F_fresh = calc.get_ef_gpu()
+        g_fresh = -F_fresh.to(dtype=DTYPE) * real_mask.to(DTYPE)
+        dE = float((E_reuse.to(DTYPE) - E_fresh.to(DTYPE)).abs().max().item())
+        dF = float((g_reuse - g_fresh).abs().max().item())
+        self._audit_max_dE = max(self._audit_max_dE, dE)
+        self._audit_max_dF = max(self._audit_max_dF, dF)
+
+    # ===================================================
     # INNER RS-PRFO LOOP
     # ===================================================
     @profile
@@ -1130,6 +1241,14 @@ class BatchPRFO:
         accepted = torch.zeros(B, dtype=torch.bool, device=device)
         step_accepted = torch.zeros(B, dtype=torch.bool, device=device)
         last_rho = torch.full((B,), float("nan"), dtype=DTYPE, device=device)
+
+        # === FIX #2: committed-geometry E/g, threaded back to run() so it can skip
+        # FORWARD-B. Init to the base point (E_old / g_cart at entry): a structure
+        # that never accepts a step stays at base, so its committed E/g == base.
+        # On each accept the row is overwritten with the accepted trial's E and
+        # forces (the trial forward at base+s_cart IS the committed geometry).
+        E_committed = E_old.clone()
+        g_committed = g_cart.clone()
 
         # === OPTIMIZATION #4: Adaptive max attempts ===
         if self._recent_acceptance_rate > 0.7 and it > 5:
@@ -1198,11 +1317,16 @@ class BatchPRFO:
             s_try = torch.zeros_like(s_cart)
             s_try[pend] = s_cart[pend]
 
-            # Trial evaluation
+            # Trial evaluation. FIX #2: KEEP the trial forces (the legacy code dropped
+            # them via `_`); for an accepted structure base+s_cart IS the committed
+            # geometry, so these forces == FORWARD-B's forces (block-diagonal) and let
+            # run() skip FORWARD-B. The trial forward itself is unavoidable (rho test).
             calc.backup_coords()
             calc.step_cart_(s_try)
-            E_new, _ = calc.get_ef_gpu()
+            self._fwd_calls += 1
+            E_new, F_trial = calc.get_ef_gpu()
             E_new = E_new.to(dtype=DTYPE)
+            F_trial = F_trial.to(dtype=DTYPE)
             calc.restore_coords()
 
             # Model change - could be further optimized
@@ -1235,6 +1359,11 @@ class BatchPRFO:
                 calc.step_cart_(s_commit)
                 last_step[acc] = s_commit[acc]
                 step_accepted |= acc
+                # FIX #2: the accepted rows now sit at base+s_cart == the geometry the
+                # trial forward (above) evaluated -> record its E and g there so run()
+                # reuses them instead of FORWARD-B (g = -F*mask, the run() convention).
+                E_committed[acc] = E_new[acc]
+                g_committed[acc] = (-F_trial * real_mask.to(DTYPE))[acc]
                 self._dump_xyz_subset(calc, acc, it)
 
             # ---- trust-radius update ----
@@ -1270,7 +1399,7 @@ class BatchPRFO:
             if attempts_used < max_attempts:
                 self._w(f"  [Efficiency] Used {attempts_used}/{max_attempts} attempts\n")
 
-        return trust_r, last_step, last_rho, step_accepted
+        return trust_r, last_step, last_rho, step_accepted, E_committed, g_committed
     # ===================================================
     # CONVERGENCE
     # ===================================================

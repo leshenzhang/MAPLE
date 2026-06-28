@@ -813,6 +813,15 @@ class LQABatch:
         self._step_len_mw = float(self.p.step_length_bohr * BOHR_TO_ANG)
         self._build_padding()
 
+        # --- OPTIONAL FIX #4: amortized Hessian (method-consistent, NOT byte-id) -
+        # Default p.hessian_recalc=None -> exact get_efh_gpu() EVERY macro step =
+        # the current behaviour (byte-identical). When set to K>0 the batched LQA
+        # mirrors the single-structure LQA: exact Hessian only every K steps,
+        # Bofill/BFGS-updated (cheap get_ef_gpu) in between -- amortizing the
+        # expensive FD Hessian (3N+ forwards) over K steps. OPT-IN.
+        self._efh_calls = 0       # diagnostics: # exact get_efh_gpu Hessian forwards
+        self._ef_calls = 0        # diagnostics: # cheap get_ef_gpu forwards (amortized steps)
+
     # ----------------------------- setup ----------------------------------
     def _build_padding(self):
         """Build padded mass-weight vector D, DOF mask, DOF counts, TS coords."""
@@ -876,6 +885,7 @@ class LQABatch:
         """
         self.calc.set_coords_(self._ts_coord_N3)
         E_ts, F_ts, H_ts, _ = self.calc.get_efh_gpu()
+        self._efh_calls += 1
         Hmw = self.Dpad[:, :, None] * H_ts * self.Dpad[:, None, :]
         Hmw = 0.5 * (Hmw + Hmw.transpose(1, 2))
         w, V = _torch.linalg.eigh(Hmw)                       # ascending eigvals
@@ -943,6 +953,67 @@ class LQABatch:
         dx = dx * act[:, None].to(_torch.float64)
         return dx
 
+    # ---------------- batched Bofill Hessian update (FIX #4) -----------------
+    @staticmethod
+    def _bofill_update_batched(H, s_cart, g_prev, g_new, real_mask,
+                               step_accepted=None,
+                               step_tol: float = 1e-8, grad_tol: float = 1e-8,
+                               sr1_tol: float = 1e-8):
+        """Batched Bofill (MS/SR1 + PSB) update of the CARTESIAN Hessian.
+
+        Ported verbatim from BPRFO._bofill_update_batched (same Gaussian-style
+        residual Z = dg - H.dq, phi mixing, masked to real DOFs, per-structure
+        gating on step_accepted). Used by the FIX #4 amortized-Hessian LQA path to
+        carry curvature between exact get_efh_gpu() recalcs (method-consistent with
+        the single-structure LQA's BFGS/Bofill micro-step Hessian update)."""
+        DTYPE = H.dtype
+        rm = real_mask.to(DTYPE)
+        mask_ij = (real_mask.unsqueeze(-1) & real_mask.unsqueeze(-2)).to(DTYPE)
+
+        dq = s_cart.to(DTYPE) * rm
+        dg = (g_new - g_prev).to(DTYPE) * rm
+        dq2 = (dq * dq).sum(-1)
+        dg2 = (dg * dg).sum(-1)
+        upd_mask = (dq2 > step_tol**2) & (dg2 > grad_tol**2)
+        if step_accepted is not None:
+            upd_mask = upd_mask & step_accepted
+        if not bool(upd_mask.any()):
+            return H
+
+        H_new = H.clone()
+        idx = upd_mask.nonzero(as_tuple=False).flatten()
+        dq_m = dq[idx]; dg_m = dg[idx]; HH = H_new[idx]
+        Hdq = _torch.einsum("mij,mj->mi", HH, dq_m)
+        Z = dg_m - Hdq
+        dq2_m = (dq_m * dq_m).sum(-1)
+        zz_m = (Z * Z).sum(-1)
+        qz_m = (dq_m * Z).sum(-1)
+
+        Z_dqT = _torch.einsum("mi,mj->mij", Z, dq_m) * mask_ij[idx]
+        dq_ZT = _torch.einsum("mi,mj->mij", dq_m, Z) * mask_ij[idx]
+        dq_dqT = _torch.einsum("mi,mj->mij", dq_m, dq_m) * mask_ij[idx]
+        dH_PSB = (Z_dqT + dq_ZT) / dq2_m.view(-1, 1, 1) \
+            - (qz_m / (dq2_m * dq2_m)).view(-1, 1, 1) * dq_dqT
+
+        use_sr1 = (qz_m.abs() > sr1_tol) & (zz_m > sr1_tol**2)
+        dH_SR1_full = _torch.zeros_like(dH_PSB)
+        if bool(use_sr1.any()):
+            Z_ZT = _torch.einsum("mi,mj->mij", Z[use_sr1], Z[use_sr1]) * mask_ij[idx][use_sr1]
+            dH_SR1_full[use_sr1] = Z_ZT / qz_m[use_sr1].view(-1, 1, 1)
+
+        phi = _torch.ones_like(qz_m)
+        good_phi = (dq2_m > sr1_tol**2) & (zz_m > sr1_tol**2)
+        if bool(good_phi.any()):
+            ratio = (qz_m[good_phi] * qz_m[good_phi]) / (dq2_m[good_phi] * zz_m[good_phi])
+            phi[good_phi] = (1.0 - ratio).clamp(0.0, 1.0)
+        phi = _torch.where(use_sr1, phi, _torch.ones_like(phi))
+
+        inc = (1.0 - phi).view(-1, 1, 1) * dH_SR1_full + phi.view(-1, 1, 1) * dH_PSB
+        HH = HH + inc
+        HH = 0.5 * (HH + HH.transpose(-1, -2))
+        H_new[idx] = HH
+        return H_new
+
     # --------------------------- one direction ----------------------------
     def _propagate_side(self, sign, vneg, active_init):
         """Propagate all B structures one side (sign=+1 forward / -1 backward).
@@ -966,20 +1037,40 @@ class LQABatch:
         store = [{"E": [], "maxG": [], "rmsG": [], "x": []} for _ in range(B)]
         active = active_init.clone()
 
-        # initial eval at the displaced start point
+        # FIX #4: amortize the Hessian when p.hessian_recalc=K>0 (default None ->
+        # exact every step = current behaviour, byte-identical). The displaced
+        # start point is ALWAYS an exact Hessian anchor.
+        recalc_k = getattr(p, "hessian_recalc", None)
+        amortize = (recalc_k is not None and int(recalc_k) > 0)
+
+        # initial eval at the displaced start point (exact Hessian anchor)
         E, F, H, _ = self.calc.get_efh_gpu()
+        self._efh_calls += 1
         self._record(store, E, F, q_mw, active)
         maxG, rmsG = self._force_metrics(F)
         conv = (maxG <= p.f_max_th) & (rmsG <= p.f_rms_th)
         active = active & ~conv
+        g_prev = -F   # Cartesian gradient, threaded for the Bofill update
 
         for _it in range(1, p.max_steps + 1):
             if not bool(active.any()):
                 break
             dx = self._lqa_step(F, H, active)
             q_mw = q_mw + dx
-            self.calc.step_cart_(dx * Dpad)
-            E, F, H, _ = self.calc.get_efh_gpu()
+            s_cart = dx * Dpad
+            self.calc.step_cart_(s_cart)
+            if (not amortize) or (_it % int(recalc_k) == 0):
+                # exact Hessian recalc (anchor): default path takes this EVERY step
+                E, F, H, _ = self.calc.get_efh_gpu()
+                self._efh_calls += 1
+            else:
+                # amortized step: cheap E/F forward + Bofill-update the Hessian
+                E, F = self.calc.get_ef_gpu()
+                self._ef_calls += 1
+                g_new = -F
+                H = self._bofill_update_batched(
+                    H, s_cart, g_prev, g_new, self.dof_mask, step_accepted=active)
+            g_prev = -F
             self._record(store, E, F, q_mw, active)
             maxG, rmsG = self._force_metrics(F)
             conv = (maxG <= p.f_max_th) & (rmsG <= p.f_rms_th)
