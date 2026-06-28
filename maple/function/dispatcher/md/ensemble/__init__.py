@@ -10,5 +10,6 @@ Provides different statistical ensembles for MD simulations:
 from .nve import NVE
 from .nvt import NVT
 from .npt import NPT
+from .batched import BatchedMD
 
-__all__ = ['NVE', 'NVT', 'NPT']
+__all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD']

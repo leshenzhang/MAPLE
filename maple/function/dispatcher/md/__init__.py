@@ -30,6 +30,8 @@ __author__ = 'MAPLE Development Team'
 from .ensemble.nve import NVE
 from .ensemble.nvt import NVT
 from .ensemble.npt import NPT
+# Opt-in batched (replica/ensemble) MD; single-structure NVE/NVT path is the oracle.
+from .ensemble.batched import BatchedMD
 
 # Thermostats
 from .thermostat.langevin import LangevinThermostat
@@ -55,6 +57,8 @@ from .utils import (
 __all__ = [
     # Ensembles
     'NVE', 'NVT', 'NPT',
+    # Batched (replica/ensemble) MD
+    'BatchedMD',
     # Thermostats
     'LangevinThermostat', 'VRescaleThermostat',
     # Barostats
