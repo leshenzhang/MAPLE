@@ -75,7 +75,7 @@ def write_xyz(filename: str, images: List[Atoms], energies: Optional[List[float]
     """
     Write a multi-frame XYZ trajectory. If energies given, write in comment line.
     """
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         for i, at in enumerate(images):
             pos = to_numpy_f64(at.get_positions())
             symbols = at.get_chemical_symbols()

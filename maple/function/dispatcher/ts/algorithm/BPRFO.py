@@ -444,7 +444,7 @@ class BatchPRFO:
                             p = os.path.join(self.out_dir, f"ts_batch{oi + 1}.xyz")
                             self.xyz_paths.append(p)
                             self.frame_counts.append(0)
-                            open(p, "w").close()
+                            open(p, "w", encoding="utf-8").close()
 
                         # Extend the active set + its ORIGINAL-index map.
                         atoms_list = atoms_list + new_atoms
@@ -1222,7 +1222,7 @@ class BatchPRFO:
         ]
         self.frame_counts = [0 for _ in range(B_all)]
         for p in self.xyz_paths:
-            open(p, "w").close()
+            open(p, "w", encoding="utf-8").close()
 
     def _dump_xyz_all(self, calc, atoms_list, tag="init"):
         with torch.no_grad():
@@ -1266,7 +1266,7 @@ class BatchPRFO:
     def _append_xyz(self, idx_orig, symbols, pos_np, comment=""):
         path = self.xyz_paths[idx_orig]
         n = pos_np.shape[0]
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"{n}\n")
             f.write(f"{comment}\n")
             for k in range(n):

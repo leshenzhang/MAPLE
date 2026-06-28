@@ -184,6 +184,6 @@ def run_em_prestage(atoms: Atoms, params: dict, output: str) -> bool:
 
 
 def _log(output: str, lines) -> None:
-    with open(output, "a") as fh:
+    with open(output, "a", encoding="utf-8") as fh:
         for line in lines:
             fh.write(line)

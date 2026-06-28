@@ -368,7 +368,7 @@ class Scan(JobABC):
         xyz_filename = base + "_scan_final.xyz"
         
         try:
-            self.xyz_file = open(xyz_filename, "w")
+            self.xyz_file = open(xyz_filename, "w", encoding="utf-8")
             
             if dim == 1:
                 coords_list, energies = self._scan_1d(scan_values)

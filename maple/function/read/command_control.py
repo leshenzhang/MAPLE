@@ -949,14 +949,14 @@ class CommandControl:
     @staticmethod
     def _log_info(output_path: Optional[str], lines: List[str]) -> None:
         if output_path:
-            with open(output_path, "a") as handle:
+            with open(output_path, "a", encoding="utf-8") as handle:
                 for line in lines:
                     handle.write(line)
 
     @staticmethod
     def _log_error(output_path: Optional[str], message: str) -> None:
         if output_path:
-            with open(output_path, "a") as handle:
+            with open(output_path, "a", encoding="utf-8") as handle:
                 handle.write(f"ERROR: {message}\n")
 
     def get(self, key: str, default: Optional[Any] = None) -> Any:

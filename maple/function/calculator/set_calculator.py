@@ -562,11 +562,11 @@ class SetCalculator:
             raise
 
     def log_error(self, error_message: str) -> None:
-        with open(self.output, 'a') as handle:
+        with open(self.output, 'a', encoding="utf-8") as handle:
             handle.write(f'ERROR: {error_message.rstrip()}\n')
 
     def log_info(self, info_message: list) -> None:
-        with open(self.output, 'a') as handle:
+        with open(self.output, 'a', encoding="utf-8") as handle:
             for line in info_message:
                 handle.write(line)
 

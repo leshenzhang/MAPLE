@@ -6,7 +6,7 @@ def log_error(error_message: str, output:str) -> None:
         error_message: The error message to log.
         output: The output file.
     """
-    with open(output, 'a') as file:
+    with open(output, 'a', encoding="utf-8") as file:
         file.write(f"ERROR: {error_message}\n")
 
 def log_info(info_message: list, output:str) -> None:
@@ -17,6 +17,6 @@ def log_info(info_message: list, output:str) -> None:
         info_message: The info message to log.
         output: The output file.
     """
-    with open(output, 'a') as file:
+    with open(output, 'a', encoding="utf-8") as file:
         for info in info_message:   
             file.write(f"{info}")

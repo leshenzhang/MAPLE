@@ -1040,7 +1040,7 @@ class AutoNEB(JobABC):
                 'hei_idx': node.hei_idx,
                 'iteration': node.iteration,
             }
-        with open(tree_file, 'w') as f:
+        with open(tree_file, 'w', encoding="utf-8") as f:
             json.dump(tree_data, f, indent=2)
         log_info([f"Wrote path tree to: {tree_file}\n"], self.output)
 

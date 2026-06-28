@@ -309,7 +309,7 @@ class HierarchicalTimer:
         
         # Write to file only (no stdout output)
         output = "\n".join(lines)
-        with open(output_file, 'a') as f:
+        with open(output_file, 'a', encoding="utf-8") as f:
             f.write(output)
     
     def _print_node(self, node: TimingNode, lines: List[str], total_time: float, parent_time: float):

@@ -80,7 +80,7 @@ def masses_D(atoms: Atoms) -> np.ndarray:
 
 def write_xyz(path: str, atoms_list: List[Atoms], energies: Optional[List[float]] = None):
     """Write a list of structures to an XYZ file."""
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for i, at in enumerate(atoms_list):
             pos = at.get_positions()
             symbols = at.get_chemical_symbols()

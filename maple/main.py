@@ -20,7 +20,7 @@ def _default_output_path(input_file: str) -> str:
 
 def _log_error_to_output(output_file: str, message: str, exc: Exception | None = None) -> None:
     try:
-        with open(output_file, "a") as handle:
+        with open(output_file, "a", encoding="utf-8") as handle:
             handle.write(f"ERROR: {message.rstrip()}\n")
             if exc is not None:
                 traceback.print_exception(type(exc), exc, exc.__traceback__, file=handle)

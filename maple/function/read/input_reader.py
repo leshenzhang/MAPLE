@@ -317,7 +317,7 @@ class InputReader():
 
     def log_info(self, info_message: list) -> None:
         """Logs info messages to the output file."""
-        with open(self.output, 'a') as file:
+        with open(self.output, 'a', encoding="utf-8") as file:
             for info in info_message:
                 file.write(f"{info}")
 

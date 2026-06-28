@@ -64,7 +64,7 @@ def write_xyz(filename: str, atoms: Atoms, energy: Optional[float] = None,
     pos = to_numpy_f64(atoms.get_positions())
     symbols = atoms.get_chemical_symbols()
     
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         f.write(f"{len(symbols)}\n")
         
         # Build comment line
@@ -105,7 +105,7 @@ def append_xyz_trajectory(filename: str, atoms: Atoms, energy: Optional[float] =
     pos = to_numpy_f64(atoms.get_positions())
     symbols = atoms.get_chemical_symbols()
     
-    with open(filename, "a") as f:
+    with open(filename, "a", encoding="utf-8") as f:
         f.write(f"{len(symbols)}\n")
         
         if energy is not None:

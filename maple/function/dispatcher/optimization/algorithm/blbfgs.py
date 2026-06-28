@@ -544,7 +544,7 @@ class BatchLBFGS:
         ]
         self.frame_counts = [0 for _ in range(B_all)]
         for p in self.xyz_paths:
-            open(p, "w").close()
+            open(p, "w", encoding="utf-8").close()
 
     def _dump_xyz_all(self, calc, atoms_list, tag="init"):
         with torch.no_grad():
@@ -559,7 +559,7 @@ class BatchLBFGS:
     def _append_xyz(self, idx_orig, symbols, pos_np, comment=""):
         path = self.xyz_paths[idx_orig]
         n = pos_np.shape[0]
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"{n}\n")
             f.write(f"{comment}\n")
             for k in range(n):

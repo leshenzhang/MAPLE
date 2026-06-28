@@ -11,7 +11,7 @@ def write_xyz(filename: str, atoms_list: list, energies: list = None):
 	atoms_list: [Atoms, Atoms, ...]
 	energies:   [float, float, ...] 可选
 	"""
-	with open(filename, "w") as f:
+	with open(filename, "w", encoding="utf-8") as f:
 		for i, at in enumerate(atoms_list):
 			pos = at.get_positions()
 			symbols = at.get_chemical_symbols()

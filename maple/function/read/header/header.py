@@ -18,5 +18,5 @@ def print_banner(output_file_name: str) -> None:
 **********************************************************************
 
 """
-        with open(output_file_name, 'a') as file:
+        with open(output_file_name, 'a', encoding="utf-8") as file:
             file.write(banner + "\n")

@@ -136,7 +136,7 @@ class engine():
                         "Split multi-structure/trajectory input before using "
                         "#solv(explicit=...)."
                     )
-                    with open(self.output, "a") as handle:
+                    with open(self.output, "a", encoding="utf-8") as handle:
                         handle.write(f"ERROR: {msg}\n")
                     raise ValueError(msg)
 
@@ -145,7 +145,7 @@ class engine():
                         "Explicit solvation is non-periodic; #pbc is not supported "
                         "with #solv(explicit=...)."
                     )
-                    with open(self.output, "a") as handle:
+                    with open(self.output, "a", encoding="utf-8") as handle:
                         handle.write(f"ERROR: {msg}\n")
                     raise ValueError(msg)
 
