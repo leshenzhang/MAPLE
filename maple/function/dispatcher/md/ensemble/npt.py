@@ -207,6 +207,14 @@ class NPTParams:
     hmr:           str   = ""         # ""/off = no-op; on/true => factor 3.0; or a numeric factor
     hmr_factor:    Optional[float] = None   # explicit factor override of params.hmr
     hmr_bond_mult: float = 1.2        # covalent-radius scale for H-bond inference
+    # [Batch-3] Steered MD: constant-velocity pull on a COM-COM distance CV + Jarzynski work
+    smd:           str   = ""        # ""/off = no pull; on/distance => steer the COM-COM distance
+    smd_group1:    str   = ""        # first pull group:  all / heavy / "0,1,5-10" (taken as COM)
+    smd_group2:    str   = ""        # second pull group: all / heavy / "0,1,5-10" (taken as COM)
+    smd_k:         float = 0.0       # restraint force constant, Ha/Å² (same convention as posres_fc)
+    smd_lam0:      str   = ""        # start centre (Å); ""/auto = current CV distance at step 0
+    smd_lam1:      float = 0.0       # end centre (Å); centre moves lam0 -> lam1 linearly over the run
+    smd_log_every: int   = 10        # steps between *_smd.dat work-log rows
 
     # ------------------------------------------------------------------
     # box_check: minimum-image box-size guard severity (strict|warn|off).

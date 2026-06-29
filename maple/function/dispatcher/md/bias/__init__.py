@@ -20,11 +20,15 @@ from .colvars_calc import ColvarsCalculator
 from .posres_calc import PosresCalculator, posres_enabled
 from .gamd import (GamdCalculator, gamd_enabled, gamd_params,
                    gamd_reweight_1d)
+from .steered import (SteeredMDCalculator, smd_enabled, jarzynski_1d,
+                      read_smd_work)
 from . import umbrella
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "PosresCalculator", "posres_enabled", "GamdCalculator",
-           "gamd_enabled", "gamd_params", "gamd_reweight_1d", "umbrella"]
+           "gamd_enabled", "gamd_params", "gamd_reweight_1d",
+           "SteeredMDCalculator", "smd_enabled", "jarzynski_1d",
+           "read_smd_work", "umbrella"]
 
 
 def maybe_wrap_bias(atoms, params, output):
@@ -39,9 +43,12 @@ def maybe_wrap_bias(atoms, params, output):
     colvars_in = getattr(params, "colvars", "") or ""
     posres_in = getattr(params, "posres", "")
     gamd_in = getattr(params, "gamd", "")
+    smd_in = getattr(params, "smd", "")
     want_posres = posres_enabled(posres_in)
     want_gamd = gamd_enabled(gamd_in)
-    if not plumed_in and not colvars_in and not want_posres and not want_gamd:
+    want_smd = smd_enabled(smd_in)
+    if (not plumed_in and not colvars_in and not want_posres
+            and not want_gamd and not want_smd):
         return atoms.calc
 
     inner = atoms.calc
@@ -73,6 +80,25 @@ def maybe_wrap_bias(atoms, params, output):
             getattr(params, "posres_ramp", ""),
             getattr(params, "steps", 0),
             atoms=atoms, output=output, restart_step=restart_step)
+
+    # Steered MD (constant-velocity pull on a COM-COM distance CV) is an
+    # additive moving restraint: it wraps on top of any active bias/posres,
+    # inside the optional outermost GaMD boost. total_steps = params.steps.
+    if want_smd:
+        _l0 = getattr(params, "smd_lam0", "")
+        _lam0 = (None if (_l0 is None or str(_l0).strip().lower()
+                          in ("", "auto", "none"))
+                 else float(_l0))
+        wrapped = SteeredMDCalculator(
+            wrapped,
+            getattr(params, "smd_group1", ""),
+            getattr(params, "smd_group2", ""),
+            float(getattr(params, "smd_k", 0.0)),
+            _lam0,
+            float(getattr(params, "smd_lam1", 0.0)),
+            int(getattr(params, "steps", 0)),
+            atoms=atoms, output=output, restart_step=restart_step,
+            log_every=int(getattr(params, "smd_log_every", 10)))
 
     # GaMD total-potential boost wraps outermost: ΔV is defined on the full
     # potential the dynamics sees (MLIP + any active bias/restraint). It is a
