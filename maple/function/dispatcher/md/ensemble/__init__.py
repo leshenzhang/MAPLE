@@ -12,5 +12,6 @@ from .nvt import NVT
 from .npt import NPT
 from .batched import BatchedMD
 from .nvt_batched import BatchedNVT
+from .umbrella_batched import BatchedUmbrella
 
-__all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT']
+__all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedUmbrella']

@@ -284,10 +284,22 @@ class BatchedNVT(JobABC):
 
     # ------------------------------------------------------------- force helper
     def _forces_au(self):
-        """ONE batched forward -> (E (B,) Ha, F (B, nmax_dof) a.u. = Ha/Bohr)."""
+        """ONE batched forward -> (E (B,) Ha, F (B, nmax_dof) a.u. = Ha/Bohr).
+
+        Force-assembly / bias-injection point: if a per-replica batch-aware
+        bias is attached (``self._bias``; e.g.
+        ``bias.batched.BatchedHarmonicRestraint`` for umbrella sampling), it
+        adds its per-replica force into the padded (B, nmax_dof) buffer here,
+        once per forward, via ``bias.apply(E, F, calc)``. No bias attached ->
+        exact no-op (unbiased / single-system parity preserved). This is the
+        SAME hook the orchestrator can target to batch GaMD / steered-MD."""
         E_Ha, F_Ha = self.calc.get_ef_gpu()
         F = F_Ha.to(self.device, self.dtype) * HA_PER_ANG_TO_AU
-        return E_Ha.to(self.device, self.dtype).reshape(-1), F
+        E = E_Ha.to(self.device, self.dtype).reshape(-1)
+        bias = getattr(self, "_bias", None)
+        if bias is not None:
+            E, F = bias.apply(E, F, self.calc)
+        return E, F
 
     def _displace(self, v, frac_dt):
         """Drift positions by ``v * frac_dt * dt`` (a.u. -> Angstrom) in the calc."""

@@ -23,12 +23,13 @@ from .gamd import (GamdCalculator, gamd_enabled, gamd_params,
 from .steered import (SteeredMDCalculator, smd_enabled, jarzynski_1d,
                       read_smd_work)
 from . import umbrella
+from .batched import BatchedHarmonicRestraint
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "PosresCalculator", "posres_enabled", "GamdCalculator",
            "gamd_enabled", "gamd_params", "gamd_reweight_1d",
            "SteeredMDCalculator", "smd_enabled", "jarzynski_1d",
-           "read_smd_work", "umbrella"]
+           "read_smd_work", "umbrella", "BatchedHarmonicRestraint"]
 
 
 def maybe_wrap_bias(atoms, params, output):
