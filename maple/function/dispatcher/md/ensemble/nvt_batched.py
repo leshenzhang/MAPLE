@@ -344,49 +344,67 @@ class BatchedNVT(JobABC):
         self._hist_T.append(2.0 * ke / (ndof * KELVIN_TO_HARTREE))
 
     # =================================================================== v-rescale
+    # ONE VV step is factored out (``_step_vrescale``) so a higher-level driver
+    # (e.g. REMD parallel tempering) can interleave its own bookkeeping between
+    # steps WITHOUT re-deriving the integrator. ``_run_vrescale`` is the plain
+    # NVT loop = repeated ``_step_vrescale``; the arithmetic is byte-identical to
+    # the pre-refactor monolithic loop (parity gate unchanged).
+    def _step_vrescale(self, v, F, step):
+        """ONE Bussi (2007) VV step: B(dt/2) -> A(dt) -> force -> B(dt/2) ->
+        per-replica rescale. Takes the cached force ``F`` (t-dt), returns the
+        updated ``(v, E, F)`` (E = PE at the new positions, F cached for t+dt)."""
+        self._set_anneal_T(step)
+        v = v + 0.5 * F / self.mass * self.dt_au          # B1 half kick
+        self._displace(v, 1.0)                            # A full drift
+        E, F = self._forces_au()                          # ONE forward
+        v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick
+        v = self._apply_thermostat(v, vrescale=True)      # per-replica Bussi A7
+        v = self._apply_projection(v, step)               # per-replica COM/angular
+        ke = 0.5 * (self.mass * v * v).sum(dim=1)         # (B,) Ha
+        self._record(ke, E)
+        self._steps_done = step
+        return v, E, F
+
     def _run_vrescale(self):
         """Vectorized VV (Bussi 2007 post-step rescale). Mirrors nvt._run_simulation
         v-rescale branch: B(dt/2) -> A(dt) -> force -> B(dt/2) -> per-replica rescale."""
-        torch = self._torch
         v = self.v
         E, F = self._forces_au()                              # cache F at t=0
         for step in range(1, self.params.steps + 1):
-            self._set_anneal_T(step)
-            v = v + 0.5 * F / self.mass * self.dt_au          # B1 half kick
-            self._displace(v, 1.0)                            # A full drift
-            E, F = self._forces_au()                          # ONE forward
-            v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick
-            v = self._apply_thermostat(v, vrescale=True)      # per-replica Bussi A7
-            v = self._apply_projection(v, step)               # per-replica COM/angular
-            ke = 0.5 * (self.mass * v * v).sum(dim=1)         # (B,) Ha
-            self._record(ke, E)
-            self._steps_done = step
+            v, E, F = self._step_vrescale(v, F, step)
         self.v = v
 
     # =================================================================== langevin
+    def _step_langevin(self, v, F, step):
+        """ONE LF-Middle Langevin step in the CARRIED-velocity representation:
+        full kick -> half drift -> OU thermostat -> half drift -> recompute force.
+        Takes carried ``v`` and cached force ``F`` (t-dt); returns the updated
+        ``(v, E, F)``. T/KE are recorded from the SYNC (standard) velocity."""
+        self._set_anneal_T(step)
+        v = v + F / self.mass * self.dt_au                # full kick (carried)
+        self._displace(v, 0.5)                            # half drift
+        v = self._apply_thermostat(v, vrescale=False)     # per-replica OU
+        self._displace(v, 0.5)                            # half drift
+        E, F = self._forces_au()                          # post-thermostat forward
+        v = self._apply_projection(v, step)               # per-replica COM/angular
+        # report SYNC (standard) KE/T: v_std = v_carried + 0.5*(F/m)*dt
+        v_sync = v + 0.5 * F / self.mass * self.dt_au
+        ke = 0.5 * (self.mass * v_sync * v_sync).sum(dim=1)
+        self._record(ke, E)
+        self._steps_done = step
+        return v, E, F
+
     def _run_langevin(self):
         """Vectorized LF-Middle Langevin (Leimkuhler & Matthews 2013). Mirrors
         nvt._run_simulation langevin branch in the CARRIED-velocity representation:
         full kick -> half drift -> OU thermostat -> half drift -> recompute forces.
         T/KE are reported from the SYNC (standard) velocity, matching nvt.py."""
-        torch = self._torch
         v = self.v
         E, F = self._forces_au()
         # standard -> LF-Middle carried at t=0 (v_carried = v - 0.5*(F/m)*dt).
         v = v - 0.5 * F / self.mass * self.dt_au
         for step in range(1, self.params.steps + 1):
-            self._set_anneal_T(step)
-            v = v + F / self.mass * self.dt_au                # full kick (carried)
-            self._displace(v, 0.5)                            # half drift
-            v = self._apply_thermostat(v, vrescale=False)     # per-replica OU
-            self._displace(v, 0.5)                            # half drift
-            E, F = self._forces_au()                          # post-thermostat forward
-            v = self._apply_projection(v, step)               # per-replica COM/angular
-            # report SYNC (standard) KE/T: v_std = v_carried + 0.5*(F/m)*dt
-            v_sync = v + 0.5 * F / self.mass * self.dt_au
-            ke = 0.5 * (self.mass * v_sync * v_sync).sum(dim=1)
-            self._record(ke, E)
-            self._steps_done = step
+            v, E, F = self._step_langevin(v, F, step)
         self.v = v
 
     # ----------------------------------------------------------------- finalize
