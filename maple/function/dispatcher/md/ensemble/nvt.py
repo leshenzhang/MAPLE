@@ -45,6 +45,8 @@ from ..utils import (
 )
 from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
+from ..constraints import build_constraint_manager, maybe_repartition_masses
+from ..anneal import make_anneal_fn
 
 
 def _apply_projection_with_work(
@@ -66,6 +68,10 @@ def _apply_projection_with_work(
     )
     kinetic_after = calculate_kinetic_energy(atoms, projected)
     return projected, projection, kinetic_after - kinetic_before
+
+
+from ..bias import maybe_wrap_bias
+from ..box_guard import check_box_size, composition_sanity
 
 
 @dataclass
@@ -97,6 +103,7 @@ class NVTParams:
     # 300 K: standard ambient condition used across all major MD tutorials.
     # ------------------------------------------------------------------
     temperature:     float = 300.0        # K
+    anneal:          str   = ""           # simulated-annealing T schedule (K); ""=constant T. e.g. "100,300" ramp, "300,500,300" heat/cool
 
     # ------------------------------------------------------------------
     # Thermostat algorithm
@@ -202,7 +209,40 @@ class NVTParams:
     remove_angular:   bool  = False  # initialization-only COM + rotation; parallel to remove_com
     remove_com_every: int   = 100    # runtime-only COM removal
     remove_angular_every: int = 0    # runtime-only COM + rotation; parallel to remove_com_every
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
+    posres:       str   = ""        # GROMACS posres: off / ref-structure path / "initial"; empty = off
+    posres_fc:    float = 0.0       # restraint force constant, Ha/Å²
+    posres_group: str   = "heavy"   # restrained atoms: all / heavy / explicit "0,1,5-10"
+    posres_ramp:  str   = ""        # descending k schedule (Ha/Å²); empty = constant fc
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
+    # [Batch-3] GaMD boost (CV-free enhanced sampling); empty/off = no boost
+    gamd:            str   = ""       # ""/off/lower/upper - boost mode (reaches params via _init_params)
+    gamd_sigma0:     float = 6.0      # kcal/mol; anti-Gaussian width ceiling (sigma0)
+    gamd_prep_steps: int   = 2000     # conventional-MD steps to collect V statistics
+    gamd_params:     Optional[dict] = None  # pre-fit {mode,k,E,...}; set to skip prep
+    # [Batch-3] Hydrogen mass repartitioning (4 fs steps with H-bond constraints)
+    hmr:           str   = ""         # ""/off = no-op; on/true => factor 3.0; or a numeric factor
+    hmr_factor:    Optional[float] = None   # explicit factor override of params.hmr
+    hmr_bond_mult: float = 1.2        # covalent-radius scale for H-bond inference
+    # [Batch-3] Steered MD: constant-velocity pull on a COM-COM distance CV + Jarzynski work
+    smd:           str   = ""        # ""/off = no pull; on/distance => steer the COM-COM distance
+    smd_group1:    str   = ""        # first pull group:  all / heavy / "0,1,5-10" (taken as COM)
+    smd_group2:    str   = ""        # second pull group: all / heavy / "0,1,5-10" (taken as COM)
+    smd_k:         float = 0.0       # restraint force constant, Ha/Å² (same convention as posres_fc)
+    smd_lam0:      str   = ""        # start centre (Å); ""/auto = current CV distance at step 0
+    smd_lam1:      float = 0.0       # end centre (Å); centre moves lam0 -> lam1 linearly over the run
+    smd_log_every: int   = 10        # steps between *_smd.dat work-log rows
+
+    # ------------------------------------------------------------------
+    # box_check: minimum-image box-size guard severity (strict|warn|off).
+    # strict (default) = GROMACS-style fatal abort when the shortest periodic
+    # box width drops below 2*r_max (the MLIP receptive field); warn = log and
+    # continue; off = disable. Only acts for PBC calculators (finite r_max).
+    # ------------------------------------------------------------------
+    box_check:       str   = "strict"
 
 
 class NVT(JobABC):
@@ -222,6 +262,17 @@ class NVT(JobABC):
 
         self.atoms = atoms
         self.params = self._init_params(NVTParams, paras, ("md", "MD", "nvt", "NVT"))
+        maybe_repartition_masses(self.atoms, self.params)
+        maybe_wrap_bias(self.atoms, self.params, output)
+
+        # --- GROMACS-grompp-style physical preflight (box size + composition) ---
+        # Reject a periodic box shorter than 2*r_max (MLIP receptive field),
+        # which would cause silent minimum-image self-interaction. Self-skips
+        # for non-PBC calculators. See dispatcher/md/box_guard.py.
+        check_box_size(self.atoms, self.atoms.calc, self.params.box_check,
+                       context="NVT setup preflight")
+        composition_sanity(self.atoms, self.atoms.calc, self.params.box_check,
+                           context="NVT setup preflight")
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(
@@ -253,6 +304,26 @@ class NVT(JobABC):
         )
         self._runtime_n_dof = get_n_dof_from_policy(runtime_policy)
         self._runtime_dof_description = describe_dof_policy(runtime_policy)
+
+        # [TASK#9 constraints] build the frozen constraint set (None if constraints=none)
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        if self._constraints is not None:
+            # constrained dynamics use the velocity-Verlet RATTLE path (v-rescale / NVE).
+            # The Langevin LFMiddle path is not constraint-aware, so fall back to the
+            # GROMACS production thermostat (v-rescale) when constraints + Langevin.
+            if self.params.thermostat == 'langevin':
+                self.log_info([
+                    "\n*** NOTE: constraints require the velocity-Verlet RATTLE path; "
+                    "switching thermostat 'langevin' -> 'v-rescale' "
+                    "(GROMACS production default) for this constrained run.\n\n"
+                ])
+                self.params.thermostat = 'v-rescale'
+            # each distance constraint removes one DOF (rigid water = 3)
+            self._runtime_n_dof = max(self._runtime_n_dof - self._n_constraints, 1)
+            self._runtime_dof_description += (
+                f" - {self._n_constraints} constraints (3N - 3 - n_constraints)"
+            )
 
         if self.params.thermostat == 'langevin':
             self.thermostat = LangevinThermostat(
@@ -531,6 +602,10 @@ class NVT(JobABC):
         ])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
+        # [TASK#9 constraints] attach the constraint set to the integrator
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
         v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.
@@ -549,7 +624,11 @@ class NVT(JobABC):
         is_vrescale = self.params.thermostat == 'v-rescale'
         w_bath = 0.0
 
+        anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
+
+            if anneal_fn is not None:
+                self.thermostat.set_temperature(anneal_fn(step))
 
             if is_vrescale:
                 v, forces = integrator.step(v, forces)

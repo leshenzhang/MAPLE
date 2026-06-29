@@ -270,7 +270,7 @@ class MDLogger:
                 if backup is not None:
                     backup_msgs.append(f"  Backed up existing file: {p.name} -> {backup.name}\n")
 
-            self.thermo_file = open(self.thermo_path, 'w')
+            self.thermo_file = open(self.thermo_path, 'w', encoding='utf-8')
             # Open trajectory file based on format
             if self.traj_format == 'dcd':
                 self.traj_file = DCDWriter(
@@ -281,7 +281,7 @@ class MDLogger:
                     first_step=step_offset,
                 )
             else:  # xyz
-                self.traj_file = open(self.traj_path, 'w')
+                self.traj_file = open(self.traj_path, 'w', encoding='utf-8')
         # else: files already opened in append mode by restart_simulation()
 
         # Write main output header
@@ -696,7 +696,7 @@ class MDLogger:
                         atoms.set_cell(Cell.fromcellpar(state["cell"]))
                     if state["pbc"] is not None:
                         atoms.set_pbc(state["pbc"])
-                    with open(self.final_path, 'w') as f:
+                    with open(self.final_path, 'w', encoding='utf-8') as f:
                         write_xyz_frame(
                             f,
                             atoms=atoms,
@@ -762,8 +762,8 @@ class MDLogger:
         # on start_simulation(step_offset=0) to open clean output files.
         # ------------------------------------------------------------------
         if not load_state:
-            self.thermo_file = (open(self.thermo_path, "a") if self.thermo_path.exists()
-                                else open(self.thermo_path, "w"))
+            self.thermo_file = (open(self.thermo_path, "a", encoding='utf-8') if self.thermo_path.exists()
+                                else open(self.thermo_path, "w", encoding='utf-8'))
             if self.traj_format == 'dcd':
                 if self.traj_path.exists():
                     self.traj_file = DCDWriter.open_for_append(self.traj_path)
@@ -776,8 +776,8 @@ class MDLogger:
                         first_step=state["step"],
                     )
             else:
-                self.traj_file = (open(self.traj_path, "a") if self.traj_path.exists()
-                                  else open(self.traj_path, "w"))
+                self.traj_file = (open(self.traj_path, "a", encoding='utf-8') if self.traj_path.exists()
+                                  else open(self.traj_path, "w", encoding='utf-8'))
             self.thermo_file.write(
                 f"\n# --- RESTARTED from {used_path.name} step {state['step']} ---\n"
             )
@@ -975,7 +975,7 @@ class MDLogger:
         # ------------------------------------------------------------------
         # Write summary file
         # ------------------------------------------------------------------
-        with open(self.summary_path, 'w') as f:
+        with open(self.summary_path, 'w', encoding='utf-8') as f:
             f.write("MD Simulation Summary\n")
             f.write("=" * 60 + "\n\n")
             f.write(f"Ensemble:                   {self._ensemble.upper()}\n")
@@ -1068,7 +1068,7 @@ class MDLogger:
             #   - Coordinates (can be used as input for next stage)
             #   - Velocities (embedded in XYZ, read by InputReader)
             #   - Cell parameters (if PBC)
-            with open(self.final_path, 'w') as f:
+            with open(self.final_path, 'w', encoding='utf-8') as f:
                 write_xyz_frame(
                     f,
                     atoms=atoms,
@@ -1109,7 +1109,7 @@ class MDLogger:
             messages: List of message strings
             echo:     Mirror output to stdout (used for progress lines)
         """
-        with open(self.main_output, 'a') as f:
+        with open(self.main_output, 'a', encoding='utf-8') as f:
             for msg in messages:
                 f.write(msg)
         if echo and self.verbose >= 1:

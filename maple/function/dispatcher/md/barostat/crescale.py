@@ -97,11 +97,11 @@ class CRescaleBarostat:
         #   dV/V|_noise = sqrt(2 k_B T β dt / (τ_P V)) * W
         # We precompute sqrt(2 k_B T β dt / τ_P) in units of √Å³:
         #   k_B T in eV = T * KELVIN_TO_HARTREE * HARTREE_TO_EV
-        #   β in Å³/eV  = compressibility / EV_PER_ANG3_TO_BAR
+        #   β in Å³/eV  = compressibility * EV_PER_ANG3_TO_BAR
         #   → product: [eV * Å³/eV * 1] = Å³  ✓
         HARTREE_TO_EV = 27.211386245988
         kT_ev = temperature * KELVIN_TO_HARTREE * HARTREE_TO_EV      # eV
-        beta_ang3_per_ev = compressibility / EV_PER_ANG3_TO_BAR      # Å³/eV
+        beta_ang3_per_ev = compressibility * EV_PER_ANG3_TO_BAR      # Å³/eV
         self._noise_prefactor = np.sqrt(
             2.0 * kT_ev * beta_ang3_per_ev * (timestep / tau_p)
         )   # units: √Å³

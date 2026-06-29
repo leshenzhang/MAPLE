@@ -89,6 +89,13 @@ class VRescaleThermostat:
         # that the input kinetic energy lives in the intended 3N-3 subspace.
         self._is_periodic = any(atoms.pbc)
 
+    def set_temperature(self, temperature: float) -> None:
+        """Update the target temperature (K), recomputing the cached kT and
+        target kinetic energy used by the V-rescale step (for annealing)."""
+        self.temperature = float(temperature)
+        self._kT_target = self.temperature * KELVIN_TO_HARTREE
+        self._ke_target = 0.5 * self._n_dof * self._kT_target
+
     def _sample_chi2(self, n: int) -> float:
         """
         Sample from χ²(n) distribution as the exact sum of n squared normals.

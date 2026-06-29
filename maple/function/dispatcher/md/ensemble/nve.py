@@ -33,6 +33,11 @@ from ..utils import (
     HA_PER_ANG_TO_AU,
 )
 from ..logger import MDLogger
+from ..constraints import build_constraint_manager, maybe_repartition_masses
+
+
+from ..bias import maybe_wrap_bias
+from ..box_guard import check_box_size, composition_sanity
 
 
 @dataclass
@@ -166,12 +171,45 @@ class NVEParams:
     # ------------------------------------------------------------------
     remove_com_every: int = 0       # runtime-only COM projection cadence; default disabled for strict NVE
     remove_angular_every: int = 0   # runtime-only angular projection cadence (includes COM first)
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
+    posres:       str   = ""        # GROMACS posres: off / ref-structure path / "initial"; empty = off
+    posres_fc:    float = 0.0       # restraint force constant, Ha/Å²
+    posres_group: str   = "heavy"   # restrained atoms: all / heavy / explicit "0,1,5-10"
+    posres_ramp:  str   = ""        # descending k schedule (Ha/Å²); empty = constant fc
 
     # ------------------------------------------------------------------
     # Random seed
     # Set for reproducible velocity initialization; None = system entropy.
     # ------------------------------------------------------------------
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
+    # [Batch-3] GaMD boost (CV-free enhanced sampling); empty/off = no boost
+    gamd:            str   = ""       # ""/off/lower/upper - boost mode (reaches params via _init_params)
+    gamd_sigma0:     float = 6.0      # kcal/mol; anti-Gaussian width ceiling (sigma0)
+    gamd_prep_steps: int   = 2000     # conventional-MD steps to collect V statistics
+    gamd_params:     Optional[dict] = None  # pre-fit {mode,k,E,...}; set to skip prep
+    # [Batch-3] Hydrogen mass repartitioning (4 fs steps with H-bond constraints)
+    hmr:           str   = ""         # ""/off = no-op; on/true => factor 3.0; or a numeric factor
+    hmr_factor:    Optional[float] = None   # explicit factor override of params.hmr
+    hmr_bond_mult: float = 1.2        # covalent-radius scale for H-bond inference
+    # [Batch-3] Steered MD: constant-velocity pull on a COM-COM distance CV + Jarzynski work
+    smd:           str   = ""        # ""/off = no pull; on/distance => steer the COM-COM distance
+    smd_group1:    str   = ""        # first pull group:  all / heavy / "0,1,5-10" (taken as COM)
+    smd_group2:    str   = ""        # second pull group: all / heavy / "0,1,5-10" (taken as COM)
+    smd_k:         float = 0.0       # restraint force constant, Ha/Å² (same convention as posres_fc)
+    smd_lam0:      str   = ""        # start centre (Å); ""/auto = current CV distance at step 0
+    smd_lam1:      float = 0.0       # end centre (Å); centre moves lam0 -> lam1 linearly over the run
+    smd_log_every: int   = 10        # steps between *_smd.dat work-log rows
+
+    # ------------------------------------------------------------------
+    # box_check: minimum-image box-size guard severity (strict|warn|off).
+    # strict (default) = GROMACS-style fatal abort when the shortest periodic
+    # box width drops below 2*r_max (the MLIP receptive field); warn = log and
+    # continue; off = disable. Only acts for PBC calculators (finite r_max).
+    # ------------------------------------------------------------------
+    box_check:       str   = "strict"
 
 
 class NVE(JobABC):
@@ -199,6 +237,20 @@ class NVE(JobABC):
 
         # Initialize params from dict
         self.params = self._init_params(NVEParams, paras, ("md", "MD", "nve", "NVE"))
+        maybe_repartition_masses(self.atoms, self.params)
+        maybe_wrap_bias(self.atoms, self.params, output)
+
+        # [TASK#9 constraints] frozen constraint set (None if constraints=none)
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        # --- GROMACS-grompp-style physical preflight (box size + composition) ---
+        # Reject a periodic box shorter than 2*r_max (MLIP receptive field),
+        # which would cause silent minimum-image self-interaction. Self-skips
+        # for non-PBC calculators. See dispatcher/md/box_guard.py.
+        check_box_size(self.atoms, self.atoms.calc, self.params.box_check,
+                       context="NVE setup preflight")
+        composition_sanity(self.atoms, self.atoms.calc, self.params.box_check,
+                           context="NVE setup preflight")
 
         # Initialize components
         self.logger = MDLogger(
@@ -445,12 +497,14 @@ class NVE(JobABC):
             print(msg, end='', flush=True)
 
         # Initialize velocities
-        runtime_policy = get_runtime_dof_policy(
+        runtime_policy = get_initialization_dof_policy(
             self.atoms,
-            remove_com_every=self.params.remove_com_every,
-            remove_angular_every=self.params.remove_angular_every,
+            remove_com=self.params.remove_com,
+            remove_angular=self.params.remove_angular,
         )
         runtime_n_dof = get_n_dof_from_policy(runtime_policy)
+        # [TASK#9 constraints] subtract constrained DOF
+        runtime_n_dof = max(runtime_n_dof - self._n_constraints, 1)
 
         velocities = initialize_velocities(
             atoms=self.atoms,
@@ -508,27 +562,40 @@ class NVE(JobABC):
             temperature=self.params.temperature,
             atoms=self.atoms,
             step_offset=step_offset,
-            n_dof=get_n_dof_from_policy(get_runtime_dof_policy(
+            n_dof=max(get_n_dof_from_policy(get_initialization_dof_policy(
                 self.atoms,
-                remove_com_every=self.params.remove_com_every,
-                remove_angular_every=self.params.remove_angular_every,
-            )),
-            dof_description=describe_dof_policy(get_runtime_dof_policy(
+                remove_com=self.params.remove_com,
+                remove_angular=self.params.remove_angular,
+            )) - self._n_constraints, 1),
+            dof_description=describe_dof_policy(get_initialization_dof_policy(
                 self.atoms,
-                remove_com_every=self.params.remove_com_every,
-                remove_angular_every=self.params.remove_angular_every,
+                remove_com=self.params.remove_com,
+                remove_angular=self.params.remove_angular,
             )),
         )
 
         self.logger.log_main(["\nStarting NVE simulation...\n\n"])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
-        runtime_policy = get_runtime_dof_policy(
+        # [TASK#9 constraints] attach the constraint set to the integrator
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
+        # BUGFIX(ai-maple-md): NVE conserves total linear momentum (and, for an
+        # isolated / non-PBC system, total angular momentum). The 3 (COM) [+3
+        # rotation] DOF removed ONCE at initialization therefore stay frozen for
+        # the whole trajectory, so the reported temperature must use the
+        # INITIALIZATION DOF policy (3N-3[-3]), not the runtime policy, which with
+        # remove_*_every=0 returns 3N and biases T by n_dof_init/3N (CH4: 9/15).
+        # NVT is unaffected (its thermostat performs runtime projection).
+        nve_policy = get_initialization_dof_policy(
             self.atoms,
-            remove_com_every=self.params.remove_com_every,
-            remove_angular_every=self.params.remove_angular_every,
+            remove_com=self.params.remove_com,
+            remove_angular=self.params.remove_angular,
         )
-        runtime_n_dof = get_n_dof_from_policy(runtime_policy)
+        runtime_n_dof = get_n_dof_from_policy(nve_policy)
+        # [TASK#9 constraints] subtract constrained DOF
+        runtime_n_dof = max(runtime_n_dof - self._n_constraints, 1)
         v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.

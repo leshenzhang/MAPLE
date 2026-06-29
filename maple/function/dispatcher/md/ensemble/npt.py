@@ -62,6 +62,12 @@ from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
 
 
+from ..bias import maybe_wrap_bias
+from ..box_guard import check_box_size, composition_sanity
+from ..constraints import build_constraint_manager, maybe_repartition_masses
+from ..anneal import make_anneal_fn
+
+
 @dataclass
 class NPTParams:
     """
@@ -95,6 +101,7 @@ class NPTParams:
     steps:           int   = 100000       # steps (= 10 ps at 0.1 fs/step)
 
     temperature:     float = 300.0        # K
+    anneal:          str   = ""           # simulated-annealing T schedule (K); ""=constant T. e.g. "100,300" ramp, "300,500,300" heat/cool
     pressure:        float = 1.0          # bar
 
     # ------------------------------------------------------------------
@@ -182,7 +189,40 @@ class NPTParams:
     remove_angular:   bool  = False  # initialization-only COM + rotation; parallel to remove_com
     remove_com_every: int   = 100    # runtime-only COM removal
     remove_angular_every: int = 0    # runtime-only COM + rotation; parallel to remove_com_every
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
+    posres:       str   = ""        # GROMACS posres: off / ref-structure path / "initial"; empty = off
+    posres_fc:    float = 0.0       # restraint force constant, Ha/Å²
+    posres_group: str   = "heavy"   # restrained atoms: all / heavy / explicit "0,1,5-10"
+    posres_ramp:  str   = ""        # descending k schedule (Ha/Å²); empty = constant fc
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
+    # [Batch-3] GaMD boost (CV-free enhanced sampling); empty/off = no boost
+    gamd:            str   = ""       # ""/off/lower/upper - boost mode (reaches params via _init_params)
+    gamd_sigma0:     float = 6.0      # kcal/mol; anti-Gaussian width ceiling (sigma0)
+    gamd_prep_steps: int   = 2000     # conventional-MD steps to collect V statistics
+    gamd_params:     Optional[dict] = None  # pre-fit {mode,k,E,...}; set to skip prep
+    # [Batch-3] Hydrogen mass repartitioning (4 fs steps with H-bond constraints)
+    hmr:           str   = ""         # ""/off = no-op; on/true => factor 3.0; or a numeric factor
+    hmr_factor:    Optional[float] = None   # explicit factor override of params.hmr
+    hmr_bond_mult: float = 1.2        # covalent-radius scale for H-bond inference
+    # [Batch-3] Steered MD: constant-velocity pull on a COM-COM distance CV + Jarzynski work
+    smd:           str   = ""        # ""/off = no pull; on/distance => steer the COM-COM distance
+    smd_group1:    str   = ""        # first pull group:  all / heavy / "0,1,5-10" (taken as COM)
+    smd_group2:    str   = ""        # second pull group: all / heavy / "0,1,5-10" (taken as COM)
+    smd_k:         float = 0.0       # restraint force constant, Ha/Å² (same convention as posres_fc)
+    smd_lam0:      str   = ""        # start centre (Å); ""/auto = current CV distance at step 0
+    smd_lam1:      float = 0.0       # end centre (Å); centre moves lam0 -> lam1 linearly over the run
+    smd_log_every: int   = 10        # steps between *_smd.dat work-log rows
+
+    # ------------------------------------------------------------------
+    # box_check: minimum-image box-size guard severity (strict|warn|off).
+    # strict (default) = GROMACS-style fatal abort when the shortest periodic
+    # box width drops below 2*r_max (the MLIP receptive field); warn = log and
+    # continue; off = disable. Only acts for PBC calculators (finite r_max).
+    # ------------------------------------------------------------------
+    box_check:       str   = "strict"
 
 
 class NPT(JobABC):
@@ -206,8 +246,39 @@ class NPT(JobABC):
                 "Use NVT or NVE for non-periodic systems."
             )
 
+        # --- Calculator capability gate (NPT requires a real virial/stress) ---
+        # Pressure coupling is physically meaningless without the configurational
+        # virial: for a dense/condensed phase the pressure is dominated by the
+        # stress term, not the kinetic term.  GROMACS likewise refuses pressure
+        # coupling without a virial.  We require both PBC support and a genuine
+        # stress property; a kinetic-only (ideal-gas) pressure must NOT silently
+        # drive the barostat.
+        _supports_pbc = bool(getattr(atoms.calc, "SUPPORTS_PBC", False))
+        _impl = tuple(getattr(atoms.calc, "implemented_properties", ()) or ())
+        if not (_supports_pbc and "stress" in _impl):
+            raise ValueError(
+                "NPT ensemble requires a calculator that supports periodic boundaries "
+                "AND returns a stress tensor (real configurational virial). "
+                f"Calculator '{type(atoms.calc).__name__}' reports "
+                f"SUPPORTS_PBC={_supports_pbc}, implemented_properties={_impl}. "
+                "Non-periodic gas-phase potentials (e.g. aimnet2, macepol) can only run "
+                "NVE/NVT. Use a PBC+stress calculator (e.g. UMA, or a periodic-enabled "
+                "MACE) for NPT."
+            )
+
         self.atoms = atoms
         self.params = self._init_params(NPTParams, paras, ("md", "MD", "npt", "NPT"))
+        maybe_repartition_masses(self.atoms, self.params)
+        maybe_wrap_bias(self.atoms, self.params, output)
+
+        # --- GROMACS-grompp-style physical preflight (box size + composition) ---
+        # Reject a periodic box shorter than 2*r_max (MLIP receptive field),
+        # which would cause silent minimum-image self-interaction. Self-skips
+        # for non-PBC calculators. See dispatcher/md/box_guard.py.
+        check_box_size(self.atoms, self.atoms.calc, self.params.box_check,
+                       context="NPT setup preflight")
+        composition_sanity(self.atoms, self.atoms.calc, self.params.box_check,
+                           context="NPT setup preflight")
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(
@@ -248,6 +319,30 @@ class NPT(JobABC):
             self.log_info(["\n*** WARNING: remove_angular is ignored for NPT/PBC systems; only initialization COM removal remains active.\n"])
         self._runtime_n_dof = get_n_dof_from_policy(runtime_policy)
         self._runtime_dof_description = describe_dof_policy(runtime_policy)
+
+        # [TASK#9 constraints in NPT] build the frozen constraint set (None when
+        # constraints=none; the unconstrained path is untouched). Mirrors NVT:
+        # rigid water (SETTLE-equivalent) + X-H bonds let the timestep rise to
+        # ~2 fs in the condensed phase. The barostat loop re-satisfies the
+        # constraints after each cell rescale (see _run_simulation).
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        if self._constraints is not None:
+            # The Langevin LFMiddle path is not constraint-aware; fall back to the
+            # GROMACS production thermostat (v-rescale) when constraints + Langevin
+            # are both requested (identical to the NVT policy).
+            if self.params.thermostat == 'langevin':
+                self.log_info([
+                    "\n*** NOTE: constraints require the velocity-Verlet RATTLE path; "
+                    "switching thermostat langevin -> v-rescale.\n"
+                ])
+                self.params.thermostat = 'v-rescale'
+            # Each distance constraint removes one DOF (rigid water = 3); keep the
+            # thermostat target and reported temperature consistent.
+            self._runtime_n_dof = max(self._runtime_n_dof - self._n_constraints, 1)
+            self._runtime_dof_description = (
+                f"{self._runtime_dof_description} - {self._n_constraints} constraints"
+            )
 
         if self.params.thermostat == 'langevin':
             self.thermostat = LangevinThermostat(
@@ -537,6 +632,12 @@ class NPT(JobABC):
         ])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
+        # [TASK#9 constraints in NPT] attach the constraint set so the RATTLE
+        # position/velocity stages run inside integrator.step(); the barostat
+        # loop below re-satisfies the bonds after each cell rescale.
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
         v = velocities.copy()
 
         # Cache forces at t=0; the Langevin LFMiddle path reuses the same initial
@@ -546,13 +647,24 @@ class NPT(JobABC):
         )  # Ha/Å → a.u.
         pressure_stress_warned = False
 
+        anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
+            if anneal_fn is not None:
+                self.thermostat.set_temperature(anneal_fn(step))
             if is_langevin:
                 # LFMiddle sequence with carried velocities, then barostat.
                 v = integrator.lfmiddle_full_kick(v, forces)
                 integrator.half_step_r(v)
                 v = self.thermostat.apply(v)
                 v, forces = integrator.lfmiddle_post_thermostat(v)
+            elif self._constraints is not None:
+                # Constraint-aware path: monolithic velocity-Verlet (RATTLE
+                # position + velocity stages run inside step()), then V-rescale
+                # as a separate O-block — identical to the NVT constrained path.
+                # The split_step chain is NOT constraint-aware, so constrained
+                # NPT must integrate through step() here.
+                v, forces = integrator.step(v, forces)
+                v, _delta_w = self.thermostat.apply(v)
             else:
                 # Keep the existing V-rescale split chain unchanged.
                 v_half = integrator.split_step(v, forces)
@@ -566,8 +678,38 @@ class NPT(JobABC):
                 # A(half)-B: half-position + force eval + half-kick; returns cached forces
                 v, forces = integrator.complete_split_step(v)
 
+            # [TASK#9 constraints in NPT] capture the constraint-satisfied
+            # geometry BEFORE the barostat rescale; it is the RATTLE reference
+            # for the post-rescale re-projection (the barostat scales every
+            # position by μ, stretching each constrained bond by μ).
+            ref_positions_pre_barostat = (
+                self.atoms.get_positions().copy()
+                if self._constraints is not None else None
+            )
+
             # Barostat: rescale cell after the thermostat/integrator cycle.
             self.barostat.apply(v)
+
+            # [TASK#9 constraints in NPT] the barostat scaled all positions by μ
+            # (stretching every constrained bond by μ) and changed the cell.
+            # Refresh the minimum-image cell and re-satisfy the constraints: the
+            # position stage restores bond lengths d0 + corrects velocities, the
+            # velocity stage zeroes relative velocity along each bond. The small
+            # neglected constraint contribution to the barostat virial is a
+            # documented approximation (bond-constraint pressure bias is tiny).
+            if self._constraints is not None:
+                self._constraints.sync_cell(self.atoms)
+                v = self._constraints.project_positions(
+                    self.atoms, ref_positions_pre_barostat, v, integrator.timestep)
+                v = self._constraints.project_velocities(self.atoms, v)
+
+            # Runtime box guard: the barostat just rescaled the cell; fatal
+            # abort if it shrank a periodic width below 2*r_max (prevents the
+            # barostat from silently driving the system into a wrong-physics box).
+            check_box_size(
+                self.atoms, self.atoms.calc, self.params.box_check,
+                context=f"NPT runtime step {step_offset + step} (after barostat rescale)",
+            )
             v, _projection = apply_runtime_motion_projection(
                 self.atoms,
                 v,
