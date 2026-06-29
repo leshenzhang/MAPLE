@@ -56,6 +56,7 @@ import numpy as np
 
 from .posres_calc import _build_selection     # reuse group selection (all/heavy/idx)
 from ..utils import HA_PER_ANG_TO_AU          # Ha/Angstrom -> Ha/Bohr (a.u. force)
+from .gamd import gamd_params, _Welford, HARTREE_PER_KCAL, KB_HA_PER_K  # reuse GaMD math
 
 
 class BatchedHarmonicRestraint:
@@ -160,6 +161,152 @@ class BatchedHarmonicRestraint:
         return E, F
 
 
+def _com_distance_cv(coord_np, ptr, g1_list, g2_list, m_list):
+    """Per-replica COM-COM distance CV (Angstrom) from concatenated master coords.
+
+    The SAME collective variable as :class:`BatchedHarmonicRestraint` (isolated;
+    no minimum image), but value-only (no gradient): GaMD does NOT restrain along
+    the CV -- it boosts the whole potential -- so only the CV *value* is needed,
+    for reweighting and for the WE progress coordinate.
+
+    coord_np : (N_atoms,3) Angstrom (replicas concatenated).
+    ptr      : (B+1,) per-replica atom offsets (``calc._ptr``).
+    g1_list/g2_list : per-replica int index arrays (the two CV groups).
+    m_list   : per-replica mass arrays (amu; only ratios matter for the COM).
+    Returns ``cvs`` (B,) in Angstrom."""
+    B = len(g1_list)
+    cvs = np.empty(B, dtype=np.float64)
+    for b in range(B):
+        pos = np.asarray(coord_np[ptr[b]:ptr[b + 1]], dtype=np.float64)
+        g1, g2, m = g1_list[b], g2_list[b], m_list[b]
+        R1 = (m[g1, None] * pos[g1]).sum(0) / m[g1].sum()
+        R2 = (m[g2, None] * pos[g2]).sum(0) / m[g2].sum()
+        cvs[b] = float(np.linalg.norm(R1 - R2))
+    return cvs
+
+
+class BatchedGaMD:
+    """Per-replica pure-MLIP GaMD boost on the BatchedNVT bias hook.
+
+    This is the batch-aware sibling of the single-system :class:`bias.gamd.
+    GamdCalculator`: it reuses that module's parameter estimator
+    (:func:`bias.gamd.gamd_params`, Miao 2015 eqs 7-11), its Welford accumulator
+    and its reweighting math (:func:`bias.gamd.gamd_reweight_1d`) -- only the
+    *injection point* differs (per-replica force buffer vs ASE ``get_forces``).
+
+    Pure-MLIP reduction (see :mod:`bias.gamd`): the boost ``DeltaV=1/2 k (E-V)^2``
+    (when ``V<E``) reduces, on a pure MLIP, to scaling the physical force by the
+    scalar ``(1 - k(E-V)) in [0,1]``. So per step, per replica ``b``::
+
+        if V_b < E:  F_b *= (1 - k*(E - V_b));  DeltaV_b = 1/2 k (E - V_b)^2
+
+    The boost params ``(k, E)`` are estimated ONCE from a shared prep window
+    (energies POOLED across all B replicas -- ParGaMD holds one finalized
+    ``(E, Vmax, Vmin, k)`` fixed for every walker, paper Sec 2.4 step 1) and then
+    frozen. ``boost=False`` makes this a passive CV logger (no force change,
+    ``DeltaV=0``) -- used for the unbiased reference run.
+
+    Bias contract: ``apply(E, F, calc) -> (E, F)`` (see module docstring). The
+    per-replica CV is logged to ``cv_history`` and the boost to ``dv_history``
+    (Ha) every force evaluation -- feed (concatenated production frames of)
+    ``cv_history``/``dv_history`` to :func:`bias.gamd.gamd_reweight_1d` for the
+    unbiased PMF.
+    """
+
+    KIND = "gamd"
+
+    def __init__(self, atoms_list, group1, group2, *, boost=True, mode="lower",
+                 sigma0_kcal=6.0, prep_steps=2000, temperature=300.0, params=None):
+        self.B = len(atoms_list)
+        if self.B == 0:
+            raise ValueError("BatchedGaMD needs >= 1 replica.")
+        self._g1 = [np.asarray(_build_selection(group1, at), dtype=int)
+                    for at in atoms_list]
+        self._g2 = [np.asarray(_build_selection(group2, at), dtype=int)
+                    for at in atoms_list]
+        self._m = [np.asarray(at.get_masses(), dtype=np.float64) for at in atoms_list]
+        self._n = [len(at) for at in atoms_list]
+        for b in range(self.B):
+            if len(self._g1[b]) == 0 or len(self._g2[b]) == 0:
+                raise ValueError("GaMD CV groups must be non-empty.")
+            if set(self._g1[b].tolist()) & set(self._g2[b].tolist()):
+                raise ValueError("GaMD CV groups must not overlap.")
+        self.boost = bool(boost)
+        self._mode = mode
+        self._sigma0 = float(sigma0_kcal) * HARTREE_PER_KCAL   # Ha
+        self._prep = max(int(prep_steps), 0)
+        self._kT = KB_HA_PER_K * float(temperature)            # Ha
+        self._stats = _Welford()                               # shared (pooled) stats
+        self._params = dict(params) if params else None        # frozen if supplied
+        self._istep = 0
+        self.k = 0.0
+        self.E_thr = 0.0
+        # per-replica per-step logs (Ha for dV, Angstrom for CV); phase per step.
+        self.dv_history = [[] for _ in range(self.B)]
+        self.cv_history = [[] for _ in range(self.B)]
+        self.phase_history = []
+
+    @property
+    def params(self):
+        return self._params
+
+    # -- shared boost params: pool all B replicas during prep, freeze once ----- #
+    def _ensure_params(self, V_all):
+        if self._params is not None:
+            return self._params
+        for V in V_all:
+            self._stats.push(float(V))
+        if self._istep + 1 >= self._prep and self._stats.n > 1:
+            self._params = gamd_params(self._stats.vmin, self._stats.vmax,
+                                       self._stats.mean, self._stats.sigma,
+                                       self._sigma0, self._mode)
+        return self._params  # None => still in prep (no boost yet)
+
+    @staticmethod
+    def _ptr_np(calc):
+        ptr = calc._ptr
+        return (ptr.detach().to("cpu").numpy() if hasattr(ptr, "detach")
+                else np.asarray(ptr))
+
+    # ------------------------------------------------------------- bias contract
+    def apply(self, E, F, calc):
+        """Scale each replica's force by the GaMD factor + log CV/boost.
+
+        E : (B,) Ha (physical V) ; F : (B, nmax_dof) a.u. (modified IN PLACE) ;
+        ``calc.coord`` (N_atoms,3 Angstrom) + ``calc._ptr`` (B+1). Returns the
+        boosted (E+DeltaV, F)."""
+        import torch
+        coord_np = calc.coord.detach().to("cpu").numpy()
+        ptr = self._ptr_np(calc)
+        cvs = _com_distance_cv(coord_np, ptr, self._g1, self._g2, self._m)
+        V_all = np.asarray(E.detach().to("cpu").numpy(), dtype=np.float64).reshape(-1)
+        dV = np.zeros(self.B, dtype=np.float64)
+        phase = "logonly"
+        if self.boost:
+            p = self._ensure_params(V_all)
+            if p is not None and p["k"] > 0.0:
+                k, Ethr = p["k"], p["E"]
+                self.k, self.E_thr = k, Ethr
+                phase = "prod"
+                for b in range(self.B):
+                    Vb = V_all[b]
+                    if Vb < Ethr:
+                        factor = 1.0 - k * (Ethr - Vb)        # in [0,1] by construction
+                        n = self._n[b]
+                        F[b, :3 * n].mul_(float(factor))
+                        dV[b] = 0.5 * k * (Ethr - Vb) ** 2     # Ha
+            else:
+                phase = "prep"
+        for b in range(self.B):
+            self.cv_history[b].append(float(cvs[b]))
+            self.dv_history[b].append(float(dV[b]))
+        self.phase_history.append(phase)
+        self._istep += 1
+        if dV.any():
+            E = E + torch.as_tensor(dV, dtype=E.dtype, device=E.device)
+        return E, F
+
+
 # --------------------------------------------------------------------------- #
 # Standalone numpy self-check (no torch / no GPU; mirrors posres_calc/steered):
 #   PYTHONSAFEPATH=1 python -m maple.function.dispatcher.md.bias.batched
@@ -210,5 +357,26 @@ if __name__ == "__main__":
         pass
     print(f"(4) overlap guard ok={ok}")
 
-    print("BATCHED-RESTRAINT SELF-CHECK:", "PASS" if ok else "FAIL")
+    # (5) GaMD CV helper (numpy) + boost-factor identity. B=2 H2 replicas at
+    #     d=2.0 and 3.0; g1={0} g2={1} -> CV = bond length.
+    repsg = [Atoms("H2", positions=[[0., 0, 0], [2.0, 0, 0]]),
+             Atoms("H2", positions=[[0., 0, 0], [3.0, 0, 0]])]
+    g = BatchedGaMD(repsg, [0], [1], boost=True, prep_steps=1,
+                    sigma0_kcal=6.0, temperature=300.0)
+    coordg = np.concatenate([r.get_positions() for r in repsg], axis=0)
+    cvg = _com_distance_cv(coordg, np.array([0, 2, 4]), g._g1, g._g2, g._m)
+    ok &= np.allclose(cvg, [2.0, 3.0], atol=1e-12)
+    print(f"(5) GaMD CV={cvg} (exp [2.0, 3.0])")
+
+    # (6) boost factor in [0,1] and DeltaV>=0 from frozen params over a V sweep.
+    pg = gamd_params(-100.0, -90.0, -95.0, 2.0, sigma0=1.0 * HARTREE_PER_KCAL,
+                     mode="lower")
+    kk, EE = pg["k"], pg["E"]
+    facs = [1.0 - kk * (EE - V) for V in (-100.0, -95.0, -90.0)]
+    dvs = [0.5 * kk * (EE - V) ** 2 for V in (-100.0, -95.0, -90.0)]
+    ok &= all(-1e-12 <= f <= 1.0 + 1e-12 for f in facs) and all(d >= 0 for d in dvs)
+    print(f"(6) boost factors={['%.3f' % f for f in facs]} in [0,1]; "
+          f"DeltaV>=0 ok")
+
+    print("BATCHED-RESTRAINT/GaMD SELF-CHECK:", "PASS" if ok else "FAIL")
     raise SystemExit(0 if ok else 1)
