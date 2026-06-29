@@ -127,6 +127,12 @@ class BatchPRFO:
                  pool_queue: Optional[list] = None,
                  B_target: Optional[int] = None,
                  pool_size_bucket: bool = False,
+                 # ---- VRAM-adaptive pool B_target (OPT-IN; default OFF = fixed B) ----
+                 auto_batch: bool = False,
+                 vram_safety: float = 0.8,
+                 vram_slope_mib_per_atom: float = 1.3,
+                 auto_batch_cap: int = 256,
+                 auto_batch_min: int = 8,
                  hessian_update: str = "bofill",
                  # ---- OPT-IN upgrades (all default to legacy behavior) ----
                  hessian_mode: str = "full",          # [1] 'full'(default,oracle)|'iterative'
@@ -269,6 +275,22 @@ class BatchPRFO:
         self._next_orig = 0                # next free ORIGINAL index for refilled guesses
         self._pool_refilled = 0            # diagnostics: total guesses pulled from queue
 
+        # ---- VRAM-adaptive pool B_target (OPT-IN; default OFF). When auto_batch is
+        # on (or a pool is given with B_target=None), the refill target is sized each
+        # refill from the LIVE free VRAM via the linear forward model (a per-iter
+        # block-diagonal forward of Sum_atoms ~ B*meanN allocates ~slope*Sum_atoms),
+        # capped at auto_batch_cap. UMA is a LOCAL block-diagonal potential, so each
+        # structure's trajectory is independent of how many batchmates it shares a
+        # forward with -> B_target changes only HOW MANY per forward, never the math
+        # (converged geometry per structure is identical, up to fp32 calculator
+        # noise). Default OFF -> B_target stays the fixed value (legacy). ----
+        self._auto_batch_init = bool(auto_batch)
+        self.vram_safety = float(vram_safety)
+        self.vram_slope_mib_per_atom = max(1e-6, float(vram_slope_mib_per_atom))
+        self.auto_batch_cap = int(auto_batch_cap)
+        self.auto_batch_min = int(auto_batch_min)
+        self._auto_batch = False           # live flag (set in run())
+
         # --- ACCURACY-PRESERVING forward reuse (FIX #1 + #2) -----------------
         # Default ON. The committed-geometry E/F threaded out of iter N-1 (end-of-
         # iter FORWARD-B + the inner loop's committed trial forward) are reused at
@@ -299,7 +321,8 @@ class BatchPRFO:
     @profile
     def run(self, mols,
             pool_queue: Optional[list] = None,
-            B_target: Optional[int] = None) -> None:
+            B_target: Optional[int] = None,
+            auto_batch: Optional[bool] = None) -> None:
         device = self.device
         atoms_list = list(mols.multiatoms)
         calc = mols.calc
@@ -313,6 +336,22 @@ class BatchPRFO:
         bt = B_target if B_target is not None else self._B_target_init
         self._pool_queue = list(pq) if pq is not None else None
         self._B_target = int(bt) if bt is not None else None
+
+        # Resolve VRAM-adaptive B_target. Auto when explicitly asked (auto_batch=True)
+        # OR when a pool is given with no fixed B_target (B_target=None -> auto). Only
+        # meaningful with a pool (no pool => no refill => B_target unused). When auto,
+        # also enable the calculator's VRAM-adaptive Hessian chunking so the recalc
+        # FD-Hessian (the VRAM-hungry op) fits at large B, and seed B_target from the
+        # initial atom mix.
+        ab = self._auto_batch_init if auto_batch is None else bool(auto_batch)
+        self._auto_batch = bool(self._pool_queue is not None
+                                and (ab or self._B_target is None))
+        if self._auto_batch:
+            if hasattr(calc, "auto_chunk"):
+                calc.auto_chunk = True
+            # seed B_target (log emitted after _open_log below).
+            self._B_target = self._compute_b_target(atoms_list)
+
         if (self._pool_queue is not None and self._B_target is not None
                 and self._pool_size_bucket):
             # D1.5 size-bucketing: optimize most-homogeneous refills first (less padding
@@ -326,6 +365,10 @@ class BatchPRFO:
 
         self._open_log()
         self._w("# RS-PRFO batched TS search start\n")
+        if self._auto_batch:
+            self._w(f"# auto_batch ON: B_target={self._B_target} "
+                    f"(cap={self.auto_batch_cap}, safety={self.vram_safety}); "
+                    f"calc.auto_chunk={getattr(calc, 'auto_chunk', None)}\n")
         self._w(f"# RecalcFC interval: {self.recalc}\n")
         self._w(f"# Hessian update method: {self.hessian_update}\n")
         self._w(f"# hessian_mode={self.hessian_mode} trust_mode={self.trust_mode} "
@@ -649,6 +692,14 @@ class BatchPRFO:
             # Dynamic batch shrinking (on-GPU mask drives the shrink).
             survive_local = (~final_done).nonzero(as_tuple=False).flatten()
 
+            # VRAM-adaptive refill target: recompute B_target from the CURRENT atom-count
+            # mix (surviving structures + pending queue) so the refill fills the GPU as
+            # the queue's size distribution drifts. Cheap (a mean over python ints). No-op
+            # unless auto_batch is on; the fixed-B path keeps self._B_target unchanged.
+            if self._auto_batch and self._pool_queue is not None:
+                survivors = [atoms_list[i] for i in survive_local.cpu().tolist()]
+                self._B_target = self._compute_b_target(survivors)
+
             # Streaming pool: after the shrink, the active batch can be refilled from
             # `self._pool_queue` back up to `self._B_target` (keeps the GPU saturated).
             # Pooling disabled (queue/target None) => want_refill is always False =>
@@ -847,6 +898,39 @@ class BatchPRFO:
                     f"max|dg|={self._audit_max_dF:.3e} Ha/A\n")
 
         self._close_log()
+
+
+    # ===================================================
+    # VRAM-ADAPTIVE B_target (pool fill sizing)
+    # ===================================================
+
+    def _compute_b_target(self, active_atoms) -> int:
+        """VRAM-adaptive active-batch size for the streaming pool.
+
+        Sizes B so the per-iter block-diagonal forward (Sum_atoms ~ B*meanN) stays
+        under vram_safety of total VRAM via the linear forward model (a forward of A
+        atoms allocates ~vram_slope_mib_per_atom * A on top of what is already used),
+        then clamps to [auto_batch_min, auto_batch_cap]. meanN is the mean atom count
+        over the active set + the pending queue (the structures that will populate the
+        batch). The cap is the dominant limiter for small molecules (the forward
+        saturates GPU util well before VRAM fills), so this fills the GPU toward the
+        compute knee without OOM; the recalc FD-Hessian VRAM is bounded separately by
+        the calculator's auto_chunk."""
+        ns = [len(a) for a in active_atoms]
+        if self._pool_queue:
+            ns = ns + [len(a) for a in self._pool_queue]
+        meanN = max(1.0, (sum(ns) / len(ns)) if ns else 1.0)
+        if self.device.type != "cuda":
+            cap = self.auto_batch_cap
+        else:
+            MiB = 1024.0 ** 2
+            free_b, total_b = torch.cuda.mem_get_info()
+            total_mib = total_b / MiB
+            used_mib = total_mib - free_b / MiB
+            headroom_mib = self.vram_safety * total_mib - used_mib
+            amax_atoms = headroom_mib / self.vram_slope_mib_per_atom  # max Sum_atoms
+            cap = int(amax_atoms / meanN)
+        return int(max(self.auto_batch_min, min(self.auto_batch_cap, cap)))
 
 
     # ===================================================

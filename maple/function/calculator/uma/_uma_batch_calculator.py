@@ -194,6 +194,11 @@ class UMABatchCalc:
         disable_activation_checkpointing: bool = False,
         fast_inference: bool = False,
         compile_model: bool = False,
+        # ---- VRAM-adaptive FD-Hessian chunk sizing (OPT-IN; default OFF = oracle) ----
+        auto_chunk: bool = False,
+        vram_safety: float = 0.8,
+        vram_slope_mib_per_atom: float = 1.5,
+        vram_chunk_cap: int = 200000,
     ):
         dev = str(device)
         dev = "cuda" if dev.startswith("cuda") else "cpu"
@@ -223,6 +228,22 @@ class UMABatchCalc:
         # math or the algorithm -- they are kernel/graph optimizations only.
         self._fast_inference = bool(fast_inference)
         self._compile_model = bool(compile_model)
+
+        # ---- VRAM-adaptive FD-Hessian chunk budget (OPT-IN; default OFF) ----
+        # When auto_chunk is on, get_efh_gpu sizes the per-forward chunk atom budget
+        # (self._h_max_atoms) from the CURRENT free VRAM: a forward of A atoms
+        # allocates ~ vram_slope_mib_per_atom * A on top of what is already reserved,
+        # so the budget is (vram_safety*total - used) / slope. An OOM halve-and-retry
+        # guard makes it crash-proof. Default OFF -> _h_max_atoms stays the fixed
+        # hessian_max_atoms (byte-identical oracle). Sizing the chunk changes ONLY how
+        # many isolated FD replicas share a forward, never any force value (the FD
+        # columns are block-diagonal per replica) -> results are bit-for-bit identical
+        # to the fixed-chunk path, regardless of the chosen budget.
+        self.auto_chunk = bool(auto_chunk)
+        self.vram_safety = float(vram_safety)
+        self.vram_slope_mib_per_atom = max(1e-6, float(vram_slope_mib_per_atom))
+        self.vram_chunk_cap = int(vram_chunk_cap)
+        self._auto_chunk_retries = 0   # diagnostics: total OOM halve-and-retry events
 
         # ---- inference settings ------------------------------------------
         # Default path keeps the string "default" -> byte-identical to the base.
@@ -648,7 +669,69 @@ class UMABatchCalc:
                 return self._efh_gpu_autograd(movable_masks)
             except Exception:
                 pass
+        # OPT-IN VRAM-adaptive chunk sizing (default OFF -> fixed-chunk oracle).
+        if self.auto_chunk and self.device.type == "cuda":
+            return self._get_efh_numerical_auto(movable_masks)
+        return self._get_efh_numerical(movable_masks)
 
+    # ---------------------------------------------- VRAM-adaptive chunk helpers
+    def _vram_budget_atoms(self) -> int:
+        """Max atoms-per-FD-forward to keep total VRAM under vram_safety*total.
+
+        Uses the LIVE free VRAM (torch.cuda.mem_get_info reflects the caching
+        allocator's reserved pool + context), so the budget self-regulates as the
+        run's reserved high-water mark grows: a forward of A atoms allocates
+        ~vram_slope_mib_per_atom * A on top of what is already used, so
+        A_max = (vram_safety*total - used) / slope. Floored at the largest single
+        structure (one whole replica must fit a chunk) and capped at vram_chunk_cap.
+        """
+        MiB = 1024.0 ** 2
+        free_b, total_b = torch.cuda.mem_get_info()
+        total_mib = total_b / MiB
+        used_mib = total_mib - free_b / MiB
+        headroom_mib = self.vram_safety * total_mib - used_mib
+        amax = int(headroom_mib / self.vram_slope_mib_per_atom)
+        floor = max(1, int(self.Nmax_atoms))
+        return max(floor, min(self.vram_chunk_cap, amax))
+
+    def _get_efh_numerical_auto(self, movable_masks):
+        """VRAM-adaptive FD Hessian: size the chunk atom budget to fill VRAM toward
+        vram_safety, then on a CUDA OOM halve the budget and retry (never crashes).
+        Math is identical to the fixed-chunk oracle -- chunk size changes only how
+        many isolated replicas share a forward, not any force value. NOTE: while
+        auto_chunk is ON, self._h_max_atoms is the LIVE adaptive budget (it is
+        overwritten here each call); a caller that toggles auto_chunk back OFF and
+        wants the old fixed budget must reset self._h_max_atoms itself."""
+        budget = self._vram_budget_atoms()
+        if budget != self._h_max_atoms:
+            # only invalidate the cached plan when the budget actually changed, so a
+            # stable-VRAM RecalcFC loop still reuses one plan across recalcs.
+            self._h_max_atoms = budget
+            self._h_plan = None
+            self._h_plan_key = None
+        attempts = 0
+        while True:
+            try:
+                return self._get_efh_numerical(movable_masks)
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower() or attempts >= 12:
+                    raise
+                torch.cuda.empty_cache()
+                new_budget = max(int(self.Nmax_atoms), self._h_max_atoms // 2)
+                if new_budget >= self._h_max_atoms:
+                    raise  # cannot shrink further (single structure already too big)
+                self._h_max_atoms = new_budget
+                self._h_plan = None
+                self._h_plan_key = None
+                self._auto_chunk_retries += 1
+                attempts += 1
+
+    def _get_efh_numerical(self, movable_masks=None):
+        """Numerical central-FD Hessian body (the default + byte-parity oracle).
+
+        Chunk atom budget = self._h_max_atoms (fixed hessian_max_atoms by default, or
+        set by _get_efh_numerical_auto when auto_chunk is on). See get_efh_gpu's
+        docstring for the full contract / optimizations."""
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
