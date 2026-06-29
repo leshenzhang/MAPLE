@@ -18,10 +18,13 @@ generation + WHAM/MBAR post-processing live in :mod:`.umbrella`.
 from .plumed_calc import PlumedCalculator
 from .colvars_calc import ColvarsCalculator
 from .posres_calc import PosresCalculator, posres_enabled
+from .gamd import (GamdCalculator, gamd_enabled, gamd_params,
+                   gamd_reweight_1d)
 from . import umbrella
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
-           "PosresCalculator", "posres_enabled", "umbrella"]
+           "PosresCalculator", "posres_enabled", "GamdCalculator",
+           "gamd_enabled", "gamd_params", "gamd_reweight_1d", "umbrella"]
 
 
 def maybe_wrap_bias(atoms, params, output):
@@ -35,8 +38,10 @@ def maybe_wrap_bias(atoms, params, output):
     plumed_in = getattr(params, "plumed", "") or ""
     colvars_in = getattr(params, "colvars", "") or ""
     posres_in = getattr(params, "posres", "")
+    gamd_in = getattr(params, "gamd", "")
     want_posres = posres_enabled(posres_in)
-    if not plumed_in and not colvars_in and not want_posres:
+    want_gamd = gamd_enabled(gamd_in)
+    if not plumed_in and not colvars_in and not want_posres and not want_gamd:
         return atoms.calc
 
     inner = atoms.calc
@@ -67,6 +72,19 @@ def maybe_wrap_bias(atoms, params, output):
             getattr(params, "posres_group", "heavy"),
             getattr(params, "posres_ramp", ""),
             getattr(params, "steps", 0),
+            atoms=atoms, output=output, restart_step=restart_step)
+
+    # GaMD total-potential boost wraps outermost: ΔV is defined on the full
+    # potential the dynamics sees (MLIP + any active bias/restraint). It is a
+    # CV-free accelerator, normally used standalone; composing on top is valid.
+    if want_gamd:
+        wrapped = GamdCalculator(
+            wrapped,
+            mode=(gamd_in if isinstance(gamd_in, str) else "lower"),
+            sigma0_kcal=float(getattr(params, "gamd_sigma0", 6.0)),
+            prep_steps=int(getattr(params, "gamd_prep_steps", 2000)),
+            temperature=temperature,
+            params=getattr(params, "gamd_params", None),
             atoms=atoms, output=output, restart_step=restart_step)
 
     atoms.calc = wrapped
