@@ -51,10 +51,15 @@ class MaceOffBatchCalc:
     def __init__(self,
                  model_path: str = _DEFAULT_MODEL,
                  device: str = "cuda",
-                 dtype: torch.dtype = torch.float64):
+                 dtype: torch.dtype = torch.float64,
+                 allow_tf32: bool = False):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu"
                                    else "cpu")
         self.dtype = dtype
+        # GPU-opt Lever 1: TF32 tensor-core matmul is an EXPLICIT opt-in (only ever
+        # active for an fp32 forward; fp64 matmuls ignore the flag). Default OFF so
+        # the fp64 default path is byte-for-byte unchanged.
+        self.allow_tf32 = bool(allow_tf32)
         self._model_path = model_path
 
         model = torch.load(model_path, map_location=self.device, weights_only=False)
@@ -64,6 +69,7 @@ class MaceOffBatchCalc:
         # forward fails with a cuda/cpu device mismatch. .to(device) recurses into
         # the scripted submodules and moves them.
         self.model = model.to(self.device).to(self.dtype).eval()
+        self._maybe_set_tf32()
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.r_max = float(self.model.r_max)
@@ -81,6 +87,35 @@ class MaceOffBatchCalc:
 
         self._prepared = False
         self._coord_backup = None
+
+    # ----------------------------------------------------------------- precision
+    def _maybe_set_tf32(self):
+        """Enable TF32 tensor-core matmul -- ONLY for an opted-in fp32 CUDA forward.
+        TF32 truncates fp32 mantissas in the matmul accumulate, so it must be an
+        explicit choice (energy drift fp32->TF32 ~1.2e-3 Ha, acceptable for NVT per
+        B-33). It is a no-op for fp64 (the flag does not affect double-precision
+        matmuls), so leaving it set never perturbs the fp64 default path."""
+        if self.allow_tf32 and self.dtype == torch.float32 and self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    def set_precision(self, dtype: torch.dtype, allow_tf32: bool = False):
+        """Switch the forward precision in place (Lever 1 wiring from BatchedNVT).
+
+        Recasts the loaded model to ``dtype`` and (for fp32+CUDA) optionally turns on
+        TF32. Safe to call before OR after prepare(): if already prepared, the master
+        coord buffers are recast too. fp32 halves the model+activation VRAM (~2x max
+        batch) and runs ~1.37x (fp32) / ~1.83x (fp32+TF32) on the compute-bound case;
+        energy drift fp64->fp32 ~7e-4 Ha (B-33). fp64 stays the default (NVE needs it)."""
+        self.dtype = dtype
+        self.allow_tf32 = bool(allow_tf32)
+        self.model = self.model.to(dtype).eval()
+        self._maybe_set_tf32()
+        if self._prepared:
+            self.coord = self.coord.to(dtype)
+            if self._coord_backup is not None:
+                self._coord_backup = self._coord_backup.to(dtype)
+        return self
 
     # ------------------------------------------------------------------ prepare
     def prepare(self, atoms_list, fixed_nmax: int = None):

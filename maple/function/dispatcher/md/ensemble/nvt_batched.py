@@ -88,6 +88,25 @@ class BatchedNVTParams:
     init_velocities: bool  = True
     verbose:         int   = 1
     random_seed:     Optional[int] = None
+    # --- GPU-opt Lever 1: fp32/TF32 forward (opt-in; default fp64 unchanged) ---
+    # ""/"fp64" => calc dtype left untouched (fp64 default; NVE-grade, byte-identical
+    # to the no-precision path). "fp32" => float32 forward (~1.37x, ~2x max batch,
+    # drift ~7e-4 Ha). "fp32-tf32"/"tf32" => float32 + TF32 tensor-core matmul
+    # (~1.83x, drift ~1.2e-3 Ha). Acceptable for NVT/NPT per B-33; NOT for NVE.
+    precision:       str   = ""
+    # --- GPU-opt Lever 2: VRAM-adaptive batch sizing (opt-in; default OFF) ---
+    # When auto_batch=True the replica list is run in VRAM-sized sub-batches (chunks
+    # of <= B_target). The calc is a LOCAL block-diagonal MLIP, so a replica's
+    # trajectory is independent of how many batchmates share its forward -> chunking
+    # changes ONLY how many run per forward, never the physics (gate B-64.3). Default
+    # OFF -> all B replicas in one batch (legacy). No effect when B <= B_target.
+    auto_batch:           bool  = False
+    auto_batch_cap:       int   = 256      # never exceed this B per forward
+    auto_batch_min:       int   = 1        # never go below this B per forward
+    vram_safety:          float = 0.8      # target fraction of total VRAM to fill
+    vram_slope_mib_per_atom: float = 1.3   # linear forward-VRAM model (MiB per atom)
+    large_atom_threshold: int   = 200      # replicas >= this are compute-bound...
+    large_atom_B_cap:     int   = 4        # ...so cap B here (throughput already flat)
     # --- HMR (mass-only; supported) ---
     hmr:           str   = ""               # ""/off => no-op; on/true => 3.0; or a number
     hmr_factor:    Optional[float] = None
@@ -163,7 +182,13 @@ class BatchedNVT(JobABC):
         dev = getattr(calc, "device", None)
         self.device = dev if dev is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
+        # GPU-opt Lever 1: apply opt-in fp32/TF32 precision to the calc BEFORE the
+        # dtype is read (default precision="" => calc dtype untouched => fp64 default).
+        self._apply_precision()
         self.dtype = getattr(calc, "dtype", torch.float64)
+        # GPU-opt Lever 2: opt-in VRAM-adaptive batch sizing (chunked sub-batches).
+        self._auto_batch = bool(self.params.auto_batch)
+        self._chunk_global_base = 0     # global replica-index offset (chunk RNG keying)
 
     # --------------------------------------------------------------- gates
     @classmethod
@@ -199,10 +224,108 @@ class BatchedNVT(JobABC):
                 "steered MD, PLUMED, Colvars and posres are available on the "
                 "single-system NVT path -- run those systems one at a time.")
 
+    # ----------------------------------------------------- GPU-opt Lever 1 (fp32)
+    def _apply_precision(self):
+        """Apply the opt-in fp32/TF32 forward precision to the calc (Lever 1).
+
+        precision="" / "fp64"  -> NO-OP: the calc keeps its constructed dtype, so the
+        default path is byte-for-byte identical to feat/md-batched-core (gate B-64.1).
+        "fp32"                 -> float32 forward.
+        "tf32" / "fp32-tf32"   -> float32 forward + TF32 tensor-core matmul.
+        fp64 stays the default because NVE needs it; NVT/NPT may opt into fp32 (B-33)."""
+        torch = self._torch
+        raw = str(getattr(self.params, "precision", "") or "").strip().lower()
+        if raw in ("", "fp64", "f64", "float64", "double", "64"):
+            return                                   # default: calc dtype unchanged
+        if raw in ("fp32", "f32", "float32", "single", "32"):
+            want_dtype, tf32 = torch.float32, False
+        elif raw in ("tf32", "fp32-tf32", "fp32+tf32", "fp32_tf32", "float32-tf32"):
+            want_dtype, tf32 = torch.float32, True
+        else:
+            raise ValueError(
+                f"Unknown precision '{self.params.precision}'. Use ''/'fp64' (default), "
+                "'fp32', or 'tf32'/'fp32-tf32'.")
+        if hasattr(self.calc, "set_precision"):
+            self.calc.set_precision(want_dtype, allow_tf32=tf32)
+        else:                                        # generic best-effort fallback
+            if tf32 and getattr(self.device, "type", "") == "cuda":
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            if hasattr(self.calc, "model"):
+                self.calc.model = self.calc.model.to(want_dtype)
+            self.calc.dtype = want_dtype
+
+    # ------------------------------------------------ GPU-opt Lever 2 (auto-batch)
+    def _resolve_b_target(self) -> int:
+        """VRAM-adaptive replicas-per-forward (ports BPRFO._compute_b_target + the
+        benchmark caveat). A block-diagonal forward of ~B*meanN atoms allocates
+        ~vram_slope_mib_per_atom per atom on top of what is already used, so B fills
+        VRAM toward vram_safety, clamped to [auto_batch_min, auto_batch_cap]. CAVEAT
+        (benchmark): >=~200-atom replicas saturate GPU compute at B~=2-4, so bigger B
+        only wastes VRAM there -> hard-cap at large_atom_B_cap."""
+        torch = self._torch
+        p = self.params
+        ns = [len(at) for at in self.atoms_list]
+        meanN = max(1.0, (sum(ns) / len(ns)) if ns else 1.0)
+        maxN = max(ns) if ns else 1
+        if getattr(self.device, "type", "") != "cuda":
+            cap = p.auto_batch_cap
+        else:
+            MiB = 1024.0 ** 2
+            free_b, total_b = torch.cuda.mem_get_info()
+            total_mib = total_b / MiB
+            used_mib = total_mib - free_b / MiB
+            headroom_mib = p.vram_safety * total_mib - used_mib
+            amax_atoms = headroom_mib / max(1e-6, p.vram_slope_mib_per_atom)
+            cap = int(amax_atoms / meanN)
+        bt = int(max(p.auto_batch_min, min(p.auto_batch_cap, cap)))
+        if maxN >= p.large_atom_threshold:           # compute-bound: bigger B is waste
+            bt = min(bt, p.large_atom_B_cap)
+        return max(1, bt)
+
+    def _run_chunked(self, b_target: int):
+        """Run the full replica list in VRAM-sized sub-batches of <= b_target, reusing
+        the UNTOUCHED single-batch kernel per chunk. The calc is block-diagonal/local,
+        and replica g's per-replica RNG is keyed off its GLOBAL index (seed+g) via
+        _chunk_global_base, so each replica's trajectory is IDENTICAL to the all-in-one
+        explicit-B run regardless of which chunk it lands in (gate B-64.3)."""
+        full_atoms, full_B = self.atoms_list, self.B
+        results = [None] * full_B
+        for start in range(0, full_B, b_target):
+            stop = min(start + b_target, full_B)
+            self.atoms_list = full_atoms[start:stop]
+            self.B = stop - start
+            self._chunk_global_base = start          # GLOBAL replica index for RNG
+            self._prepare_buffers()
+            if self.params.thermostat == "v-rescale":
+                self._run_vrescale()
+            else:
+                self._run_langevin()
+            self._finalize()
+            for j, r in enumerate(self.results):
+                r["replica"] = start + j
+                results[start + j] = r
+        self.atoms_list, self.B = full_atoms, full_B
+        self._chunk_global_base = 0
+        self.results = results
+        n_chunks = (full_B + b_target - 1) // b_target
+        self.log_info(["\n" + "=" * 72 + "\n",
+                       f"  GPU-opt auto_batch: ran B={full_B} replicas in {n_chunks} "
+                       f"sub-batch(es) of <= {b_target}\n", "=" * 72 + "\n"])
+
     # ====================================================================== run
     def run(self):
         with timer(f"Batched MD (NVT, B={self.B})"):
             self._log_parameters()
+            if self._auto_batch:
+                b_target = self._resolve_b_target()
+                self.auto_B_target = b_target
+                self.log_info([f"  GPU-opt auto_batch ON: B_target={b_target} "
+                               f"(B={self.B}, cap={self.params.auto_batch_cap}, "
+                               f"safety={self.params.vram_safety})\n"])
+                if self.B > b_target:                # chunk into VRAM-sized sub-batches
+                    self._run_chunked(b_target)
+                    return self
             self._prepare_buffers()
             if self.params.thermostat == "v-rescale":
                 self._run_vrescale()
@@ -239,8 +362,13 @@ class BatchedNVT(JobABC):
         # per-replica RNG: rngs[b] drives BOTH replica b's velocity init AND its
         # thermostat (exactly as the single-system NVT shares one rng) -> the b=0
         # stream reproduces a single-system seeded run. (B-int seed; None => fresh.)
+        # RNG is keyed off the GLOBAL replica index (seed + global_idx). For the
+        # default all-in-one run _chunk_global_base==0 so this is seed+b (unchanged);
+        # under auto_batch chunking it keeps replica g on stream seed+g regardless of
+        # which sub-batch it lands in -> identical per-replica trajectory (B-64.3).
         seed = self.params.random_seed
-        self._rngs = [np.random.default_rng(seed + b) if seed is not None
+        gbase = self._chunk_global_base
+        self._rngs = [np.random.default_rng(seed + gbase + b) if seed is not None
                       else np.random.default_rng() for b in range(B)]
 
         # positions buffer is kept inside the calc (master coords); velocities here.
@@ -469,6 +597,12 @@ class BatchedNVT(JobABC):
         else:
             lines.append(f"tau_t:           {p.tau_t:.1f} fs\n")
         lines.append(f"Remove COM ev.:  {p.remove_com_every} steps (runtime, per replica)\n")
+        prec = str(p.precision or "").strip().lower() or "fp64(default)"
+        lines.append(f"Precision:       {prec}  (calc dtype={self.dtype})\n")
+        if p.auto_batch:
+            lines.append(f"Auto-batch:      ON  (cap={p.auto_batch_cap}, "
+                         f"safety={p.vram_safety}, large>= {p.large_atom_threshold} "
+                         f"atoms -> B<= {p.large_atom_B_cap})\n")
         if p.random_seed is not None:
             lines.append(f"Random seed:     {p.random_seed}\n")
         lines.append("=" * 72 + "\n")
