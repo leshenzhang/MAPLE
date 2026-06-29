@@ -65,6 +65,7 @@ from ..logger import MDLogger
 from ..bias import maybe_wrap_bias
 from ..box_guard import check_box_size, composition_sanity
 from ..constraints import build_constraint_manager, maybe_repartition_masses
+from ..anneal import make_anneal_fn
 
 
 @dataclass
@@ -100,6 +101,7 @@ class NPTParams:
     steps:           int   = 100000       # steps (= 10 ps at 0.1 fs/step)
 
     temperature:     float = 300.0        # K
+    anneal:          str   = ""           # simulated-annealing T schedule (K); ""=constant T. e.g. "100,300" ramp, "300,500,300" heat/cool
     pressure:        float = 1.0          # bar
 
     # ------------------------------------------------------------------
@@ -637,7 +639,10 @@ class NPT(JobABC):
         )  # Ha/Å → a.u.
         pressure_stress_warned = False
 
+        anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
+            if anneal_fn is not None:
+                self.thermostat.set_temperature(anneal_fn(step))
             if is_langevin:
                 # LFMiddle sequence with carried velocities, then barostat.
                 v = integrator.lfmiddle_full_kick(v, forces)

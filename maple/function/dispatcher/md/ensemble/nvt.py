@@ -46,6 +46,7 @@ from ..utils import (
 from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
 from ..constraints import build_constraint_manager, maybe_repartition_masses
+from ..anneal import make_anneal_fn
 
 
 def _apply_projection_with_work(
@@ -102,6 +103,7 @@ class NVTParams:
     # 300 K: standard ambient condition used across all major MD tutorials.
     # ------------------------------------------------------------------
     temperature:     float = 300.0        # K
+    anneal:          str   = ""           # simulated-annealing T schedule (K); ""=constant T. e.g. "100,300" ramp, "300,500,300" heat/cool
 
     # ------------------------------------------------------------------
     # Thermostat algorithm
@@ -614,7 +616,11 @@ class NVT(JobABC):
         is_vrescale = self.params.thermostat == 'v-rescale'
         w_bath = 0.0
 
+        anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
+
+            if anneal_fn is not None:
+                self.thermostat.set_temperature(anneal_fn(step))
 
             if is_vrescale:
                 v, forces = integrator.step(v, forces)
