@@ -11,5 +11,6 @@ from .nve import NVE
 from .nvt import NVT
 from .npt import NPT
 from .batched import BatchedMD
+from .nvt_batched import BatchedNVT
 
-__all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD']
+__all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT']
