@@ -88,6 +88,28 @@ def seg_atoms(idx):
     return [Atoms(symbols=syms, positions=coords_all[f][idx]) for f in range(Fc)]
 
 
+def batched_energy_Ha(atoms_list, cap):
+    """Batched per-frame energies (Ha) in sub-batches of <=cap frames; OOM-resilient
+    (halves cap on CUDA OOM, so it completes on any GPU). Returns (E (F,), eff_cap)."""
+    F = len(atoms_list); out = np.empty(F); s = 0; eff = max(1, cap)
+    while s < F:
+        b = min(eff, F - s)
+        try:
+            bcalc.prepare(atoms_list[s:s + b])
+            E, _ = bcalc.get_ef_gpu()
+            out[s:s + b] = E.detach().cpu().numpy()
+            s += b
+            if DEV == "cuda":
+                torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            if DEV == "cuda":
+                torch.cuda.empty_cache()
+            if eff == 1:
+                raise
+            eff = max(1, eff // 2)
+    return out, eff
+
+
 # independent upstream MACE-OFF ASE calculator (different code path)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 from mace.calculators.foundations_models import mace_off
@@ -101,20 +123,19 @@ except Exception as exc:
     ase_calc, have_ase = None, False
 
 worst = 0.0
+# cap the multi-graph batch by atom budget (~12k atoms/forward) so big segments
+# still test B>1 (true multi-graph) without exceeding GPU memory; ligand = full Fc.
+ATOM_BUDGET = 12000
 for tag, idx in [("ligand", lig_idx), ("receptor", rec_idx),
                  ("complex", np.arange(top.natom))]:
     al = seg_atoms(idx)
-    bcalc.prepare(al)                              # B = Fc (ONE forward)
-    Eb, _ = bcalc.get_ef_gpu()
-    Eb = Eb.detach().cpu().numpy()
-    Es = np.empty(Fc)                              # sequential, B=1 per frame
-    for i, a in enumerate(al):
-        bcalc.prepare([a])
-        e, _ = bcalc.get_ef_gpu()
-        Es[i] = float(e.detach().cpu()[0])
+    cap = max(2, ATOM_BUDGET // max(1, idx.size)) if idx.size > 1 else Fc
+    cap = min(cap, Fc)
+    Eb, eff = batched_energy_Ha(al, cap)           # batched (B=eff>=2 where it fits)
+    Es, _ = batched_energy_Ha(al, 1)               # sequential, B=1 per frame
     dpar = float(np.max(np.abs(Eb - Es)))
     worst = max(worst, dpar)
-    line = f"[C] {tag:9s}: batch-vs-seq max|d|={dpar:.3e} Ha"
+    line = f"[C] {tag:9s}(B={eff}): batch-vs-seq max|d|={dpar:.3e} Ha"
     if have_ase:
         a0 = al[0].copy(); a0.calc = ase_calc
         dref = abs(Eb[0] - a0.get_potential_energy() * EV2HARTREE)
@@ -148,7 +169,7 @@ class HartreeWrap(Calculator):
 
 
 Fe = 12
-MB = 4           # cap frames/forward for the 4331-atom complex (GPU-memory safe)
+MB = 3           # cap frames/forward (3 x 4331 ~ 13k atoms) -> GPU-memory safe
 
 t0 = time.time()
 eb_b = EndpointBinding(PRMTOP, NC, calc=bcalc, ligand_resname="LIG",
