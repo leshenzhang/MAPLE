@@ -319,12 +319,21 @@ class CalcABC(ase.calculators.calculator.Calculator):
         """Translate input-header options into ctor kwargs. Backends override."""
         return {}
 
-    def _finalize_results(self, atoms, *, energy, forces=None, hessian=None, unit=None):
+    def _finalize_results(self, atoms, *, energy, forces=None, stress=None,
+                          hessian=None, unit=None):
         """Single entry: unit conversion + implicit-solvent + write self.results.
 
         Backends pass the pure model outputs (in the unit declared by
         MODEL_ENERGY_UNIT). This method converts to Hartree, then optionally
         adds the implicit-solvent correction, then writes self.results.
+
+        ``stress`` (ASE Voigt-6, eV/Å³) is stored unconverted: MAPLE's pressure
+        routine (compute_instantaneous_pressure) consumes the stress as eV/Å³
+        even though energy/forces are Hartree. This is the configurational-virial
+        path that PBC ensembles (NPT) require; before this fix the generic adapter
+        passed stress= here but the signature dropped it, so NPT through any
+        GenericASECalculator-wrapped model (e.g. mace-off-generic) crashed with
+        "_finalize_results() got an unexpected keyword argument 'stress'".
         """
         source_unit = unit if unit is not None else self.MODEL_ENERGY_UNIT
         energy_ha, forces_ha = _convert_energy_force_units(
@@ -349,6 +358,13 @@ class CalcABC(ase.calculators.calculator.Calculator):
         self.results['free_energy'] = float(energy_ha)
         if forces_ha is not None:
             self.results['forces'] = forces_ha
+        if stress is not None:
+            # ASE Voigt-6, eV/Å³ — stored UNCONVERTED (MAPLE's pressure routine
+            # consumes stress as eV/Å³). Must be written: 'stress' is advertised
+            # in implemented_properties, so if it is missing here every
+            # atoms.get_stress() triggers a redundant calculate() (an extra MLIP
+            # forward) before falling back to ideal-gas pressure.
+            self.results['stress'] = np.asarray(stress, dtype=np.float64)
         if hessian is not None:
             self.results['hessian'] = hessian
 

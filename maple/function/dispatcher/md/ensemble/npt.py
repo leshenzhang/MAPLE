@@ -57,6 +57,7 @@ from ..utils import (
     set_atoms_velocity_representation,
     standard_to_lfmiddle_carried,
     FS_TO_AU,
+    BOHR_TO_ANGSTROM,
 )
 from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
@@ -573,6 +574,43 @@ class NPT(JobABC):
         self.log_info([f"Initial temperature: {actual_temp:.2f} K\n"])
         return velocities
 
+    def _apply_barostat_scaling(self, pressure: float) -> float:
+        """[O1] Isotropically rescale cell+positions from a LAGGED pressure.
+
+        Standard GROMACS-style lagged-pressure operator splitting: the barostat
+        coupling factor mu is computed from ``pressure`` (the cached instantaneous
+        pressure produced by the PREVIOUS step's single force/stress evaluation),
+        so the cell/position scaling can be folded into this step's position-update
+        leg BEFORE the force evaluation.  The single ``get_forces`` of the step then
+        lands at the final post-rescale geometry and is reused for the half-kick,
+        the next-step cache, and the pressure/PE logging — eliminating the second
+        per-step MLIP forward.
+
+        The mu formulas mirror BerendsenBarostat.apply / CRescaleBarostat.apply
+        exactly and reuse the barostat's precomputed prefactors (the single source
+        of the physical constants).  Only the algebra is re-expressed here so the
+        pressure is an *argument* rather than being re-measured (which would force
+        an extra forward) at the already-moved geometry.  The same RNG instance
+        (self._rng, shared with the barostat) is advanced once per step, exactly as
+        CRescaleBarostat.apply did, preserving restart reproducibility.
+
+        The lagged reorder is O(dt) and leaves the sampled NPT ensemble invariant
+        (validated by the ensemble-equivalence test).
+        """
+        bar = self.barostat
+        if isinstance(bar, BerendsenBarostat):
+            mu3 = 1.0 - bar._scale_prefactor * (bar.pressure_target - pressure)
+        else:  # CRescaleBarostat
+            volume = self.atoms.get_volume()                       # Å³
+            dv_det = bar._det_prefactor * (pressure - bar.pressure_target)
+            w = bar.rng.standard_normal()
+            dv_stoch = bar._noise_prefactor / np.sqrt(volume) * w
+            mu3 = 1.0 + dv_det + dv_stoch
+        mu3 = float(np.clip(mu3, 0.5 ** 3, 2.0 ** 3))
+        mu = mu3 ** (1.0 / 3.0)
+        self.atoms.set_cell(self.atoms.get_cell() * mu, scale_atoms=True)
+        return pressure
+
     def _run_simulation(self, velocities: np.ndarray,
                         velocity_representation: str,
                         step_offset: int = 0, n_steps: int = None,
@@ -647,69 +685,116 @@ class NPT(JobABC):
         )  # Ha/Å → a.u.
         pressure_stress_warned = False
 
+        # [O1] Seed the lagged pressure used by the barostat scaling. The
+        # calculator already holds results at the current geometry (forces were
+        # just evaluated), so reading the stress here is a cache hit (no extra
+        # forward). Each step uses the previous step's cached pressure to compute
+        # the cell-scaling factor BEFORE that step's single force evaluation.
+        self._cached_pressure, pressure_stress_warned = compute_instantaneous_pressure(
+            self.atoms,
+            v,
+            stress_warned=pressure_stress_warned,
+            class_name=type(self.barostat).__name__,
+        )
+
         anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
             if anneal_fn is not None:
                 self.thermostat.set_temperature(anneal_fn(step))
+            # [O1] Single-forward NPT propagator (GROMACS-style lagged pressure).
+            #
+            # The previous design ran TWO MLIP forwards/step: one inside the
+            # integrator leg (at r(t+dt), pre-rescale) whose force return was then
+            # made stale by the barostat's position/cell scaling, and a second
+            # recompute at the post-rescale geometry. Here the barostat scaling is
+            # computed from the PREVIOUS step's cached pressure and folded into the
+            # position-update leg BEFORE the force evaluation, so the SINGLE
+            # get_forces of the step lands at the final post-rescale geometry and is
+            # reused for (a) the second VV half-kick, (b) the next-step force cache,
+            # and (c) the pressure/PE logging. Lagged pressure is an O(dt) reorder
+            # that leaves the sampled NPT ensemble invariant.
+            lagged_pressure = self._cached_pressure
+            ref_positions_pre_barostat = None
+            needs_second_half_kick = False
+
             if is_langevin:
-                # LFMiddle sequence with carried velocities, then barostat.
+                # LFMiddle (no second half-kick: the kick is the full_kick that
+                # opens the *next* step). Drift -> O -> drift -> barostat rescale,
+                # then the single force eval below caches forces for next step.
+                # (Langevin never carries constraints — see constructor switch.)
                 v = integrator.lfmiddle_full_kick(v, forces)
                 integrator.half_step_r(v)
                 v = self.thermostat.apply(v)
-                v, forces = integrator.lfmiddle_post_thermostat(v)
+                integrator.half_step_r(v)              # -> r(t+dt), pre-rescale
+                self._apply_barostat_scaling(lagged_pressure)
             elif self._constraints is not None:
-                # Constraint-aware path: monolithic velocity-Verlet (RATTLE
-                # position + velocity stages run inside step()), then V-rescale
-                # as a separate O-block — identical to the NVT constrained path.
-                # The split_step chain is NOT constraint-aware, so constrained
-                # NPT must integrate through step() here.
-                v, forces = integrator.step(v, forces)
-                v, _delta_w = self.thermostat.apply(v)
-            else:
-                # Keep the existing V-rescale split chain unchanged.
-                v_half = integrator.split_step(v, forces)
-
-                # O: thermostat (V-rescale)
-                # Note: V-rescale returns (velocities, delta_w) but the thermostat
-                # work is not tracked here — Bussi 2007 Eq. 15 conserved quantity
-                # is only valid for NVT, not NPT where the barostat also does work.
-                v, _delta_w = self.thermostat.apply(v_half)
-
-                # A(half)-B: half-position + force eval + half-kick; returns cached forces
-                v, forces = integrator.complete_split_step(v)
-
-            # [TASK#9 constraints in NPT] capture the constraint-satisfied
-            # geometry BEFORE the barostat rescale; it is the RATTLE reference
-            # for the post-rescale re-projection (the barostat scales every
-            # position by μ, stretching each constrained bond by μ).
-            ref_positions_pre_barostat = (
-                self.atoms.get_positions().copy()
-                if self._constraints is not None else None
-            )
-
-            # Barostat: rescale cell after the thermostat/integrator cycle.
-            self.barostat.apply(v)
-
-            # [TASK#9 constraints in NPT] the barostat scaled all positions by μ
-            # (stretching every constrained bond by μ) and changed the cell.
-            # Refresh the minimum-image cell and re-satisfy the constraints: the
-            # position stage restores bond lengths d0 + corrects velocities, the
-            # velocity stage zeroes relative velocity along each bond. The small
-            # neglected constraint contribution to the barostat virial is a
-            # documented approximation (bond-constraint pressure bias is tiny).
-            if self._constraints is not None:
+                # Constraint-aware velocity-Verlet (RATTLE) with the barostat
+                # rescale interposed between the position drift and the force eval.
+                # Thermostat (V-rescale) stays as the trailing O-block, exactly as
+                # the previous monolithic step()+O ordering.
+                dt_au  = integrator.timestep
+                masses = integrator.masses[:, np.newaxis]
+                # B: first half-kick with cached (post-rescale) forces
+                v = v + 0.5 * forces / masses * dt_au
+                # A: full drift + RATTLE position stage (ref = r(t))
+                positions = self.atoms.get_positions()
+                ref_drift = positions.copy()
+                positions = positions + v * dt_au * BOHR_TO_ANGSTROM
+                self.atoms.set_positions(positions)
+                v = self._constraints.project_positions(
+                    self.atoms, ref_drift, v, dt_au)
+                if any(self.atoms.pbc):
+                    self.atoms.wrap()
+                # Capture the constraint-satisfied geometry BEFORE the rescale; it
+                # is the RATTLE reference for the post-rescale re-projection (the
+                # barostat scales every position by μ, stretching each bond by μ).
+                ref_positions_pre_barostat = self.atoms.get_positions().copy()
+                self._apply_barostat_scaling(lagged_pressure)
+                # Re-satisfy constraints against the final (rescaled) geometry:
+                # restore bond lengths d0 + correct velocities, then zero the
+                # relative velocity along each bond. (Bond-constraint contribution
+                # to the barostat virial is a documented tiny approximation.)
                 self._constraints.sync_cell(self.atoms)
                 v = self._constraints.project_positions(
-                    self.atoms, ref_positions_pre_barostat, v, integrator.timestep)
+                    self.atoms, ref_positions_pre_barostat, v, dt_au)
                 v = self._constraints.project_velocities(self.atoms, v)
+                needs_second_half_kick = True
+            else:
+                # V-rescale split chain: B + half-drift, O (thermostat, mid-step),
+                # second half-drift, barostat rescale, then the single force eval +
+                # second half-kick below.
+                v_half = integrator.split_step(v, forces)
+                # O: thermostat (V-rescale). The returned thermostat work is not
+                # tracked — Bussi 2007 Eq. 15 conserved quantity is only valid for
+                # NVT, not NPT where the barostat also does work.
+                v, _delta_w = self.thermostat.apply(v_half)
+                integrator.half_step_r(v)              # -> r(t+dt), pre-rescale
+                self._apply_barostat_scaling(lagged_pressure)
+                needs_second_half_kick = True
 
-            # Runtime box guard: the barostat just rescaled the cell; fatal
-            # abort if it shrank a periodic width below 2*r_max (prevents the
-            # barostat from silently driving the system into a wrong-physics box).
+            # Runtime box guard: the barostat just rescaled the cell; fatal abort
+            # if it shrank a periodic width below 2*r_max (prevents the barostat
+            # from silently driving the system into a wrong-physics box).
             check_box_size(
                 self.atoms, self.atoms.calc, self.params.box_check,
                 context=f"NPT runtime step {step_offset + step} (after barostat rescale)",
             )
+
+            # ---- the SINGLE MLIP forward of the step (final post-rescale geom) ----
+            forces = self.atoms.get_forces() * HA_PER_ANG_TO_AU
+
+            if needs_second_half_kick:
+                # B: second VV half-kick with the final post-rescale forces.
+                dt_au  = integrator.timestep
+                masses = integrator.masses[:, np.newaxis]
+                v = v + 0.5 * forces / masses * dt_au
+                if self._constraints is not None:
+                    # RATTLE velocity stage, then the trailing V-rescale O-block
+                    # (a uniform velocity scaling preserves bond orthogonality, so
+                    # no further projection is needed after the thermostat).
+                    v = self._constraints.project_velocities(self.atoms, v)
+                    v, _delta_w = self.thermostat.apply(v)
+
             v, _projection = apply_runtime_motion_projection(
                 self.atoms,
                 v,
@@ -717,13 +802,16 @@ class NPT(JobABC):
                 remove_com_every=self.params.remove_com_every,
                 remove_angular_every=self.params.remove_angular_every,
             )
-            forces = self.atoms.get_forces() * HA_PER_ANG_TO_AU
+            # Pressure at the post-rescale geometry: stress is a cache hit from the
+            # single forward above (no extra evaluation). Cache it as the lagged
+            # pressure that drives the NEXT step's barostat scaling.
             pressure, pressure_stress_warned = compute_instantaneous_pressure(
                 self.atoms,
                 v,
                 stress_warned=pressure_stress_warned,
                 class_name=type(self.barostat).__name__,
             )
+            self._cached_pressure = pressure
 
             abs_step         = step_offset + step
             current_time     = abs_step * self.params.timestep
