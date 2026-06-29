@@ -363,6 +363,44 @@ class UMACalculator(FAIRChemCalculator):
         """Numerical-only Hessian via shared finite-difference helper."""
         return numerical_hessian_from_atoms(self, atoms, delta)
 
+    def get_hvp(self, atoms: Atoms, n, delta: float = 0.005):
+        """Finite-difference Hessian-vector product ``H @ n`` for Dimer-mode TS.
+
+        OPT-IN / additive: overrides the deliberately-raising base
+        ``CalcABC.get_hvp`` so the single-structure :class:`Dimer` (dimer.py) runs
+        *natively* on a UMA potential (serving as the convergence-equivalence
+        parity oracle for the batched :class:`BatchDimer`). UMA's eSCN-MoE
+        autograd double-backward is known-incomplete, so -- exactly like this
+        calculator's numerical ``get_hessian`` -- the curvature is taken by a
+        finite difference of the (Hartree) force field along ``n``:
+
+            H @ n  ~=  -(F(R + delta*n) - F(R)) / delta
+
+        since ``F = -grad E`` => ``dF = -H dx`` => ``-(F1-F0)/delta = H n``.
+
+        Parameters
+        ----------
+        atoms : ase.Atoms   geometry defining ``R``.
+        n : array-like, shape (3N,)   dimer axis (as the Dimer supplies it).
+        delta : float   FD half-length in Angstrom (default 0.005, == DimerParams).
+
+        Returns
+        -------
+        (Hn, forces, energy) : tuple of torch.Tensor (float64, Hartree units)
+            ``Hn`` (3N,) [Ha/A^2], ``forces`` (3N,) [Ha/A], ``energy`` scalar [Ha].
+        """
+        n_arr = np.asarray(n, dtype=np.float64).reshape(-1)
+        base = atoms.copy(); base.calc = self
+        E0 = float(base.get_potential_energy(force_consistent=True))   # Hartree
+        F0 = np.asarray(base.get_forces(), dtype=np.float64).reshape(-1)  # Ha/A
+        disp = atoms.copy(); disp.calc = self
+        disp.set_positions(atoms.get_positions() + delta * n_arr.reshape(-1, 3))
+        F1 = np.asarray(disp.get_forces(), dtype=np.float64).reshape(-1)
+        Hn = -(F1 - F0) / delta                                       # = H @ n, Ha/A^2
+        return (torch.as_tensor(Hn, dtype=torch.float64),
+                torch.as_tensor(F0, dtype=torch.float64),
+                torch.as_tensor(E0, dtype=torch.float64))
+
     def calculate(self, atoms, properties=None, system_changes=None):
         properties = reject_implicit_solvent_derivatives(self, properties)
         system_changes = all_changes if system_changes is None else system_changes

@@ -1106,3 +1106,53 @@ class UMABatchCalc:
         if self.N_atoms > 0:
             Hn_pad.reshape(-1)[self._cols] = Hn_atom.reshape(-1).to(dtype)
         return Hn_pad * EV2HARTREE
+
+    @torch.no_grad()
+    def get_hvp(self, atoms, n, delta: float = 0.005):
+        """Single-structure finite-difference Hessian-vector product ``H @ n``.
+
+        OPT-IN, additive: provides the ``calc.get_hvp(atoms, n) -> (Hn, forces,
+        energy)`` contract that the single-structure :class:`Dimer` (dimer.py)
+        consumes, so the serial Dimer can run *natively* on a UMA potential and
+        serve as the convergence-equivalence parity oracle for :class:`BatchDimer`.
+        UMA's eSCN-MoE autograd double-backward is known-incomplete (see
+        :meth:`hvp` caveat), so this uses a *finite difference of the batched
+        force field* -- the SAME construction (and SAME ``get_ef_gpu`` forward)
+        that ``BatchDimer._hvp`` uses, guaranteeing both follow the identical PES:
+
+            H @ n  ~=  -(F(R + delta*n) - F(R)) / delta        (forward diff)
+
+        because ``F = -grad E`` => ``dF = -H dx`` => ``-(F1-F0)/delta = H n``.
+
+        Parameters
+        ----------
+        atoms : ase.Atoms
+            Geometry whose current positions define ``R`` (B=1).
+        n : array-like, shape (3N,)
+            Dimer axis / direction vector (unit, as the Dimer supplies it).
+        delta : float
+            FD half-length in Angstrom (default 0.005, matching ``DimerParams``).
+
+        Returns
+        -------
+        (Hn, forces, energy) : tuple of torch.Tensor
+            ``Hn`` (3N,) [Ha/A^2], ``forces`` (3N,) [Ha/A], ``energy`` scalar [Ha]
+            -- all on this calculator's device/dtype, in Hartree units.
+        """
+        import numpy as _np
+        self.prepare([atoms])
+        N = len(atoms); dof = 3 * N
+        E0, F0 = self.get_ef_gpu()                       # (1,), (1, nmax_dof) Hartree
+        v = torch.zeros((self._atoms_B, self.nmax_dof),
+                        dtype=self.dtype, device=self.device)
+        nt = torch.as_tensor(_np.asarray(n, dtype=_np.float64).reshape(-1),
+                             dtype=self.dtype, device=self.device)
+        v[0, :dof] = nt[:dof]
+        self.backup_coords()
+        self.step_cart_(delta * v)
+        _, F1 = self.get_ef_gpu()
+        self.restore_coords()
+        Hn = (-(F1 - F0) / delta)[0, :dof].clone()       # = H @ n, Ha/A^2
+        forces = F0[0, :dof].clone()                     # Ha/A
+        energy = E0[0].clone()                           # Ha
+        return Hn, forces, energy

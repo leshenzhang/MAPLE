@@ -13,29 +13,35 @@ class IRC(JobABC):
         self.commandcontrol = params
 
     def run(self):
+        # NOTE: every branch RETURNS its algorithm result so a caller / parity
+        # harness can consume it. Previously the batched-LQA branch swallowed
+        # ``_run_batched_lqa()``'s return value -> ``run()`` yielded ``None`` even
+        # though LQABatch routing succeeded, causing a downstream ``float(None)``
+        # TypeError when the harness read a result field. (algorithm-completeness
+        # fix; default behaviour for the in-place single algorithms is unchanged.)
         with timer("IRC Calculation"):
             if self.method == 'gs':
                 from .algorithm import GS
                 irc = GS(self.atoms, output=self.output, paras=self.commandcontrol)
-                irc.run()
+                return irc.run()
             elif self.method == 'hpc':
                 from .algorithm import HPC
                 irc = HPC(self.atoms, output=self.output, paras=self.commandcontrol)
-                irc.run()
+                return irc.run()
             elif self.method == 'eulerpc':
                 from .algorithm import EulerPC
                 irc = EulerPC(self.atoms, output=self.output, paras=self.commandcontrol)
-                irc.run()
+                return irc.run()
             elif self.method == 'lqa':
                 from maple.function.utility import Molecules
                 # OPT-IN batched LQA-IRC for a list/Molecules of transition
                 # states; a single Atoms keeps the unchanged single LQA.
                 if isinstance(self.atoms, (list, Molecules)):
-                    self._run_batched_lqa()
+                    return self._run_batched_lqa()
                 else:
                     from .algorithm import LQA
                     irc = LQA(self.atoms, output=self.output, paras=self.commandcontrol)
-                    irc.run()
+                    return irc.run()
             else:
                 raise NotImplementedError(f'IRC method {self.method} not implemented yet.')
 

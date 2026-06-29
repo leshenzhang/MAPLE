@@ -276,7 +276,13 @@ class LQA:
         if self.p.write_traj:
             self._write_trajs(forward_log, backward_log)
 
-        return {"forward": forward_log, "backward": backward_log, "summary": merged}
+        # Expose ``E_ts`` (and ``valid``) at the top level so the single-LQA
+        # result schema lines up with ``LQABatch.run()`` per-structure dicts,
+        # letting a parity harness extract a comparable scalar from BOTH paths
+        # without hitting a ``float(None)`` on a missing field. (additive: the
+        # original "forward"/"backward"/"summary" keys are unchanged.)
+        return {"forward": forward_log, "backward": backward_log,
+                "summary": merged, "E_ts": float(E_ts), "valid": True}
 
     # --------------------------- Low-level helpers --------------------------
     def _cart_from_mw(self, q_mw: np.ndarray) -> np.ndarray:

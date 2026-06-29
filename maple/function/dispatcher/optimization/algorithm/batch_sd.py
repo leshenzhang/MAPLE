@@ -244,6 +244,20 @@ class _BatchGradOpt:
             full = torch.ones(len(atoms_list), dtype=torch.bool, device=device)
             self._harvest(calc, full, E_old, iteration, converged=False)
 
+        # Propagate the optimized geometry back to the caller's Molecules, so the
+        # standard dispatch path (optimization.py ``_run_batched`` -> ``return
+        # mols``) and any ``mols.multiatoms[i].get_positions()`` reader see the
+        # SD/SDCG result. BatchLBFGS / BatchRFO / BatchDIIS already update
+        # ``mols.multiatoms`` in place; previously the _BatchGradOpt family wrote
+        # the final geometry ONLY to ``self.final_positions`` and the dispatcher
+        # discarded the optimizer object, so the batched SD/SDCG result was lost.
+        # ``self.final_positions`` is preserved unchanged (additive, root-cause at
+        # the shared base run()). (algorithm-audit fix; default = the optimized
+        # geometry, matching the single-structure optimizers.)
+        for orig, pos in self.final_positions.items():
+            if 0 <= orig < len(mols.multiatoms):
+                mols.multiatoms[orig].set_positions(pos)
+
         self._close_log()
 
     # ===================================================
