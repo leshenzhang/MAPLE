@@ -337,11 +337,35 @@ class BatchedNVT(JobABC):
         for th in self._thermostats:
             th.set_temperature(T)
 
-    def _record(self, ke, E):
-        self._hist_KE.append(ke)
+    def _ke_full_internal(self, v):
+        """Per-replica kinetic energy (Ha): the full KE, and the KE with the
+        centre-of-mass velocity projected out. The padded (B, nmax_dof) buffer
+        interleaves (x, y, z) per atom; padding columns carry mass=1 but v=0, so
+        the MASKED real mass is used so padding enters neither the COM nor the KE.
+        Mirrors ``utils.calculate_temperature``'s COM projection exactly."""
+        B = self.B
+        ke_full = 0.5 * (self.mass * v * v).sum(dim=1)               # (B,) padded v=0 -> no pad term
+        mreal = (self.mass * self.mask).view(B, -1, 3)               # padding mass -> 0
+        vr = v.view(B, -1, 3)
+        mom = (mreal * vr).sum(dim=1)                                # (B, 3) momentum
+        m_tot = mreal[:, :, 0].sum(dim=1).clamp_min(1e-30)           # (B,) real total mass
+        v_com = mom / m_tot[:, None]                                 # (B, 3)
+        vr_int = vr - v_com[:, None, :]
+        ke_int = 0.5 * (mreal * vr_int * vr_int).sum(dim=(1, 2))     # (B,) padding mass=0 -> no pad term
+        return ke_full, ke_int
+
+    def _record(self, v, E):
+        """Record per-replica KE/PE/T from the (sync) velocity. T is formed from
+        the COM-subtracted (internal, 3N-3) kinetic energy so it matches the
+        n_dof=3N-3 divisor -- the kinetic-T calibration fix (a per-particle OU
+        Langevin thermostat also thermostats the 3 COM modes; leaving that COM
+        energy in KE while dividing by 3N-3 over-reports T by 3N/(3N-3)). See
+        ``utils.calculate_temperature``. The KE_Ha history keeps the raw full KE."""
+        ke_full, ke_int = self._ke_full_internal(v)
+        self._hist_KE.append(ke_full)
         self._hist_PE.append(E)
         ndof = self._torch.tensor(self.n_dof, dtype=self.dtype, device=self.device)
-        self._hist_T.append(2.0 * ke / (ndof * KELVIN_TO_HARTREE))
+        self._hist_T.append(2.0 * ke_int / (ndof * KELVIN_TO_HARTREE))
 
     # =================================================================== v-rescale
     def _run_vrescale(self):
@@ -358,8 +382,7 @@ class BatchedNVT(JobABC):
             v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick
             v = self._apply_thermostat(v, vrescale=True)      # per-replica Bussi A7
             v = self._apply_projection(v, step)               # per-replica COM/angular
-            ke = 0.5 * (self.mass * v * v).sum(dim=1)         # (B,) Ha
-            self._record(ke, E)
+            self._record(v, E)                                # T from COM-subtracted KE
             self._steps_done = step
         self.v = v
 
@@ -384,8 +407,7 @@ class BatchedNVT(JobABC):
             v = self._apply_projection(v, step)               # per-replica COM/angular
             # report SYNC (standard) KE/T: v_std = v_carried + 0.5*(F/m)*dt
             v_sync = v + 0.5 * F / self.mass * self.dt_au
-            ke = 0.5 * (self.mass * v_sync * v_sync).sum(dim=1)
-            self._record(ke, E)
+            self._record(v_sync, E)                           # T from COM-subtracted KE
             self._steps_done = step
         self.v = v
 

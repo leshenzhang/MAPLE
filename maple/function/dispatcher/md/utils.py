@@ -203,7 +203,12 @@ def describe_dof_policy(policy: Dict[str, object]) -> str:
     return "isolated: 3N"
 
 
-def calculate_temperature(atoms: Atoms, velocities: np.ndarray, n_dof: Optional[int] = None) -> float:
+def calculate_temperature(
+    atoms: Atoms,
+    velocities: np.ndarray,
+    n_dof: Optional[int] = None,
+    remove_com_velocity: Optional[bool] = None,
+) -> float:
     """
     Calculate instantaneous temperature from velocities.
 
@@ -216,6 +221,31 @@ def calculate_temperature(atoms: Atoms, velocities: np.ndarray, n_dof: Optional[
     The built-in fallback (`3N` for PBC, `3N-3` for non-PBC) is retained only
     for legacy callers that have not yet been migrated to the central policy.
 
+    Numerator/denominator consistency (the kinetic-T calibration fix):
+    `T = 2*KE/(N_dof*k_B)` is only unbiased when the kinetic energy in the
+    numerator lives in the SAME subspace counted by `N_dof` in the denominator.
+    Whenever the counted DOF exclude the global centre-of-mass translation
+    (`n_dof < 3N` -- i.e. the isolated/COM-removed case `3N-3`, the
+    COM+rotation case `3N-6`, or a PBC run with runtime COM-drift removal), the
+    COM velocity is NOT one of the counted thermal DOF and its kinetic energy
+    must be projected out of `KE` before forming `T`. A per-particle stochastic
+    thermostat (the LF-Middle Langevin OU update `v' = c1 v + c2 xi`) actively
+    drives EVERY Cartesian DOF -- the 3 COM modes included -- to the bath
+    temperature; if that COM kinetic energy is left in `KE` while dividing by
+    `3N-3`, the reported temperature is biased high by the factor
+    `3N/(3N-3)` (e.g. +12.5% for a 9-atom molecule, +5-10% for the small
+    molecules seen in the batched-NVT/REMD smoke). Runtime COM projection
+    every `remove_com_every` steps only zeroes the drift intermittently, so the
+    report is biased between removals. The deterministic V-rescale thermostat
+    rescales the full vector toward `(N_dof/2)kT` and never injects COM motion,
+    so the projection is a no-op there and its (correct) report is unchanged.
+
+    `remove_com_velocity` defaults to `n_dof < 3N` (project out the COM exactly
+    when the count says the COM is not a thermal DOF). Pass it explicitly to
+    override. This is a REPORTING correction only: it changes the temperature/
+    KE used for logging, never the propagated velocities or the thermostat
+    coupling, so the (already-correct) internal ensemble is left untouched.
+
     Parameters
     ----------
     atoms : ase.Atoms
@@ -226,6 +256,10 @@ def calculate_temperature(atoms: Atoms, velocities: np.ndarray, n_dof: Optional[
     n_dof : int, optional
         Active number of degrees of freedom. When omitted, a legacy fallback is
         used (`3N` for PBC, `3N-3` for non-PBC).
+    remove_com_velocity : bool, optional
+        Whether to project the centre-of-mass velocity out of the kinetic energy
+        before forming the temperature. When ``None`` (default) it is inferred
+        as ``n_dof < 3N`` so the numerator matches the counted DOF.
 
     Returns
     -------
@@ -233,10 +267,9 @@ def calculate_temperature(atoms: Atoms, velocities: np.ndarray, n_dof: Optional[
         Temperature in Kelvin
     """
     masses = atoms.get_masses() * AMU_TO_AU  # Convert to atomic units
-    kinetic = 0.5 * np.sum(masses[:, np.newaxis] * velocities**2)
+    n_atoms = len(atoms)
 
     if n_dof is None:
-        n_atoms = len(atoms)
         # Backward-compatible default until all callers migrate to explicit policy.
         if any(atoms.pbc):
             n_dof = 3 * n_atoms
@@ -246,6 +279,18 @@ def calculate_temperature(atoms: Atoms, velocities: np.ndarray, n_dof: Optional[
     if n_dof <= 0:
         return 0.0
 
+    # Project the COM velocity out of KE iff the counted DOF exclude it, so the
+    # numerator (KE) and denominator (N_dof) describe the same subspace.
+    if remove_com_velocity is None:
+        remove_com_velocity = n_dof < 3 * n_atoms
+
+    v = np.asarray(velocities)
+    if remove_com_velocity and n_atoms > 0:
+        total_mass = np.sum(masses)
+        v_com = np.sum(masses[:, np.newaxis] * v, axis=0) / total_mass
+        v = v - v_com[np.newaxis, :]
+
+    kinetic = 0.5 * np.sum(masses[:, np.newaxis] * v**2)
     temperature = 2.0 * kinetic / (n_dof * KELVIN_TO_HARTREE)
     return temperature
 
