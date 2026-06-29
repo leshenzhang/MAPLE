@@ -29,8 +29,12 @@ PRMTOP = os.path.join(CMET, "stripped.prmtop")
 NC = os.path.join(CMET, "snapshots.nc")
 
 import torch
-print("torch", torch.__version__, "| cuda", torch.cuda.is_available(),
-      "|", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", flush=True)
+if torch.cuda.is_available():
+    _gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"torch {torch.__version__} | cuda True | {torch.cuda.get_device_name(0)} "
+          f"| {_gb:.0f} GB", flush=True)
+else:
+    print(f"torch {torch.__version__} | cuda False | cpu", flush=True)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -70,7 +74,7 @@ print(f"[init] MACEAutogradBatchCalc loaded MACE-OFF23_medium r_max={bcalc.r_max
 # --------------- PART C: MLIP batch==sequential, all 3 segments ------------ #
 top = Prmtop(PRMTOP)
 lig_idx, rec_idx = top.ligand_receptor_masks("LIG")
-Fc = 12
+Fc = 6                                             # GPU-memory-safe for a 4331-atom complex
 coords_all = read_nc_coords(NC, frames=Fc)        # (Fc, natom, 3)
 print(f"[C] natom={top.natom} frames_used={coords_all.shape[0]} "
       f"lig={lig_idx.size} rec={rec_idx.size} q_lig={top.charges[lig_idx].sum():.3f}e",
@@ -117,6 +121,8 @@ for tag, idx in [("ligand", lig_idx), ("receptor", rec_idx),
         line += f" ; batch-vs-upstream(f0) |d|={dref:.3e} Ha"
     print(line, flush=True)
     assert dpar < 1e-8, (tag, dpar)
+    if DEV == "cuda":
+        torch.cuda.empty_cache()
 print(f"[C] all-3-segment batch==sequential parity OK (worst {worst:.3e} Ha < 1e-8)",
       flush=True)
 
@@ -141,8 +147,8 @@ class HartreeWrap(Calculator):
             self.results["forces"] = a.get_forces() * EV2HARTREE
 
 
-Fe = 16
-MB = 8           # cap frames/forward for the 4331-atom complex (GPU-memory safe)
+Fe = 12
+MB = 4           # cap frames/forward for the 4331-atom complex (GPU-memory safe)
 
 t0 = time.time()
 eb_b = EndpointBinding(PRMTOP, NC, calc=bcalc, ligand_resname="LIG",
