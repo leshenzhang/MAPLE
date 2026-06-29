@@ -443,7 +443,18 @@ class MACEAutogradBatchCalc:
         F_eV = self._scatter_forces((-g).detach().to(dtype))
         return (E_eV.detach().to(dtype) * EV2HARTREE, F_eV * EV2HARTREE)
 
-    def get_efh_gpu(self):
+    def get_efh_gpu(self, movable_masks=None):
+        """Energy + forces + per-structure Hessian.
+
+        ``movable_masks`` (mirrors ANIBatchCalc / UMABatchCalc / AIMNet2BatchCalc):
+        None = full Hessian (byte-identical oracle); else a per-structure movable
+        atom subset (None / bool mask / index list per structure) that restricts
+        BOTH the perturbed (seeded) DOFs AND the responding rows to the movable
+        subspace -- the EXACT (3m x 3m) block of the constrained PES, enzyme-safe.
+        For the autograd path this is a MOVABLE-AUTOGRAD partial Hessian: only the
+        3m movable columns are seeded (1 forward + 1 + 3m backward), NOT the FD
+        6m-forward path.
+        """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
@@ -453,18 +464,61 @@ class MACEAutogradBatchCalc:
                     torch.zeros((0,), dtype=torch.int64, device=device))
         # OLD path (default + oracle): 6N central finite-difference Hessian.
         if self.hessian_mode == "numerical":
-            return self._efh_fd()
+            return self._efh_fd(movable_masks=movable_masks)
         # OPT-IN autograd double-backward Hessian. Try (optional) vmap first, then
         # the row-loop, then hard-fall-back to the FD oracle on ANY failure.
         if self._hessian_chunk_size is not None:
             try:
-                return self._efh_analytic(chunk_size=self._hessian_chunk_size)
+                return self._efh_analytic(movable_masks, chunk_size=self._hessian_chunk_size)
             except Exception:
                 pass
         try:
-            return self._efh_analytic()
+            return self._efh_analytic(movable_masks)
         except Exception:
-            return self._efh_fd()
+            return self._efh_fd(movable_masks=movable_masks)
+
+    # =====================================================================
+    # partial-Hessian (movable-atom subspace) helpers -- mirror ANIBatchCalc
+    # =====================================================================
+    def _resolve_movable(self, movable_masks):
+        """Per-structure movable atom-index lists. None -> all atoms of every
+        structure (full Hessian). Each entry None / bool mask / explicit indices."""
+        B = self._atoms_B
+        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
+        if movable_masks is None:
+            return [list(range(n_b[b])) for b in range(B)]
+        out = []
+        for b in range(B):
+            m = movable_masks[b]
+            if m is None:
+                out.append(list(range(n_b[b])))
+                continue
+            m_arr = np.asarray(m)
+            if m_arr.dtype == bool:
+                out.append([int(i) for i in np.nonzero(m_arr)[0]])
+            else:
+                idxs = [int(i) for i in m_arr.reshape(-1)]
+                assert all(0 <= a < n_b[b] for a in idxs), (
+                    f"movable index out of range for structure {b} "
+                    f"(n_atoms={n_b[b]}): {idxs}")
+                out.append(idxs)
+        return out
+
+    def _movable_tensors(self, movable_masks):
+        """(movable_atom (N,) bool, movable_la (B, nmax_a) bool). All-True when
+        movable_masks is None -> byte-identical full Hessian."""
+        N, B, nmax_a = self.N_atoms, self._atoms_B, self.Nmax_atoms
+        device = self.device
+        mov = self._resolve_movable(movable_masks)
+        movable_atom = torch.zeros(N, dtype=torch.bool, device=device)
+        movable_la = torch.zeros((B, nmax_a), dtype=torch.bool, device=device)
+        ptr = self._ptr.tolist()
+        for i in range(B):
+            base = ptr[i]
+            for a in mov[i]:
+                movable_atom[base + a] = True
+                movable_la[i, a] = True
+        return movable_atom, movable_la
 
     # =====================================================================
     # BATCH HVP via double-backward (NO full 3N x 3N Hessian).  1 forward.
@@ -556,23 +610,26 @@ class MACEAutogradBatchCalc:
     # =====================================================================
     # seeded block-diagonal analytic Hessian (double-backward) / FD fallback
     # =====================================================================
-    def _efh_analytic(self, chunk_size: Optional[int] = None):
-        """Full block-diagonal Hessian by seeded DOUBLE-BACKWARD. 1 forward +
-        (1 + 3*nmax_a) backward -- still ONE model forward (vs FD's 6N).
+    def _efh_analytic(self, movable_masks=None, chunk_size: Optional[int] = None):
+        """Block-diagonal Hessian by seeded DOUBLE-BACKWARD. 1 forward +
+        (1 + 3*m) backward over the movable subspace (m = movable atoms) -- still
+        ONE model forward (vs FD's 6m). ``movable_masks`` (mirrors ANIBatchCalc)
+        gates BOTH the seeded columns (only movable local DOFs) AND the responding
+        rows (``row_scale`` zeroes non-movable rows) -> the EXACT (3m x 3m) block
+        of the constrained PES, with non-movable rows/cols left zero. None ->
+        byte-identical full Hessian.
 
         ``F_all = -dE/dx`` carries ``create_graph=True`` (built in
         ``_forward_with_graph``); each Hessian column is the SECOND backward
         ``autograd.grad(F_all, pos, grad_outputs=seed)`` where ``seed`` is the
-        block-diagonal unit cotangent for one local DOF over all molecules at once.
+        block-diagonal unit cotangent for one movable local DOF over all molecules.
 
-        ``chunk_size`` (OPT-IN): when given, the 3*nmax_a seed cotangents are
-        stacked and the batched VJP is evaluated with ``torch.vmap(..., chunk_size)``
-        -- the MACE ``compute_hessians_vmap`` pattern (github ACEsuit/mace
-        mace/modules/utils.py; loop fallback per MACE issue #488). ``chunk_size``
-        bounds the vmap working set for OOM. ``chunk_size=None`` (DEFAULT) keeps the
-        byte-identical row-loop, which is also the fallback the caller drops to if
-        the vmap raises. Autograd Hessian ref: Yuan et al., Nat. Commun. 2024,
-        DOI 10.1038/s41467-024-52481-5. Model MUST be eager (pytorch#91469).
+        ``chunk_size`` (OPT-IN): stack the movable seed cotangents and evaluate the
+        batched VJP with ``torch.vmap(..., chunk_size)`` -- the MACE
+        ``compute_hessians_vmap`` pattern (github ACEsuit/mace mace/modules/utils.py;
+        loop fallback per MACE issue #488). ``chunk_size=None`` (DEFAULT) keeps the
+        byte-identical row-loop. Autograd Hessian ref: Yuan et al., Nat. Commun.
+        2024, DOI 10.1038/s41467-024-52481-5. Model MUST be eager (pytorch#91469).
         """
         B, device, dtype = self._atoms_B, self.device, self.dtype
         N, nmax, nmax_a = self.N_atoms, self.nmax_dof, self.Nmax_atoms
@@ -584,22 +641,24 @@ class MACEAutogradBatchCalc:
         F_eV = self._scatter_forces(F_all.to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
+        movable_atom, movable_la = self._movable_tensors(movable_masks)
+        row_scale = movable_atom[:, None].to(F_all.dtype)
         K = 3 * nmax_a
 
         def _scatter_col(k, col):
             a_local = k // 3
-            for i in (n_b > a_local).nonzero(as_tuple=False).flatten().tolist():
+            for i in movable_la[:, a_local].nonzero(as_tuple=False).flatten().tolist():
                 dof = 3 * n_b_list[i]
                 if k < dof:
-                    H_eV[i, :dof, k] = -col[s[i]:s[i] + n_b_list[i], :].reshape(-1)
+                    H_eV[i, :dof, k] = -col[s[i]:s[i] + n_b_list[i], :].reshape(-1).to(dtype)
 
         if chunk_size is not None and K > 0:
-            # OPT-IN vmap over the block-diagonal seed basis (batched VJP).
+            # OPT-IN vmap over the movable block-diagonal seed basis (batched VJP).
             seeds = []
             for k in range(K):
                 a_local, c = k // 3, k % 3
                 go = torch.zeros((N, 3), dtype=F_all.dtype, device=device)
-                valid = (n_b > a_local)
+                valid = movable_la[:, a_local]
                 if bool(valid.any()):
                     go[s[valid] + a_local, c] = 1.0
                 seeds.append(go)
@@ -611,26 +670,30 @@ class MACEAutogradBatchCalc:
 
             COLS = torch.vmap(_get_vjp, in_dims=0, out_dims=0,
                               chunk_size=int(chunk_size))(GO)            # (K,N,3)
+            COLS = COLS * row_scale[None]
             for k in range(K):
-                if bool((n_b > (k // 3)).any()):
-                    _scatter_col(k, COLS[k].to(dtype))
+                if bool(movable_la[:, k // 3].any()):
+                    _scatter_col(k, COLS[k])
         else:
             for k in range(K):
                 a_local, c = k // 3, k % 3
-                valid = (n_b > a_local)
+                valid = movable_la[:, a_local]
                 if not bool(valid.any()):
                     continue
                 rows = s[valid] + a_local
                 go = torch.zeros((N, 3), dtype=F_all.dtype, device=device)
                 go[rows, c] = 1.0
                 col = torch.autograd.grad(F_all, coord_leaf, grad_outputs=go,
-                                          retain_graph=True, create_graph=False)[0].to(dtype)
+                                          retain_graph=True, create_graph=False)[0]
+                col = col * row_scale
                 _scatter_col(k, col)
         H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))
         return (E_eV.detach().to(dtype) * EV2HARTREE, F_eV * EV2HARTREE, H_eV * EV2HARTREE, P)
 
-    def _efh_fd(self, delta: float = 2e-3):
-        """Full numerical Hessian (central FD). 1 + 2*3*nmax_a forwards. Baseline."""
+    def _efh_fd(self, delta: float = 2e-3, movable_masks=None):
+        """Numerical Hessian (central FD). 1 + 2*3*m forwards over the movable
+        subspace. Baseline + parity oracle. ``movable_masks`` gates the perturbed
+        columns + responding rows (None -> full 6N FD Hessian, unchanged)."""
         B, device, dtype = self._atoms_B, self.device, self.dtype
         nmax, nmax_a = self.nmax_dof, self.Nmax_atoms
         E0, F0, _ = self._forward_ef_explicit(self.coord, need_graph=False)
@@ -641,9 +704,11 @@ class MACEAutogradBatchCalc:
         F_eV = self._scatter_forces(F0.detach().to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
+        movable_atom, movable_la = self._movable_tensors(movable_masks)
+        row_scale = movable_atom[:, None].to(dtype)
         for k in range(3 * nmax_a):
             a_local, c = k // 3, k % 3
-            valid = (n_b > a_local)
+            valid = movable_la[:, a_local]
             if not bool(valid.any()):
                 continue
             rows = s[valid] + a_local
@@ -653,7 +718,7 @@ class MACEAutogradBatchCalc:
             cm[rows, c] -= delta
             _, Fp, _ = self._forward_ef_explicit(cp, need_graph=False)
             _, Fm, _ = self._forward_ef_explicit(cm, need_graph=False)
-            col = (-(Fp - Fm) / (2.0 * delta)).to(dtype)
+            col = ((-(Fp - Fm) / (2.0 * delta)).to(dtype)) * row_scale
             for i in valid.nonzero(as_tuple=False).flatten().tolist():
                 dof = 3 * n_b_list[i]
                 if k < dof:

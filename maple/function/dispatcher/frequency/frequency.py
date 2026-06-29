@@ -467,8 +467,25 @@ class FrequencyBase(JobABC):
         calc = getattr(self.atoms, "calc", None)
         bcalc = self._resolve_batched_calc(calc)
         if bcalc is not None:
-            from maple.function.dispatcher.hessian.hessian import batched_fd_hessian
             bare = self._bare_atoms(self.atoms)
+            # MOVABLE-AUTOGRAD (opt-in): when the batched calc is an autograd
+            # backend (MACE-OFF / ANI / UMA built with hessian_mode='autograd'),
+            # take the (3m x 3m) movable block straight from its seeded
+            # double-backward get_efh_gpu(movable_masks=[movable]) -- 1 model
+            # forward + 3m backward, NO 6m finite-difference forwards. Hard
+            # try/except fall-back to the batched-FD path on ANY failure, so the
+            # production default (hessian_mode='numerical' -> FD) is unchanged.
+            if (str(getattr(bcalc, "hessian_mode", "numerical")).lower() == "autograd"
+                    and callable(getattr(bcalc, "get_efh_gpu", None))):
+                try:
+                    Hmv = self._partial_hessian_autograd(bcalc, bare, movable)
+                    if Hmv is not None:
+                        return Hmv
+                except Exception as e:
+                    self.log_info([
+                        f"Partial movable-autograd Hessian failed ({e}); "
+                        f"falling back to batched finite difference.\n"])
+            from maple.function.dispatcher.hessian.hessian import batched_fd_hessian
             res = batched_fd_hessian(
                 bcalc, [bare], movable_masks=[list(movable)],
                 delta=float(self._hessian_delta),
@@ -493,6 +510,30 @@ class FrequencyBase(JobABC):
         )
         cols = np.array([3 * a + c for a in movable for c in range(3)], dtype=np.int64)
         return Hfull[np.ix_(cols, cols)]
+
+    def _partial_hessian_autograd(self, bcalc, bare, movable):
+        """(3m x 3m) movable-subspace Hessian via the autograd backend's seeded
+        double-backward ``get_efh_gpu(movable_masks)`` (1 model forward + 3m
+        backward), sliced from the padded full layout. The frozen environment
+        atoms remain in the single replica (they exert forces/curvature on the
+        movable core); only the movable rows/cols are nonzero, so the movable
+        block IS the exact constrained-PES Hessian. Returns float64 numpy
+        (Ha/A^2) in the SAME movable order as the sub-Atoms, or None.
+        """
+        bcalc.prepare([bare])
+        self.log_info([
+            "Partial Hessian via MOVABLE-AUTOGRAD (seeded double-backward, "
+            "1 forward + 3m backward).\n"])
+        out = bcalc.get_efh_gpu(movable_masks=[list(movable)])
+        H = out[2]                       # (1, nmax_dof, nmax_dof), padded full
+        if _TORCH_OK and isinstance(H, torch.Tensor):
+            H0 = H[0].detach().to(torch.float64).cpu().numpy()
+        else:
+            H0 = np.asarray(H[0], dtype=np.float64)
+        a = np.asarray(list(movable), dtype=np.int64)
+        cols = (3 * a[:, None] + np.arange(3, dtype=np.int64)[None, :]).reshape(-1)
+        Hmv = H0[np.ix_(cols, cols)]
+        return np.ascontiguousarray(Hmv, dtype=np.float64)
 
     def _resolve_batched_calc(self, calc):
         """Return a calculator implementing the batch contract, or None.
