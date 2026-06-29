@@ -24,12 +24,14 @@ from .steered import (SteeredMDCalculator, smd_enabled, jarzynski_1d,
                       read_smd_work)
 from . import umbrella
 from .batched import BatchedHarmonicRestraint
+from .steered_batched import BatchedMovingRestraint
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "PosresCalculator", "posres_enabled", "GamdCalculator",
            "gamd_enabled", "gamd_params", "gamd_reweight_1d",
            "SteeredMDCalculator", "smd_enabled", "jarzynski_1d",
-           "read_smd_work", "umbrella", "BatchedHarmonicRestraint"]
+           "read_smd_work", "umbrella", "BatchedHarmonicRestraint",
+           "BatchedMovingRestraint"]
 
 
 def maybe_wrap_bias(atoms, params, output):
