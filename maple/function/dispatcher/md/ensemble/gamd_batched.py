@@ -202,7 +202,7 @@ class BatchedGaMD(BatchedNVT):
                 v = v + 0.5 * F / self.mass * self.dt_au
                 v = self._apply_thermostat(v, vrescale=True)
                 v = self._apply_projection(v, step)
-                ke = 0.5 * (self.mass * v * v).sum(dim=1)
+                self._record(v, E)                       # tcalib: COM-subtracted T
             else:
                 v = v + F / self.mass * self.dt_au
                 self._displace(v, 0.5)
@@ -211,8 +211,7 @@ class BatchedGaMD(BatchedNVT):
                 E, F = self._forces_au()
                 v = self._apply_projection(v, step)
                 v_sync = v + 0.5 * F / self.mass * self.dt_au
-                ke = 0.5 * (self.mass * v_sync * v_sync).sum(dim=1)
-            self._record(ke, E)
+                self._record(v_sync, E)                  # tcalib: COM-subtracted T
             self._steps_done = step
             if re and step % re == 0 and step > prep:
                 v = self._we_resample(v, step)

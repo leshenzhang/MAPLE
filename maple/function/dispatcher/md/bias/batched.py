@@ -59,6 +59,19 @@ from ..utils import HA_PER_ANG_TO_AU          # Ha/Angstrom -> Ha/Bohr (a.u. for
 from .gamd import gamd_params, _Welford, HARTREE_PER_KCAL, KB_HA_PER_K  # reuse GaMD math
 
 
+def _ptr_to_np(ptr):
+    """Coerce a batch calculator's per-replica atom-offset ``_ptr`` (B+1,) to numpy.
+
+    The batch calculators disagree on the type: MACE-OFF's ``_ptr`` is already a
+    numpy array, but the UMA batch calculator's is a CUDA torch tensor
+    (``_uma_batch_calculator.py``), and ``np.asarray`` on a CUDA tensor raises
+    ``TypeError`` (C2). Handle: torch tensor (CPU or CUDA) -> detach/cpu/numpy;
+    anything else -> ``np.asarray``."""
+    if hasattr(ptr, "detach"):                 # torch tensor (CPU or CUDA)
+        return ptr.detach().to("cpu").numpy()
+    return np.asarray(ptr)
+
+
 class BatchedHarmonicRestraint:
     """Per-replica harmonic restraint on a COM-COM distance CV for BatchedNVT.
 
@@ -148,7 +161,7 @@ class BatchedHarmonicRestraint:
         CV of each replica is recorded into ``self.cv_history``."""
         import torch
         coord_np = calc.coord.detach().to("cpu").numpy()
-        cvs, forces = self.restraint_forces(coord_np, np.asarray(calc._ptr))
+        cvs, forces = self.restraint_forces(coord_np, _ptr_to_np(calc._ptr))
         dE = np.zeros(self.B, dtype=np.float64)
         for b in range(self.B):
             n = self._n[b]
@@ -264,9 +277,7 @@ class BatchedGaMD:
 
     @staticmethod
     def _ptr_np(calc):
-        ptr = calc._ptr
-        return (ptr.detach().to("cpu").numpy() if hasattr(ptr, "detach")
-                else np.asarray(ptr))
+        return _ptr_to_np(calc._ptr)            # module-level CUDA-aware coercion (C2)
 
     # ------------------------------------------------------------- bias contract
     def apply(self, E, F, calc):

@@ -458,8 +458,19 @@ class BatchedNVT(JobABC):
         return v
 
     def _apply_projection(self, v, step):
-        """Per-replica runtime COM/angular projection (reuses B's util)."""
-        if not (self.params.remove_com_every or self.params.remove_angular_every):
+        """Per-replica runtime COM/angular projection (reuses B's util).
+
+        O2a (gpu-opt, zero-risk): ``apply_runtime_motion_projection`` is a no-op
+        unless this step hits the COM or angular cadence, so gate on that cadence
+        BEFORE entering the per-replica GPU<->CPU roundtrip loop. The condition
+        MIRRORS that util's isolated-replica branch exactly (BatchedNVT is
+        isolated-only), so NO recorded value changes -- only the wasted roundtrips
+        on no-op steps are skipped."""
+        ce = int(self.params.remove_com_every or 0)
+        ae = int(self.params.remove_angular_every or 0)
+        com_fires = ce > 0 and (step % ce == 0)
+        ang_fires = ae > 0 and (step % ae == 0)
+        if not (com_fires or ang_fires):
             return v
         for b in range(self.B):
             vb = self._v_real(v, b)
@@ -507,6 +518,43 @@ class BatchedNVT(JobABC):
         ndof = self._torch.tensor(self.n_dof, dtype=self.dtype, device=self.device)
         self._hist_T.append(2.0 * ke_int / (ndof * KELVIN_TO_HARTREE))
 
+    # ---------------------------------------------------------- factored VV steps
+    def _step_vrescale(self, v, F, step):
+        """ONE v-rescale VV step (factored out of ``_run_vrescale`` so REMD can call
+        it per step). B1 half kick -> A full drift -> ONE forward -> B2 half kick ->
+        per-replica Bussi A7 rescale -> COM/angular projection -> record. T is from
+        the COM-subtracted KE (tcalib: pass the velocity ``v`` to ``_record``, NOT a
+        pre-formed ke). Returns (v, E, F)."""
+        self._set_anneal_T(step)
+        v = v + 0.5 * F / self.mass * self.dt_au          # B1 half kick
+        self._displace(v, 1.0)                            # A full drift
+        E, F = self._forces_au()                          # ONE forward
+        v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick
+        v = self._apply_thermostat(v, vrescale=True)      # per-replica Bussi A7
+        v = self._apply_projection(v, step)               # per-replica COM/angular
+        self._record(v, E)                                # T from COM-subtracted KE
+        self._steps_done = step
+        return v, E, F
+
+    def _step_langevin(self, v, F, step):
+        """ONE LF-Middle Langevin VV step (factored out of ``_run_langevin`` so REMD
+        can call it per step), in the CARRIED-velocity representation: full kick ->
+        half drift -> OU thermostat -> half drift -> post-thermostat forward ->
+        projection -> record SYNC (standard) KE/T. tcalib: pass ``v_sync`` to
+        ``_record`` (NOT a pre-formed ke). Returns (v_carried, E, F)."""
+        self._set_anneal_T(step)
+        v = v + F / self.mass * self.dt_au                # full kick (carried)
+        self._displace(v, 0.5)                            # half drift
+        v = self._apply_thermostat(v, vrescale=False)     # per-replica OU
+        self._displace(v, 0.5)                            # half drift
+        E, F = self._forces_au()                          # post-thermostat forward
+        v = self._apply_projection(v, step)               # per-replica COM/angular
+        # report SYNC (standard) KE/T: v_std = v_carried + 0.5*(F/m)*dt
+        v_sync = v + 0.5 * F / self.mass * self.dt_au
+        self._record(v_sync, E)                           # T from COM-subtracted KE
+        self._steps_done = step
+        return v, E, F
+
     # =================================================================== v-rescale
     def _run_vrescale(self):
         """Vectorized VV (Bussi 2007 post-step rescale). Mirrors nvt._run_simulation
@@ -515,15 +563,7 @@ class BatchedNVT(JobABC):
         v = self.v
         E, F = self._forces_au()                              # cache F at t=0
         for step in range(1, self.params.steps + 1):
-            self._set_anneal_T(step)
-            v = v + 0.5 * F / self.mass * self.dt_au          # B1 half kick
-            self._displace(v, 1.0)                            # A full drift
-            E, F = self._forces_au()                          # ONE forward
-            v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick
-            v = self._apply_thermostat(v, vrescale=True)      # per-replica Bussi A7
-            v = self._apply_projection(v, step)               # per-replica COM/angular
-            self._record(v, E)                                # T from COM-subtracted KE
-            self._steps_done = step
+            v, E, F = self._step_vrescale(v, F, step)
         self.v = v
 
     # =================================================================== langevin
@@ -538,17 +578,7 @@ class BatchedNVT(JobABC):
         # standard -> LF-Middle carried at t=0 (v_carried = v - 0.5*(F/m)*dt).
         v = v - 0.5 * F / self.mass * self.dt_au
         for step in range(1, self.params.steps + 1):
-            self._set_anneal_T(step)
-            v = v + F / self.mass * self.dt_au                # full kick (carried)
-            self._displace(v, 0.5)                            # half drift
-            v = self._apply_thermostat(v, vrescale=False)     # per-replica OU
-            self._displace(v, 0.5)                            # half drift
-            E, F = self._forces_au()                          # post-thermostat forward
-            v = self._apply_projection(v, step)               # per-replica COM/angular
-            # report SYNC (standard) KE/T: v_std = v_carried + 0.5*(F/m)*dt
-            v_sync = v + 0.5 * F / self.mass * self.dt_au
-            self._record(v_sync, E)                           # T from COM-subtracted KE
-            self._steps_done = step
+            v, E, F = self._step_langevin(v, F, step)
         self.v = v
 
     # ----------------------------------------------------------------- finalize
