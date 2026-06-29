@@ -52,10 +52,14 @@ class HartreeWrap(Calculator):
 
 Fe = 12
 
-# ---- batched run (OOM-resilient: drop max_batch until it fits) ----
+# ---- batched run (OOM-resilient ladder) ----
+# A single 4331-atom-complex forward at f64 caps the batch: B=2 (~8.7k atoms) fits an
+# 80GB A100; B>=3 (>=13k atoms) OOMs. TorchScript wraps CUDA-OOM as a generic
+# RuntimeError, so catch both. (An energy-only get_e_gpu would ~halve memory and lift
+# this cap; the autograd batch calc currently exposes only get_ef_gpu.)
 bcalc = MACEAutogradBatchCalc(model_path=CACHE, device=DEV, dtype=torch.float64)
 r_b, t_b, mb = None, None, None
-for cand in (4, 3, 2, 1):
+for cand in (2, 1):
     try:
         if DEV == "cuda":
             torch.cuda.empty_cache()
@@ -69,10 +73,15 @@ for cand in (4, 3, 2, 1):
         t_b = time.time() - t0
         mb = cand
         break
-    except torch.cuda.OutOfMemoryError:
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        print(f"[D] batched max_batch={cand} OOM, dropping", flush=True)
+        del bcalc
+        gc.collect()
         if DEV == "cuda":
             torch.cuda.empty_cache()
-        gc.collect()
+        bcalc = MACEAutogradBatchCalc(model_path=CACHE, device=DEV, dtype=torch.float64)
         continue
 assert r_b is not None, "batched run OOM at every max_batch"
 print(f"[D] BATCHED  dG_bind={r_b['dG_bind_mean']:.4f} +/- {r_b['dG_bind_sem']:.4f} kcal/mol "
