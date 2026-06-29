@@ -153,8 +153,13 @@ class TransitionState(JobABC):
             ts_hessian_inject=bool(p.get('ts_hessian_inject', False)),
             trust_mode=str(p.get('trust_mode', 'legacy')),
             mode_follow_guard=bool(p.get('mode_follow_guard', False)),
+            # OPT-IN VRAM-adaptive pool sizing (default OFF -> fixed B_target).
+            auto_batch=bool(p.get('auto_batch', False)),
+            auto_batch_cap=int(p.get('auto_batch_cap', 256)),
+            vram_safety=float(p.get('vram_safety', 0.8)),
         )
-        bprfo.run(mols, pool_queue=p.get('pool_queue'), B_target=p.get('B_target'))
+        bprfo.run(mols, pool_queue=p.get('pool_queue'), B_target=p.get('B_target'),
+                  auto_batch=p.get('auto_batch'))
 
     def _run_batched_dimer(self):
         """Batched dimer saddle search over B TS guesses (BatchDimer). params map
