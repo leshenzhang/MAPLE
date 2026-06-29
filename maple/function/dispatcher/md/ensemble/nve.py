@@ -33,7 +33,7 @@ from ..utils import (
     HA_PER_ANG_TO_AU,
 )
 from ..logger import MDLogger
-from ..constraints import build_constraint_manager
+from ..constraints import build_constraint_manager, maybe_repartition_masses
 
 
 from ..bias import maybe_wrap_bias
@@ -185,6 +185,15 @@ class NVEParams:
     random_seed: Optional[int] = None
     constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
     constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
+    # [Batch-3] GaMD boost (CV-free enhanced sampling); empty/off = no boost
+    gamd:            str   = ""       # ""/off/lower/upper - boost mode (reaches params via _init_params)
+    gamd_sigma0:     float = 6.0      # kcal/mol; anti-Gaussian width ceiling (sigma0)
+    gamd_prep_steps: int   = 2000     # conventional-MD steps to collect V statistics
+    gamd_params:     Optional[dict] = None  # pre-fit {mode,k,E,...}; set to skip prep
+    # [Batch-3] Hydrogen mass repartitioning (4 fs steps with H-bond constraints)
+    hmr:           str   = ""         # ""/off = no-op; on/true => factor 3.0; or a numeric factor
+    hmr_factor:    Optional[float] = None   # explicit factor override of params.hmr
+    hmr_bond_mult: float = 1.2        # covalent-radius scale for H-bond inference
 
     # ------------------------------------------------------------------
     # box_check: minimum-image box-size guard severity (strict|warn|off).
@@ -220,6 +229,7 @@ class NVE(JobABC):
 
         # Initialize params from dict
         self.params = self._init_params(NVEParams, paras, ("md", "MD", "nve", "NVE"))
+        maybe_repartition_masses(self.atoms, self.params)
         maybe_wrap_bias(self.atoms, self.params, output)
 
         # [TASK#9 constraints] frozen constraint set (None if constraints=none)

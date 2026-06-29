@@ -338,3 +338,157 @@ def build_constraint_manager(atoms: Atoms, params):
             f"Unknown constraint_algorithm='{algo}'. Choose from: {sorted(_VALID_ALGOS)}."
         )
     return ConstraintManager(atoms, mode=mode, algorithm=algo)
+
+
+# ----------------------------------------------------------------------------
+# Hydrogen Mass Repartitioning (HMR) — enables a 4 fs time step together with
+# H-bond constraints (Hopkins, Le Grand, Walker & Roitberg, JCTC 2015,
+# 10.1021/ct5010406). Mass-only edit, so it composes with any MLIP force engine
+# and with the RATTLE constraint manager above (TASK#9).
+# ----------------------------------------------------------------------------
+_HMR_FLOOR = 1.0     # amu; a heavy donor may not drop to/below this
+
+
+def _hmr_factor(raw, explicit):
+    """Resolve the HMR scale factor from params.hmr (+ optional params.hmr_factor).
+
+    Falsey / 'off' / 'no' / 'false' / 'none' / '0' => 0.0 (disabled).
+    True / 'on' / 'yes' / 'true' => 3.0 (standard ~3.024 amu hydrogen).
+    A number (or numeric string) => that factor.
+    """
+    if explicit is not None:
+        try:
+            return max(0.0, float(explicit))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(raw, bool):
+        return 3.0 if raw else 0.0
+    if isinstance(raw, (int, float)):
+        return max(0.0, float(raw))
+    s = str(raw).strip().lower()
+    if s in ("", "off", "no", "false", "none", "0"):
+        return 0.0
+    if s in ("on", "yes", "true"):
+        return 3.0
+    try:
+        return max(0.0, float(s))
+    except ValueError:
+        return 3.0     # 'hmr' truthy but unparseable -> standard factor
+
+
+def maybe_repartition_masses(atoms: Atoms, params, *, log: bool = True) -> float:
+    """Repartition hydrogen masses in place (AMBER-style HMR); return the factor.
+
+    Each hydrogen mass is scaled to ``factor * m_H`` and the added mass
+    ``m_H*(factor-1)`` is subtracted from the single heavy atom it is covalently
+    bonded to. Bonds are inferred from covalent radii via the same topology
+    helper the constraint manager uses, so HMR and H-bond constraints see an
+    identical bond set. Total mass is conserved exactly; forces/energies are
+    untouched (pure MLIP-safe). Slowing the fastest X-H motions is what permits a
+    constrained integrator to use up to a 4 fs step.
+
+    Controlled by ``params.hmr`` (falsey => no-op) and optional
+    ``params.hmr_factor`` / ``params.hmr_bond_mult``. Idempotent (guarded by
+    ``atoms.info['hmr_applied']``). Returns 0.0 when disabled.
+
+    Reads params via getattr so it composes with any params object, but
+    hmr / hmr_factor / hmr_bond_mult are also declared as real NVE/NVT/NPTParams
+    dataclass fields -- otherwise _init_params (jobABC) would strip the unknown
+    keys when building the dataclass and HMR would silently no-op on the
+    production ensemble path (the bug the gamd/* fields had until B-51).
+    """
+    factor = _hmr_factor(getattr(params, "hmr", ""), getattr(params, "hmr_factor", None))
+    if factor <= 0.0:
+        return 0.0
+    if atoms.info.get("hmr_applied"):
+        return float(atoms.info["hmr_applied"])        # already applied; no double-count
+
+    masses = atoms.get_masses().astype(float)
+    numbers = atoms.get_atomic_numbers()
+    mult = float(getattr(params, "hmr_bond_mult", _DEFAULT_BOND_MULT))
+    neigh = _neighbor_map(len(atoms), _infer_bonds(atoms, mult))
+    symbols = atoms.get_chemical_symbols()
+
+    h_idx = [i for i in range(len(atoms)) if numbers[i] == 1]
+    moved = 0
+    for h in h_idx:
+        heavy = [x for x in neigh[h] if numbers[x] > 1]
+        if len(heavy) != 1:
+            # bridging H / isolated H / H2: no unique heavy donor -> leave it (AMBER skips)
+            if log:
+                print(f"[HMR] H atom {h} has {len(heavy)} heavy neighbour(s); skipped.")
+            continue
+        donor = heavy[0]
+        d = masses[h] * (factor - 1.0)
+        if masses[donor] - d <= _HMR_FLOOR:
+            raise ValueError(
+                f"[HMR] heavy atom {donor} ({symbols[donor]}, {masses[donor]:.3f} amu) "
+                f"cannot donate {d:.3f} amu at factor {factor:g}; lower hmr_factor.")
+        masses[h] = masses[h] * factor
+        masses[donor] -= d
+        moved += 1
+
+    atoms.set_masses(masses)
+    atoms.info["hmr_applied"] = float(factor)
+    if log:
+        print(f"[HMR] factor={factor:g}: repartitioned {moved}/{len(h_idx)} H; "
+              f"total mass {masses.sum():.4f} amu (conserved).")
+    return float(factor)
+
+
+if __name__ == "__main__":
+    # Self-test: HMR conserves mass, scales H, draws from the bonded heavy atom,
+    # is idempotent, no-ops when disabled, and guards an impossible factor.
+    from types import SimpleNamespace
+    from ase.build import molecule
+
+    def _masses_of(name, **pkw):
+        a = molecule(name)
+        maybe_repartition_masses(a, SimpleNamespace(**pkw), log=False)
+        return a, a.get_masses().copy()
+
+    base = molecule("CH3CH2OH")
+    m0 = base.get_masses().copy()
+    nums = base.get_atomic_numbers()
+
+    # (1) factor 3: total mass conserved, every H == 3*m_H
+    a, m = _masses_of("CH3CH2OH", hmr=True)
+    assert abs(m.sum() - m0.sum()) < 1e-9, (m.sum(), m0.sum())
+    for i in range(len(a)):
+        if nums[i] == 1:
+            assert abs(m[i] - 3.0 * m0[i]) < 1e-9, (i, m[i], m0[i])
+    # heavy atoms only ever lose mass
+    for i in range(len(a)):
+        if nums[i] > 1:
+            assert m[i] <= m0[i] + 1e-12, (i, m[i], m0[i])
+    print(f"(1) factor3 ethanol OK: sum {m.sum():.4f}==={m0.sum():.4f}")
+
+    # (2) explicit numeric factor via hmr_factor overrides hmr
+    a2, m2 = _masses_of("H2O", hmr=True, hmr_factor=2.0)
+    for i in range(len(a2)):
+        if a2.get_atomic_numbers()[i] == 1:
+            assert abs(m2[i] - 2.0 * 1.008) < 1e-2, (i, m2[i])
+    assert abs(m2.sum() - molecule("H2O").get_masses().sum()) < 1e-9
+    print(f"(2) factor2 water OK: O={m2[0]:.4f} H={m2[1]:.4f}")
+
+    # (3) idempotent: a second call does not double-apply
+    maybe_repartition_masses(a, SimpleNamespace(hmr=True), log=False)
+    assert np.allclose(a.get_masses(), m), "HMR not idempotent"
+    print("(3) idempotent OK")
+
+    # (4) disabled => factor 0, masses untouched
+    a4 = molecule("CH3CH2OH")
+    f4 = maybe_repartition_masses(a4, SimpleNamespace(hmr="off"), log=False)
+    assert f4 == 0.0 and np.allclose(a4.get_masses(), m0)
+    print("(4) disabled no-op OK")
+
+    # (5) floor guard: methane carbon (12 amu) cannot feed 4 H at factor 5
+    raised = False
+    try:
+        maybe_repartition_masses(molecule("CH4"), SimpleNamespace(hmr=5.0), log=False)
+    except ValueError:
+        raised = True
+    assert raised, "floor guard did not fire"
+    print("(5) floor guard OK")
+
+    print("HMR SELF-CHECK PASS")
