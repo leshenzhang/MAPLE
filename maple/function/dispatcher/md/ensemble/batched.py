@@ -1,6 +1,19 @@
 """
 Batched (replica / ensemble) molecular dynamics for MAPLE.
 
+============================================================================
+DEPRECATED (root coordination CO-1, 2026-06-28; PARALLELISM_CONTRACT §3/§5.6).
+This standalone NVE/NVT loop is an ORPHAN that re-implements velocity-Verlet +
+thermostat math that is authoritatively owned by ai-maple-md (B). The ONE
+batched MD core lives in B (batch axis = replica/window/copy), reusing THIS
+package's batched-forward primitive (calc.get_ef_gpu over B) — NOT this loop's
+VV/thermostat. Do NOT extend this into a full-feature engine (NPT/constraints/
+bias = re-building B's physics). Kept only as a REFERENCE for how to drive the
+primitive ((B,nmax_dof) buffers + set_coords_ + one get_ef_gpu/step); physical
+removal follows B's batched core landing. Primitive spec: ../../../../../
+../BATCHED_FORWARD_API_CONTRACT.md (data/ai-maple-gpu/).
+============================================================================
+
 OPT-IN path: integrate ``B`` independent systems/replicas TOGETHER, with ONE
 batched MLIP forward per step (``calc.get_ef_gpu()`` over all ``B``) instead of
 ``B`` single-structure ASE ``atoms.get_forces()`` calls. UMA is a LOCAL potential,
