@@ -115,6 +115,14 @@ class MaceOffBatchCalc:
             self.coord = self.coord.to(dtype)
             if self._coord_backup is not None:
                 self._coord_backup = self._coord_backup.to(dtype)
+            # R2 opt (B-81): the cached static batch fields are dtype-typed (built at
+            # the prior dtype) -> recast the floating tensors so the per-step forward
+            # stays type-consistent with the recast model. Integer fields (batch/ptr/
+            # head/edge bookkeeping) and None entries are left untouched.
+            if getattr(self, "_static", None):
+                for k, v in self._static.items():
+                    if torch.is_tensor(v) and v.is_floating_point():
+                        self._static[k] = v.to(dtype)
         return self
 
     # ------------------------------------------------------------------ prepare
@@ -140,6 +148,59 @@ class MaceOffBatchCalc:
         self._base = torch.tensor(base, dtype=torch.long, device=self.device)
         self._coord_backup = None
         self._prepared = True
+
+        # R2 opt (B-81): build the STATIC batch dict ONCE (node_attrs / head / batch /
+        # ptr / cell / weight fields are geometry-INVARIANT) and the block-diagonal
+        # intra-replica candidate-pair index ONCE, both resident on the GPU. The
+        # per-step forward then only (a) rebuilds edge_index on-GPU from the candidate
+        # pairs (cheap radius graph; positions change, the build does not leave the
+        # GPU) and (b) reuses the cached statics -- no D2H coord copy, no per-replica
+        # ASE/matscipy neighbour list, no Batch.from_data_list re-collate/re-transfer,
+        # no per-step global set_default_dtype toggle. Mirrors MACEBatchCalc.prepare().
+        self._build_static_cache(atoms_list)
+
+    def _build_static_cache(self, atoms_list):
+        """One-time: capture the geometry-invariant batch dict + GPU candidate pairs.
+
+        Uses the SAME mace AtomicData/Batch path the original per-step forward used,
+        so node_attrs/head/batch/ptr/cell/weight tensors are BYTE-identical to what
+        the validated path produced -- only positions/edge_index/shifts are refreshed
+        per step. The one-time AtomicData build keeps the set_default_dtype context
+        (correct & cheap once); the per-step hot path has NO dtype toggle."""
+        device = self.device
+        # block-diagonal intra-replica candidate pairs (global atom indices).
+        ci_l, cj_l = [], []
+        for b in range(self.B):
+            n = int(self.n_b[b]); off = int(self._ptr[b])
+            if n >= 2:
+                iu, ju = torch.triu_indices(n, n, offset=1, device=device)
+                ci_l.append(iu + off); cj_l.append(ju + off)
+        self._cand_i = (torch.cat(ci_l) if ci_l
+                        else torch.zeros((0,), dtype=torch.long, device=device))
+        self._cand_j = (torch.cat(cj_l) if cj_l
+                        else torch.zeros((0,), dtype=torch.long, device=device))
+
+        if self.B == 0:
+            self._static = None
+            return
+        # build the batch ONCE (prepare-time geometry) to harvest the static fields.
+        prev = torch.get_default_dtype()
+        torch.set_default_dtype(self.dtype)
+        try:
+            datas = []
+            for i in range(self.B):
+                cfg = self._config_from_atoms(self._atoms[i])
+                datas.append(self._AtomicData.from_config(
+                    cfg, z_table=self._z_table, cutoff=self.r_max, heads=self.heads))
+            batch = self._tg.Batch.from_data_list(datas).to(self.device)
+        finally:
+            torch.set_default_dtype(prev)
+        d = batch.to_dict()
+        # drop the geometry-dependent keys (refreshed every step); keep the rest.
+        self._dyn_keys = ("positions", "edge_index", "shifts", "unit_shifts")
+        self._static = {k: v for k, v in d.items() if k not in self._dyn_keys}
+        # cache dtype-typed templates for the per-step dynamic fields.
+        self._unit_shifts0 = torch.zeros((0, 3), dtype=self.dtype, device=device)
 
     # --------------------------------------------------------------- coord ops
     @torch.no_grad()
@@ -171,25 +232,42 @@ class MaceOffBatchCalc:
             self.coord.copy_(self._coord_backup)
 
     # ------------------------------------------------------------------ forward
+    def _build_edges_gpu(self, coord):
+        """Block-diagonal radius graph from the cached intra-replica candidate pairs,
+        entirely on the GPU (no host neighbour list). Returns (edge_index, shifts,
+        unit_shifts). Non-periodic isolated replicas -> shifts == unit_shifts == 0.
+
+        Cutoff convention matches mace's neighbour list (matscipy ``neighbour_list``,
+        strict ``distance < cutoff``); edge ORDER is irrelevant because the model
+        aggregates messages with order-invariant scatter, so only the edge SET (which
+        this reproduces exactly for separated molecular geometries) drives E/F."""
+        device = self.device
+        if self._cand_i.numel() == 0:
+            z = torch.zeros((2, 0), dtype=torch.long, device=device)
+            s = torch.zeros((0, 3), dtype=self.dtype, device=device)
+            return z, s, s
+        rij = coord[self._cand_i] - coord[self._cand_j]
+        d2 = (rij * rij).sum(dim=-1)
+        keep = d2 < (self.r_max * self.r_max)            # matscipy strict-<
+        ci = self._cand_i[keep]; cj = self._cand_j[keep]
+        src = torch.cat([ci, cj], dim=0); dst = torch.cat([cj, ci], dim=0)
+        edge_index = torch.stack([src, dst], dim=0)
+        shifts = torch.zeros((edge_index.size(1), 3), dtype=self.dtype, device=device)
+        return edge_index, shifts, shifts
+
     def _batched_ef_eV(self):
-        """ONE native multi-graph forward -> (E_eV (B,), F_eV (N_atoms,3))."""
-        coord_np = self.coord.detach().to("cpu").numpy()
-        # Build per-replica AtomicData at float64 (model is f64). Use the global
-        # default-dtype context so AtomicData tensors match the validated path.
-        prev = torch.get_default_dtype()
-        torch.set_default_dtype(self.dtype)
-        try:
-            datas = []
-            for i in range(self.B):
-                at = self._atoms[i]
-                at.set_positions(coord_np[self._ptr[i]:self._ptr[i + 1]])
-                cfg = self._config_from_atoms(at)
-                datas.append(self._AtomicData.from_config(
-                    cfg, z_table=self._z_table, cutoff=self.r_max, heads=self.heads))
-            batch = self._tg.Batch.from_data_list(datas).to(self.device)
-        finally:
-            torch.set_default_dtype(prev)
-        out = self.model(batch.to_dict(), compute_force=True, training=False)
+        """ONE native multi-graph forward -> (E_eV (B,), F_eV (N_atoms,3)).
+
+        R2 opt (B-81): coords stay GPU-resident; edges are rebuilt on-GPU; the static
+        batch fields are reused from prepare(); no per-step set_default_dtype toggle."""
+        coord = self.coord.detach().to(self.device, self.dtype).requires_grad_(True)
+        edge_index, shifts, unit_shifts = self._build_edges_gpu(coord)
+        d = dict(self._static)                       # shallow copy; static tensors reused
+        d["positions"] = coord
+        d["edge_index"] = edge_index
+        d["shifts"] = shifts
+        d["unit_shifts"] = unit_shifts
+        out = self.model(d, compute_force=True, training=False)
         E_eV = out["energy"].detach().reshape(-1).to(self.dtype)          # (B,)
         F_eV = out["forces"].detach().to(self.dtype)                      # (N,3)
         return E_eV, F_eV
