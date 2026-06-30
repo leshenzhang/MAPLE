@@ -67,11 +67,35 @@ IMPLICIT_SOLVENT_DERIVATIVE_PROPERTIES = {
 }
 
 
+def solvent_supports_forces(calculator) -> bool:
+    """True when the active implicit-solvent backend exposes analytic forces.
+
+    Production OBC-II GBSA (``model='obc2'``) sets ``SUPPORTS_FORCES = True``: at
+    fixed point charges its GB+SA force is the exact analytic gradient, so the
+    derivative gate is lifted for that path only. The legacy heuristic GB-polar
+    correction leaves the flag False and stays energy-only (default-path
+    invariant).
+    """
+    sc = getattr(calculator, "solvent_correction", None)
+    return bool(sc is not None and getattr(sc, "SUPPORTS_FORCES", False))
+
+
 def reject_implicit_solvent_derivatives(calculator, properties):
     """Fail fast when experimental implicit solvation is asked for derivatives."""
     if not getattr(calculator, "solvent_correction", None):
         return _property_list(properties)
     normalized = _property_list(properties)
+    if solvent_supports_forces(calculator):
+        # OBC-II analytic-force path: forces/stress are allowed (Hessian/HVP
+        # remain unsupported in v1 and are still rejected below).
+        requested = {str(prop).lower() for prop in normalized}
+        blocked = requested.intersection({"hessian", "hvp"})
+        if blocked:
+            raise NotImplementedError(
+                "OBC-II implicit-solvent forces are supported, but solvent "
+                "Hessian/HVP are not implemented in v1."
+            )
+        return normalized
     requested = {str(prop).lower() for prop in normalized}
     if requested.intersection(IMPLICIT_SOLVENT_DERIVATIVE_PROPERTIES):
         raise NotImplementedError(IMPLICIT_SOLVENT_FORCE_ERROR)
@@ -90,10 +114,10 @@ def validate_implicit_solvent_choice(implicit, solvent):
     """Normalize and validate implicit-solvent selector pair."""
     implicit_norm = normalize_none_option(implicit)
     solvent_norm = normalize_none_option(solvent)
-    if implicit_norm == 'gbsa' and solvent_norm == 'none':
+    if implicit_norm in ('gbsa', 'gbsa-obc2') and solvent_norm == 'none':
         raise ValueError(
-            "implicit='gbsa' requires an explicit solvent name such as solvent='water'; "
-            "use implicit='none' to disable implicit solvent."
+            "implicit='gbsa'/'gbsa-obc2' requires an explicit solvent name such as "
+            "solvent='water'; use implicit='none' to disable implicit solvent."
         )
     return implicit_norm, solvent_norm
 
@@ -152,6 +176,13 @@ def init_implicit_solvent(calc, implicit, solvent, device):
 
         calc.solvent_correction = GBSA(solvent=solvent, device=device)
         calc.chargecalc = QEqTorch(device=device)
+    elif implicit == 'gbsa-obc2':
+        # Production OBC-II GBSA: real descreening integral + ACE surface area,
+        # analytic fixed-charge forces (ML-GBSA). No QEq chargecalc -- charges are
+        # FIXED (set on atoms.atomic_charges from a frozen MLIP pass / RESP / prmtop).
+        from .extra_correction import GBSA
+
+        calc.solvent_correction = GBSA(solvent=solvent, device=device, model='obc2')
     else:
         calc.solvent_correction = None
 
@@ -332,14 +363,24 @@ class CalcABC(ase.calculators.calculator.Calculator):
         )
 
         if getattr(self, 'solvent_correction', None) is not None:
-            # GB-polar solvation is energy-only. Reaching here with forces under
-            # active solvent means the calculate()/get_hessian() guards were
-            # bypassed; fail loudly rather than emit a solvent-inconsistent force.
             if forces_ha is not None:
-                raise NotImplementedError(IMPLICIT_SOLVENT_FORCE_ERROR)
-            solvent_energy = self.implicit_solv_energy(atoms)
-            se = solvent_energy.item() if hasattr(solvent_energy, 'item') else float(solvent_energy)
-            energy_ha = energy_ha + se
+                if not solvent_supports_forces(self):
+                    # Legacy heuristic GB-polar solvation is energy-only. Reaching
+                    # here with forces means the calculate()/get_hessian() guards
+                    # were bypassed; fail loudly rather than emit a
+                    # solvent-inconsistent force.
+                    raise NotImplementedError(IMPLICIT_SOLVENT_FORCE_ERROR)
+                # OBC-II analytic path: add the GB+SA energy AND its analytic
+                # fixed-charge force to the MLIP outputs (both in Hartree / Hartree-A).
+                se, sf = self.implicit_solv_energy_and_force(atoms)
+                se = se.item() if hasattr(se, 'item') else float(se)
+                sf = sf.detach().cpu().numpy() if hasattr(sf, 'detach') else np.asarray(sf)
+                energy_ha = energy_ha + se
+                forces_ha = forces_ha + sf
+            else:
+                solvent_energy = self.implicit_solv_energy(atoms)
+                se = solvent_energy.item() if hasattr(solvent_energy, 'item') else float(solvent_energy)
+                energy_ha = energy_ha + se
 
         # Sole results-writing chokepoint for every CalcABC backend: clear first
         # so an energy-only call cannot inherit stale forces/hessian from a
@@ -423,11 +464,30 @@ class CalcABC(ase.calculators.calculator.Calculator):
         Returns:
             torch.Tensor: Implicit solvent correction energy in Hartree.
         """
+        self._ensure_solvent_charges(atoms)
+        solvent_energy,_ = self.solvent_correction.get_energy(atoms)
+        return solvent_energy
+
+    def _ensure_solvent_charges(self, atoms: ase.Atoms) -> None:
+        """Populate ``atoms.atomic_charges`` for the active solvent backend.
+
+        Legacy heuristic GB-polar uses live geometry-dependent QEq charges.
+        Production OBC-II (``SUPPORTS_FORCES``) uses FIXED point charges (ML-GBSA
+        assumption): they must be supplied on ``atoms.atomic_charges`` (a single
+        frozen MLIP pass, RESP, or prmtop) so the GB force has no dQ/dR term.
+        """
+        if solvent_supports_forces(self):
+            q = getattr(atoms, 'atomic_charges', None)
+            if q is None or not np.any(np.asarray(q, dtype=float)):
+                raise ValueError(
+                    "OBC-II implicit solvent uses FIXED point charges: set "
+                    "atoms.atomic_charges (frozen ML monopoles / RESP / prmtop) "
+                    "before requesting energy or forces."
+                )
+            return
         atoms.atomic_charges = self.chargecalc(
             atoms, total_charge=self._total_charge_from_atoms(atoms)
         )
-        solvent_energy,_ = self.solvent_correction.get_energy(atoms)
-        return solvent_energy
 
     def implicit_solv_energy_and_force(self, atoms: ase.Atoms) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -439,4 +499,7 @@ class CalcABC(ase.calculators.calculator.Calculator):
         Returns:
             tuple[torch.Tensor, torch.Tensor]: Implicit solvent correction energy in Hartree and forces in Hartree/Å.
         """
-        raise NotImplementedError(IMPLICIT_SOLVENT_FORCE_ERROR)
+        if not solvent_supports_forces(self):
+            raise NotImplementedError(IMPLICIT_SOLVENT_FORCE_ERROR)
+        self._ensure_solvent_charges(atoms)
+        return self.solvent_correction.get_energy_and_force(atoms)
