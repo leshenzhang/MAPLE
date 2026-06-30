@@ -159,8 +159,9 @@ class BatchRFO:
 
         # === First prepare to fix nmax ===
         calc.prepare(atoms_list)
-        _, F0 = calc.get_ef_gpu()
-        self._nmax = int(F0.shape[1])
+        # nmax_dof is set inside prepare() BEFORE any forward (== F.shape[1]); read
+        # it directly instead of burning a full forward+backward just to get a shape.
+        self._nmax = int(calc.nmax_dof)
         self._arange_n = torch.arange(self._nmax, device=device)
 
         # Build topology (nmax fixed) + per-structure masks/thresholds/mass-weights

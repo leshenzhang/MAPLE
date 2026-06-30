@@ -131,7 +131,7 @@ def _movable_cols(movable: Sequence[int]) -> np.ndarray:
 
 
 def serial_fd_hessian(calc, atoms, movable: Optional[Sequence[int]] = None,
-                      delta: float = 2e-3) -> "torch.Tensor":
+                      delta: float = 2e-3, fd_mode: str = "central") -> "torch.Tensor":
     """Serial central-FD Hessian over the movable subspace -- ONE perturbation per
     calc.get_ef_gpu() call (single-molecule prepare). Reference for batched parity:
     uses the SAME calculator forward path, so any diff isolates the batching effect.
@@ -161,21 +161,32 @@ def serial_fd_hessian(calc, atoms, movable: Optional[Sequence[int]] = None,
         Fr = F[0].detach().to(torch.float64).cpu().numpy()
         return Fr[cols]                                # (dof,)
 
-    for j, a in enumerate(movable):
-        for k in range(3):
-            row = 3 * j + k
-            pp = pos0.copy(); pp[a, k] += delta
-            Fp = force_movable(pp)
-            pm = pos0.copy(); pm[a, k] -= delta
-            Fm = force_movable(pm)
-            H[row, :] = torch.from_numpy(-(Fp - Fm) / (2.0 * delta)).to(device)
+    forward = (str(fd_mode).lower() == "forward")
+    if forward:
+        # forward-difference: ONE shared base forward F(x0) (3m+1 forwards total)
+        F0 = force_movable(pos0)
+        for j, a in enumerate(movable):
+            for k in range(3):
+                row = 3 * j + k
+                pp = pos0.copy(); pp[a, k] += delta
+                Fp = force_movable(pp)
+                H[row, :] = torch.from_numpy(-(Fp - F0) / delta).to(device)
+    else:
+        for j, a in enumerate(movable):
+            for k in range(3):
+                row = 3 * j + k
+                pp = pos0.copy(); pp[a, k] += delta
+                Fp = force_movable(pp)
+                pm = pos0.copy(); pm[a, k] -= delta
+                Fm = force_movable(pm)
+                H[row, :] = torch.from_numpy(-(Fp - Fm) / (2.0 * delta)).to(device)
 
     return 0.5 * (H + H.t())
 
 
 def batched_fd_hessian(calc, atoms_list, movable_masks=None, delta: float = 2e-3,
                        atom_budget: int = 20000, max_replicas: int = 512,
-                       return_padded: bool = False) -> dict:
+                       return_padded: bool = False, fd_mode: str = "central") -> dict:
     """Batched central-FD Hessian for B structures over their movable subspaces.
 
     Parameters
@@ -207,12 +218,50 @@ def batched_fd_hessian(calc, atoms_list, movable_masks=None, delta: float = 2e-3
     infos = [dict(getattr(at, "info", {}) or {}) for at in atoms_list]
     m_b   = [len(mv) for mv in movable]
     dof_b = [3 * m for m in m_b]
-    cols_b = [_movable_cols(mv) for mv in movable]
+    cols_b = [_movable_cols(mv) for mv in movable]          # movable DOF cols into a force row
+    # GPU column-gather indices (one int64 tensor per structure), built ONCE.
+    cols_b_t = [torch.as_tensor(c, dtype=torch.long, device=device) for c in cols_b]
 
-    # plus/minus force accumulators per structure: row r = perturbed movable DOF,
-    # column = movable force vector at that perturbation.
-    Fplus  = [np.zeros((d, d), dtype=np.float64) for d in dof_b]
-    Fminus = [np.zeros((d, d), dtype=np.float64) for d in dof_b]
+    # FD discretization (OPT-IN): central = +/-delta per DOF (6m forwards);
+    # forward = only +delta per DOF + ONE shared base forward F(x0) (3m+1 forwards,
+    # ~2x fewer). Forward truncation error is O(delta) vs central O(delta^2).
+    forward = (str(fd_mode).lower() == "forward")
+
+    # GPU-NATIVE ASSEMBLY. The compact per-structure (3m,3m) plus/minus force blocks
+    # (row r = perturbed movable DOF, columns = movable force vector at that
+    # perturbation) live on the GPU in float64, backed by ONE contiguous flat buffer
+    # per sign with a row-major per-structure offset. Each chunk therefore scatters
+    # its movable-column forces via a single GPU advanced-index assignment -- removing
+    # (i) the per-chunk D2H of the whole (chunk, nmax_dof) force block (only the
+    # movable columns are index_select'd, on GPU) and (ii) the single-threaded
+    # python/numpy scatter over R replicas. fp64 gather/subtract/divide/symmetrize are
+    # bit-identical GPU-vs-CPU (all elementwise; the gather copies values, no reduction).
+    dof2  = [d * d for d in dof_b]
+    off   = (np.concatenate(([0], np.cumsum(dof2)[:-1])).astype(np.int64)
+             if B else np.zeros((0,), np.int64))
+    total = int(sum(dof2))
+    Fplus_flat  = torch.zeros(total, dtype=torch.float64, device=device)
+    Fminus_flat = (None if forward
+                   else torch.zeros(total, dtype=torch.float64, device=device))
+    # forward mode: shared base force vector F(x0) per structure (movable order), GPU f64.
+    F0 = [torch.zeros((d,), dtype=torch.float64, device=device) for d in dof_b]
+    if forward:
+        bidx = 0
+        while bidx < B:
+            base_chunk, ac = [], 0
+            while bidx < B and len(base_chunk) < max_replicas:
+                nb = len(Zs[bidx])
+                if base_chunk and (ac + nb > atom_budget):
+                    break
+                base_chunk.append(bidx); ac += nb; bidx += 1
+            rep_list = [Atoms(numbers=Zs[b], positions=pos0[b], info=dict(infos[b]))
+                        for b in base_chunk]
+            calc.prepare(rep_list)
+            _, Fb = calc.get_ef_gpu()
+            Fb = Fb.detach().to(torch.float64)               # keep on GPU (no D2H)
+            for slot, b in enumerate(base_chunk):
+                if dof_b[b]:
+                    F0[b] = Fb[slot].index_select(0, cols_b_t[b])
 
     # enumerate perturbation jobs: (b, atom, axis, row, sign)
     jobs = []
@@ -223,8 +272,15 @@ def batched_fd_hessian(calc, atoms_list, movable_masks=None, delta: float = 2e-3
             for axis in range(3):
                 row = 3 * j + axis
                 jobs.append((b, a, axis, row, +1))
-                jobs.append((b, a, axis, row, -1))
+                if not forward:
+                    jobs.append((b, a, axis, row, -1))
     R = len(jobs)
+
+    # Per-job destination indices into the compact flat buffer (cheap CPU int math):
+    # dest(b,row) = off[b] + row*dof_b + arange(dof_b). Unique across all jobs (plus and
+    # minus live in separate buffers, so a +/- pair reuses the same offsets safely).
+    job_dst = [off[b] + row * dof_b[b] + np.arange(dof_b[b], dtype=np.int64)
+               for (b, a, axis, row, sign) in jobs]
 
     n_chunks = 0
     max_atoms_in_chunk = 0
@@ -240,6 +296,7 @@ def batched_fd_hessian(calc, atoms_list, movable_masks=None, delta: float = 2e-3
             chunk.append(jobs[idx])
             atoms_count += nb
             idx += 1
+        g0 = idx - len(chunk)                                # global index of chunk's first job
 
         rep_list = []
         for (b, a, axis, row, sign) in chunk:
@@ -248,28 +305,50 @@ def batched_fd_hessian(calc, atoms_list, movable_masks=None, delta: float = 2e-3
             rep_list.append(Atoms(numbers=Zs[b], positions=p, info=dict(infos[b])))
 
         calc.prepare(rep_list)
-        _, F = calc.get_ef_gpu()                        # (chunk, nmax_dof) Ha/A
-        F = F.detach().to(torch.float64).cpu().numpy()
+        _, F = calc.get_ef_gpu()                             # (chunk, nmax_dof) Ha/A on GPU
+        F = F.detach().to(torch.float64)                     # GPU f64; NO D2H of the block
 
-        for slot, (b, a, axis, row, sign) in enumerate(chunk):
-            Fmv = F[slot][cols_b[b]]                     # (dof_b,) movable-order forces
-            if sign > 0:
-                Fplus[b][row, :] = Fmv
+        # Vectorized GPU gather+scatter for the WHOLE chunk: assemble, in cheap CPU int
+        # ops, the (slot, column) source map and the flat destination, then do ONE GPU
+        # advanced-index gather + (up to two, split by sign) assignments.
+        counts = np.fromiter((dof_b[jobs[g0 + s][0]] for s in range(len(chunk))),
+                             dtype=np.int64, count=len(chunk))
+        if counts.sum() > 0:
+            slot_rep = np.repeat(np.arange(len(chunk), dtype=np.int64), counts)
+            col_rep  = np.concatenate([cols_b[jobs[g0 + s][0]] for s in range(len(chunk))])
+            dst_rep  = np.concatenate([job_dst[g0 + s] for s in range(len(chunk))])
+            slot_t = torch.as_tensor(slot_rep, device=device)
+            col_t  = torch.as_tensor(col_rep,  device=device)
+            dst_t  = torch.as_tensor(dst_rep,  device=device)
+            vals = F[slot_t, col_t]                           # (E,) GPU f64 movable forces
+            if forward:
+                Fplus_flat[dst_t] = vals                      # every job is +delta
             else:
-                Fminus[b][row, :] = Fmv
+                signs = np.fromiter((jobs[g0 + s][4] for s in range(len(chunk))),
+                                    dtype=np.int64, count=len(chunk))
+                pos_rep = torch.as_tensor(np.repeat(signs, counts) > 0, device=device)
+                Fplus_flat[dst_t[pos_rep]]   = vals[pos_rep]
+                Fminus_flat[dst_t[~pos_rep]] = vals[~pos_rep]
 
         n_chunks += 1
         max_atoms_in_chunk = max(max_atoms_in_chunk, atoms_count)
 
+    # FD subtraction + per-structure symmetrize, all on GPU in float64 (elementwise ->
+    # bit-identical to the prior CPU-numpy path).
     hessians = []
     for b in range(B):
         d = dof_b[b]
         if d == 0:
             hessians.append(torch.zeros((0, 0), dtype=torch.float64, device=device))
             continue
-        Hb = -(Fplus[b] - Fminus[b]) / (2.0 * delta)    # float64 FD
-        Hb = 0.5 * (Hb + Hb.T)                          # symmetrize per structure
-        hessians.append(torch.from_numpy(Hb).to(device))
+        Fp = Fplus_flat[off[b]:off[b] + d * d].reshape(d, d)
+        if forward:
+            Hb = -(Fp - F0[b][None, :]) / delta              # forward FD vs shared base
+        else:
+            Fm = Fminus_flat[off[b]:off[b] + d * d].reshape(d, d)
+            Hb = -(Fp - Fm) / (2.0 * delta)                  # central float64 FD
+        Hb = 0.5 * (Hb + Hb.t())                             # GPU symmetrize per structure
+        hessians.append(Hb)
 
     result = dict(hessians=hessians, movable=movable, n_chunks=n_chunks,
                   n_replicas=R, max_atoms_in_chunk=max_atoms_in_chunk)

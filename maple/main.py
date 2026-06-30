@@ -3,6 +3,11 @@ import os
 import argparse
 import traceback
 
+# R2-F2: set the CUDA allocator to expandable_segments BEFORE torch is imported
+# (it is only read at allocator init). MAPLE's torch import happens lazily inside
+# the engine, well after this point. setdefault preserves any sbatch/user override.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 try:
     from maple import __version__ as _VERSION
 except Exception:

@@ -233,6 +233,10 @@ class BatchPRFO:
         self._symbols_per_batch = None
         self._arange_n = None
         self._real_mask = None
+        # Constant-per-topology mask derivatives, also built ONCE in _rebuild_topology
+        # (real_mask float view + its symmetric outer product) instead of every iter.
+        self._real_mask_f = None
+        self._mask_ij = None
         self._D = None
         # Per-structure convergence thresholds, built ONCE per topology in
         # _rebuild_topology (they only change when the batch shrinks/refills)
@@ -469,7 +473,7 @@ class BatchPRFO:
                     E_old, F_now = self._ef(calc)
                     E_old = E_old.to(dtype=DTYPE)
                     F_now = F_now.to(dtype=DTYPE)
-                    g_cart = -F_now * real_mask.to(DTYPE)
+                    g_cart = -F_now * self._real_mask_f
                 if seed_now:
                     self._recalc_count = self._recalc_count + 1
                     self._H_work = self._build_seed_hessian(atoms_list, real_mask)
@@ -560,7 +564,7 @@ class BatchPRFO:
                     E_old, F_now = self._ef(calc)
                     E_old = E_old.to(dtype=DTYPE)
                     F_now = F_now.to(dtype=DTYPE)
-                    g_cart = -F_now * real_mask.to(DTYPE)
+                    g_cart = -F_now * self._real_mask_f
 
             # Mass-weighting and eigen-decomposition
             H_mw, g_mw = self._mass_weight_hg(H_cart, g_cart, real_mask)
@@ -603,7 +607,7 @@ class BatchPRFO:
             else:
                 E_fin, F_fin = self._ef(calc)
                 F_fin = F_fin.to(dtype=DTYPE)
-                g_new_cart = -F_fin * real_mask.to(DTYPE)
+                g_new_cart = -F_fin * self._real_mask_f
                 E_fin = E_fin.to(dtype=DTYPE)
 
             # Thread the committed E forward for FIX #1 (FORWARD-A of the next iter).
@@ -948,6 +952,12 @@ class BatchPRFO:
 
         # real_mask padded to fixed nmax
         self._real_mask = (self._arange_n[None, :] < self._L_vec[:, None])
+        # Constant-per-topology mask derivatives reused every iter (mirror the cached
+        # thresholds below): float view + its symmetric outer product. Both depend only
+        # on the padding layout, which changes only here (batch shrink/refill).
+        self._real_mask_f = self._real_mask.to(DTYPE)
+        self._mask_ij = (self._real_mask.unsqueeze(-1)
+                         & self._real_mask.unsqueeze(-2)).to(DTYPE)
         mass = _masses_flat(atoms_list, self._nmax, device)
         self._D = 1.0 / torch.sqrt(torch.clamp(mass, min=1e-12))
 
@@ -1006,7 +1016,7 @@ class BatchPRFO:
         return E_old.to(dtype=DTYPE), F_raw, H_raw
 
     def _build_cartesian_hg(self, F_raw, H_raw, real_mask):
-        mask_ij = (real_mask.unsqueeze(-1) & real_mask.unsqueeze(-2)).to(DTYPE)
+        mask_ij = self._mask_ij                          # cached constant-per-topology
         H = H_raw * mask_ij
         g_cart = -F_raw * real_mask.to(DTYPE)
         return H, g_cart
@@ -1020,7 +1030,10 @@ class BatchPRFO:
 
         pad_mask = ~real_mask
         if pad_mask.any():
-            H_mw = H_mw.clone()
+            # H_mw = D[...,None] * H * D[...,None,:] is a freshly allocated tensor
+            # (element-wise products never alias an input/buffer), so the in-place
+            # diagonal pad-penalty add below cannot corrupt anything reused later ->
+            # the extra .clone() was redundant. diag is a copy (advanced indexing).
             diag = H_mw[..., arange_n, arange_n]
             H_mw[..., arange_n, arange_n] = diag + pad_mask.to(DTYPE) * BIG
             g_mw = g_mw * (~pad_mask).to(DTYPE)
@@ -1447,7 +1460,7 @@ class BatchPRFO:
                 # trial forward (above) evaluated -> record its E and g there so run()
                 # reuses them instead of FORWARD-B (g = -F*mask, the run() convention).
                 E_committed[acc] = E_new[acc]
-                g_committed[acc] = (-F_trial * real_mask.to(DTYPE))[acc]
+                g_committed[acc] = (-F_trial * self._real_mask_f)[acc]
                 self._dump_xyz_subset(calc, acc, it)
 
             # ---- trust-radius update ----
@@ -1822,7 +1835,7 @@ class BatchPRFO:
 
         # ---- Build PSB increment ----
         Z_dqT = torch.einsum("mi,mj->mij", Z,    dq_m) * mask_ij[idx]
-        dq_ZT = torch.einsum("mi,mj->mij", dq_m, Z   ) * mask_ij[idx]
+        dq_ZT = Z_dqT.transpose(-1, -2)                 # == einsum("mi,mj->mij", dq_m, Z)*mask_ij (mask_ij symmetric)
         dq_dqT= torch.einsum("mi,mj->mij", dq_m, dq_m) * mask_ij[idx]
         dH_PSB = (Z_dqT + dq_ZT) / dq2_m.view(-1,1,1) - (qz_m / (dq2_m * dq2_m)).view(-1,1,1) * dq_dqT
 
@@ -1973,18 +1986,30 @@ class BatchPRFO:
             return f"{x:>{wid}.{p}f}"
 
         B = E.shape[0]
+        # Single batched D2H copy of every per-row vector (mirrors _fmt_iter_head),
+        # then index the host numpy arrays in the loop -> avoids ~9*B device->host
+        # syncs per cycle. float()/bool() on a numpy scalar give byte-identical text.
+        E_np = E.detach().cpu().numpy()
+        rho_np = rho.detach().cpu().numpy()
+        R_np = R.detach().cpu().numpy()
+        max_f_np = max_f.detach().cpu().numpy()
+        rms_f_np = rms_f.detach().cpu().numpy()
+        max_dp_np = max_dp.detach().cpu().numpy()
+        rms_dp_np = rms_dp.detach().cpu().numpy()
+        done_np = done.detach().cpu().numpy()
+        oidx_np = self._orig_index.detach().cpu().numpy()
         for b in range(B):
-            idx_orig = int(self._orig_index[b].item())
+            idx_orig = int(oidx_np[b])
             lines.append(
                 f"[{idx_orig:2d}] "
-                f"{fmt(E[b], 14, 6)} "
-                f"{fmt(rho[b], 8, 3)} "
-                f"{fmt(R[b], 8, 3)} "
-                f"{fmt(max_f[b], 12, 6)} "
-                f"{fmt(rms_f[b], 10, 6)} "
-                f"{fmt(max_dp[b], 12, 6)} "
-                f"{fmt(rms_dp[b], 10, 6)} "
-                f"{('YES' if bool(done[b]) else 'NO')}\n"
+                f"{fmt(E_np[b], 14, 6)} "
+                f"{fmt(rho_np[b], 8, 3)} "
+                f"{fmt(R_np[b], 8, 3)} "
+                f"{fmt(max_f_np[b], 12, 6)} "
+                f"{fmt(rms_f_np[b], 10, 6)} "
+                f"{fmt(max_dp_np[b], 12, 6)} "
+                f"{fmt(rms_dp_np[b], 10, 6)} "
+                f"{('YES' if bool(done_np[b]) else 'NO')}\n"
             )
 
         lines.append("\n")

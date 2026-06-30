@@ -549,6 +549,16 @@ class BatchDimerParams:
     # --- superlinear (opt-in, Kastner & Sherwood 2008) ---
     superlinear: bool = False          # gradient-extrapolation rotation + L-BFGS translation
     lbfgs_history: int = 8             # L-BFGS memory (number of (s, y) pairs)
+    # --- convergence-shrink (mirror BatchPRFO's default) ---
+    shrink_on_converge: bool = True    # True  -> slice converged systems OUT of the batch
+                                       #          so the next forward + every rotation HVP
+                                       #          stop evaluating them (tail dead-compute
+                                       #          removed; UMA is block-diagonal so a
+                                       #          survivor's math is unchanged beyond fp32
+                                       #          reduction-reorder noise).
+                                       # False -> legacy: freeze (zero the step) but keep
+                                       #          converged systems in the batch forever
+                                       #          (= the parity oracle).
     # --- outputs ---
     save_traj: bool = True
 
@@ -808,6 +818,55 @@ class BatchDimer(JobABC):
             r = r + (alphas[i] - b).unsqueeze(-1) * self._lb_S[:, i]
         return (-r) * self._real_mask
 
+    # ------------------------------------------------------- topology / shrink
+    def _build_topology(self, calc, atoms_list):
+        """(Re)build the padded masks for the CURRENT active set.
+
+        ``_nmax`` / ``_A`` stay FIXED at their startup values (``prepare`` is always
+        called with ``fixed_nmax=self._nmax``), so a convergence-shrink only changes
+        the batch dimension B -- every (B, nmax) per-structure state tensor is kept
+        column-aligned and is updated by simple row-slicing with ``survive_local``.
+        """
+        device = self.device
+        self._B = len(atoms_list)
+        n_b = calc._n_b.to(device)                                   # (B,) atoms/struct
+        arange_dof = torch.arange(self._nmax, device=device)
+        self._real_mask = (arange_dof[None, :] < (3 * n_b)[:, None])
+        arange_a = torch.arange(self._A, device=device)
+        self._atom_mask = (arange_a[None, :] < n_b[:, None])
+        self._Leff = (3 * n_b).clamp(min=1).to(DTYPE_BD)
+
+    def _sync_atoms(self, calc, atoms_list):
+        """Commit the calculator's CURRENT geometry back into the (pre-slice) atoms
+        objects so survivors keep their optimized coords across the ``prepare()``
+        rebuild (mirror ``BatchPRFO._sync_atoms_from_calc``)."""
+        pos = calc.coord.detach().cpu().numpy()
+        ptr = calc._ptr.detach().cpu().numpy()
+        for i, at in enumerate(atoms_list):
+            s, t = ptr[i], ptr[i + 1]
+            at.positions[:] = pos[s:t]
+
+    def _record(self, atoms_orig, calc, leaving_mask, E_now, C_now,
+                result_E, result_C):
+        """Write the FINAL geometry / energy / curvature of the systems flagged in
+        ``leaving_mask`` (a current-batch bool mask) back by their ORIGINAL index.
+
+        Used both for systems leaving mid-loop on a shrink and for whatever remains
+        in the batch at loop exit, so the per-original-index result arrays are filled
+        exactly once per structure regardless of when it left the batch."""
+        pos = calc.coord.detach().cpu().numpy()
+        ptr = calc._ptr.detach().cpu().numpy()
+        base, _ = os.path.splitext(self.output)
+        for i_local in leaving_mask.nonzero(as_tuple=False).flatten().cpu().tolist():
+            oi = int(self._orig_index[i_local].item())
+            s, t = ptr[i_local], ptr[i_local + 1]
+            atoms_orig[oi].positions[:] = pos[s:t]
+            result_E[oi] = float(E_now[i_local])
+            result_C[oi] = float(C_now[i_local])
+            if self.params.save_traj:
+                write_xyz(f"{base}_bd_ts_{oi}.xyz", [atoms_orig[oi]],
+                          energies=[result_E[oi]])
+
     # ------------------------------------------------------------------- run
     def run(self, mols):
         """Drive B dimers to their saddles in lockstep. Reads mols.multiatoms / mols.calc."""
@@ -820,18 +879,24 @@ class BatchDimer(JobABC):
             return
         base, _ = os.path.splitext(self.output)
 
-        # --- topology: one prepare() fixes nmax, build padded masks ---
+        # --- topology: one prepare() fixes nmax (kept FIXED for the whole run so a
+        #     convergence-shrink only changes the batch dimension B), build masks ---
         calc.prepare(atoms_list)
         _, F_probe = calc.get_ef_gpu()
-        self._B = B
         self._nmax = int(F_probe.shape[1])
         self._A = self._nmax // 3
-        n_b = calc._n_b.to(device)                                   # (B,) atoms/struct
-        arange_dof = torch.arange(self._nmax, device=device)
-        self._real_mask = (arange_dof[None, :] < (3 * n_b)[:, None])
-        arange_a = torch.arange(self._A, device=device)
-        self._atom_mask = (arange_a[None, :] < n_b[:, None])
-        self._Leff = (3 * n_b).clamp(min=1).to(DTYPE_BD)
+        self._build_topology(calc, atoms_list)
+
+        # --- per-ORIGINAL-index bookkeeping (survive-and-shrink writes each system's
+        #     final result back by its original index; the map is the identity when
+        #     shrink_on_converge=False, so that path reproduces the legacy collection) ---
+        atoms_orig = atoms_list                 # original mols.multiatoms (kept order)
+        B0 = B
+        self._orig_index = torch.arange(B0, dtype=torch.long, device=device)
+        result_status = ["max_iter"] * B0
+        result_E = [float("nan")] * B0
+        result_C = [float("nan")] * B0
+        shrink = bool(getattr(p, "shrink_on_converge", True))
 
         f_max_th = torch.tensor([getattr(a, "f_max_th", p.f_max_th) for a in atoms_list],
                                 dtype=DTYPE_BD, device=device)
@@ -857,7 +922,6 @@ class BatchDimer(JobABC):
         # --- per-structure translation/optimizer state (NOT shared) ---
         alpha = torch.full((B,), float(p.step0), dtype=DTYPE_BD, device=device)
         active = torch.ones(B, dtype=torch.bool, device=device)
-        final_status = ["max_iter"] * B
         last_step = torch.zeros(B, self._nmax, dtype=DTYPE_BD, device=device)
         g_prev = None                                # -Ftrans buffer for L-BFGS
         self._rot_kappa = torch.full((B,), 1.0, dtype=DTYPE_BD, device=device)
@@ -938,7 +1002,7 @@ class BatchDimer(JobABC):
             conv = (max_f <= f_max_th) & (rms_f <= f_rms_th) & \
                    (max_dp <= dp_max_th) & (rms_dp <= dp_rms_th) & active
             for b in conv.nonzero(as_tuple=False).flatten().cpu().tolist():
-                final_status[b] = "converged"
+                result_status[int(self._orig_index[b].item())] = "converged"
             active = active & (~conv)
 
             if (it <= 5) or (it % 10 == 0) or (not bool(active.any())):
@@ -952,41 +1016,94 @@ class BatchDimer(JobABC):
                     f"rot_fe={nfe} cum_fe={total_fe}\n"
                 ], self.output)
 
+            # (5) survive-and-shrink: drop the just-converged systems OUT of the batch
+            #     so the next midpoint forward + every rotation HVP stop evaluating them
+            #     (mirror BatchPRFO's default convergence-shrink). UMA is a LOCAL
+            #     block-diagonal potential, so removing a converged row cannot change a
+            #     survivor's math beyond the fp32 reduction-reorder noise floor.
+            #     shrink_on_converge=False keeps the legacy no-shrink behaviour intact
+            #     (the parity oracle: converged systems are merely frozen via active).
+            if shrink and bool(conv.any()):
+                # Record the just-converged systems' FINAL results at their frozen,
+                # post-step geometry -- IDENTICAL to what the no-shrink oracle reports
+                # at loop end (a converged system's geometry + axis N never move again).
+                # Cost: ONE extra batched forward + one curvature HVP over the current
+                # (pre-slice) batch, amortised across the whole tail it removes.
+                E_now, F_now = calc.get_ef_gpu(); total_fe += 1
+                E_now = E_now.to(DTYPE_BD); F_now = F_now.to(DTYPE_BD) * self._real_mask
+                HN_now = self._hvp(calc, N, F_now, p.delta, p.central_hvp)
+                total_fe += (2 if p.central_hvp else 1)
+                C_now = self._mdot(N, HN_now)
+                self._record(atoms_orig, calc, conv, E_now, C_now, result_E, result_C)
+
+                survive_local = active.nonzero(as_tuple=False).flatten()
+                if int(survive_local.numel()) < self._B:
+                    # commit survivor geometries, then slice EVERY per-structure tensor
+                    # in lockstep (nmax pinned => column layout unchanged, rows only).
+                    self._sync_atoms(calc, atoms_list)
+                    atoms_list = [atoms_list[i] for i in survive_local.cpu().tolist()]
+                    self._orig_index = self._orig_index[survive_local]
+                    N = N[survive_local]
+                    alpha = alpha[survive_local]
+                    active = active[survive_local]
+                    last_step = last_step[survive_local]
+                    if g_prev is not None:
+                        g_prev = g_prev[survive_local]
+                    self._rot_kappa = self._rot_kappa[survive_local]
+                    if p.superlinear:
+                        self._lb_S = self._lb_S[survive_local]
+                        self._lb_Y = self._lb_Y[survive_local]
+                        self._lb_rho = self._lb_rho[survive_local]
+                    f_max_th = f_max_th[survive_local]
+                    f_rms_th = f_rms_th[survive_local]
+                    dp_max_th = dp_max_th[survive_local]
+                    dp_rms_th = dp_rms_th[survive_local]
+                    # rebuild the calculator topology + padded masks for the smaller
+                    # active set (nmax kept FIXED so the sliced tensors stay aligned).
+                    if len(atoms_list) > 0:
+                        calc.prepare(atoms_list, fixed_nmax=self._nmax)
+                        self._build_topology(calc, atoms_list)
+                    else:
+                        self._B = 0
+
             if not bool(active.any()):
-                log_info([f"\nAll {B} dimers converged at iteration {it}.\n"], self.output)
+                log_info([f"\nAll {B0} dimers converged at iteration {it}.\n"], self.output)
                 break
 
-        # --- final: sync geometries back, write per-structure TS guesses ---
-        E_final, F_final = calc.get_ef_gpu()
-        E_final = E_final.to(DTYPE_BD)
-        # final curvature sign per structure (one batched HVP at the converged axis)
-        HN_final = self._hvp(calc, N, F_final.to(DTYPE_BD) * self._real_mask,
-                             p.delta, p.central_hvp)
-        C_final = self._mdot(N, HN_final)
+        # --- final: record whatever is STILL in the batch by original index.
+        #     shrink=False -> the FULL batch (reproduces the legacy collection: every
+        #                     system, converged-and-frozen or max_iter).
+        #     shrink=True  -> only the max_iter stragglers (every converged system was
+        #                     already recorded at its convergence iteration above).
+        if self._B > 0:
+            E_final, F_final = calc.get_ef_gpu(); total_fe += 1
+            E_final = E_final.to(DTYPE_BD)
+            # final curvature sign per structure (one batched HVP at the converged axis)
+            HN_final = self._hvp(calc, N, F_final.to(DTYPE_BD) * self._real_mask,
+                                 p.delta, p.central_hvp)
+            total_fe += (2 if p.central_hvp else 1)
+            C_final = self._mdot(N, HN_final)
+            remaining = torch.ones(self._B, dtype=torch.bool, device=device)
+            self._record(atoms_orig, calc, remaining, E_final, C_final,
+                         result_E, result_C)
 
-        pos = calc.coord.detach().cpu().numpy()
-        ptr = calc._ptr.detach().cpu().numpy()
-        for b, at in enumerate(atoms_list):
-            s, t = ptr[b], ptr[b + 1]
-            at.positions[:] = pos[s:t]
-            if p.save_traj:
-                write_xyz(f"{base}_bd_ts_{b}.xyz", [at], energies=[float(E_final[b])])
-
-        n_conv = sum(1 for s in final_status if s == "converged")
+        n_conv = sum(1 for s in result_status if s == "converged")
+        n_negcurv = sum(1 for c in result_C if c == c and c < 0.0)
         log_info([
             "\n------------------------------------------------------------------------\n",
             "                       BatchDimer summary                               \n",
             "------------------------------------------------------------------------\n",
-            f"converged                : {n_conv}/{B}\n",
-            f"negative final curvature : {int((C_final < 0).sum().item())}/{B}\n",
+            f"converged                : {n_conv}/{B0}\n",
+            f"shrink_on_converge       : {shrink}\n",
+            f"negative final curvature : {n_negcurv}/{B0}\n",
             f"total batched force evals: {total_fe}\n",
-            f"per-structure status     : {final_status}\n",
-            f"per-structure curvature  : {[round(float(x), 5) for x in C_final.tolist()]}\n",
+            f"per-structure status     : {result_status}\n",
+            f"per-structure curvature  : {[round(c, 5) if c == c else None for c in result_C]}\n",
         ], self.output)
 
-        self.final_curvature = C_final.detach().cpu().numpy()
-        self.final_status = final_status
-        self.final_energy = E_final.detach().cpu().numpy()
+        self.final_curvature = np.array(result_C, dtype=float)
+        self.final_status = result_status
+        self.final_energy = np.array(result_E, dtype=float)
         self.total_force_evals = total_fe
         self.n_iter = it
         return

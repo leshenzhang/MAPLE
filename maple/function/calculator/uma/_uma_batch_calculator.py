@@ -190,6 +190,7 @@ class UMABatchCalc:
         hessian_delta: float = 2e-3,
         hessian_max_atoms: int = 4096,
         hessian_mode: str = "numerical",
+        fd_mode: str = "central",
         hessian_chunk_size: Optional[int] = None,
         disable_activation_checkpointing: bool = False,
         fast_inference: bool = False,
@@ -212,6 +213,16 @@ class UMABatchCalc:
         _m = str(hessian_mode).lower()
         self.hessian_mode = "autograd" if _m in ("autograd", "analytic") else "numerical"
         self.hessian = self.hessian_mode             # back-compat attribute
+
+        # ---- FD discretization for the NUMERICAL Hessian (OPT-IN; default
+        # 'central' = OLD 6m-forward path = byte-identical oracle). 'forward' =
+        # forward-difference H[:,j] = -(F(x0+delta e_j) - F(x0))/delta : ~2x fewer
+        # forwards (3m+1 vs 6m) by sharing ONE unperturbed reference F(x0) across
+        # all columns, at the cost of O(delta) truncation error (vs central
+        # O(delta^2)). Useful fast mode for TS-validation / RRHO screening where
+        # ~1 cm^-1 is fine; NOT for high-accuracy IR. Baked into the cached plan
+        # key so a mode flip invalidates a stale plan.
+        self._fd_mode = "forward" if str(fd_mode).lower() == "forward" else "central"
         self._hessian_chunk_size = (int(hessian_chunk_size)
                                     if hessian_chunk_size is not None else None)
         self._disable_ac = bool(disable_activation_checkpointing)
@@ -366,9 +377,14 @@ class UMABatchCalc:
         else:
             self._cols = torch.zeros(0, dtype=torch.int64, device=device)
 
-        # Per-molecule AtomicData templates + reusable batched template.
+        # Per-molecule AtomicData templates + reusable batched template. The batched
+        # template is geometry-INDEPENDENT topology, so move it to device ONCE here
+        # (like the FD-Hessian `cont` cache) instead of cloning-on-CPU + H2D on every
+        # forward; per-forward we then only D2D-clone and overwrite `pos`.
         self._ad_list = [self._a2g(self._ad_atoms(at)) for at in atoms_list]
-        self._batch_ad = atomicdata_list_to_batch(self._ad_list) if B > 0 else None
+        self._batch_ad = (
+            self._to_device(atomicdata_list_to_batch(self._ad_list)) if B > 0 else None
+        )
 
         self._coord_backup = None
         self._h_plan = None          # invalidate cached Hessian plan (topology changed)
@@ -411,8 +427,8 @@ class UMABatchCalc:
     def _clone_batch(self):
         ad = self._batch_ad
         if hasattr(ad, "clone"):
-            return ad.clone()
-        return atomicdata_list_to_batch(self._ad_list)
+            return ad.clone()                       # _batch_ad is device-resident -> D2D clone
+        return self._to_device(atomicdata_list_to_batch(self._ad_list))
 
     def _to_device(self, ad):
         if hasattr(ad, "to"):
@@ -437,7 +453,10 @@ class UMABatchCalc:
 
     def _forward(self, coord: torch.Tensor):
         """coord (N,3) f64 -> (E_eV (B,), F_eV (N,3)), single batched forward."""
-        ad = self._to_device(self._clone_batch())
+        # _clone_batch() is already on-device (topology moved in prepare()); the
+        # _to_device inside _predict_forces is the only one left (no-op here, kept
+        # for the CPU-built batches passed at the partial/full-Hessian call sites).
+        ad = self._clone_batch()
         ad.pos = coord.to(device=self.device, dtype=torch.float32)
         E, F, _ = self._predict_forces(ad)
         return E, F.reshape(self.N_atoms, 3)
@@ -473,7 +492,7 @@ class UMABatchCalc:
         mv = ("full" if movable_masks is None
               else tuple(tuple(int(x) for x in m)
                          for m in self._resolve_movable(movable_masks)))
-        return (self._delta, self._h_max_atoms, mv)
+        return (self._delta, self._h_max_atoms, self._fd_mode, mv)
 
     def _resolve_movable(self, movable_masks):
         """Per-structure list[int] of atom indices whose DOFs are perturbed.
@@ -542,12 +561,18 @@ class UMABatchCalc:
         mov_resp = mov
 
         # ---- enumerate replicas: (i, a, c, s) ; column k = 3*a + c -----------
+        # central: +delta AND -delta per DOF (2 replicas/DOF -> 6m).
+        # forward (OPT-IN): only +delta per DOF (1 replica/DOF -> 3m) and reuse the
+        # ONE base-point forward F(x0) as the shared subtrahend (added in
+        # _get_efh_numerical), so total forwards = 3m+1 vs central 6m+1 (~2x).
+        forward = (self._fd_mode == "forward")
         rep_i, rep_a, rep_c, rep_s = [], [], [], []
         for i in range(B):
             for a in mov[i]:
                 for c in range(3):
                     rep_i.append(i); rep_a.append(a); rep_c.append(c); rep_s.append(1.0)
-                    rep_i.append(i); rep_a.append(a); rep_c.append(c); rep_s.append(-1.0)
+                    if not forward:
+                        rep_i.append(i); rep_a.append(a); rep_c.append(c); rep_s.append(-1.0)
         R = len(rep_i)
 
         # ---- chunk replicas under the atom budget (legacy-identical rule) -----
@@ -597,10 +622,13 @@ class UMABatchCalc:
             )
 
             # scatter: responding (movable) atom rows -> flat H index; fac=-s/(2d)
+            # central: H[:,k] += -s*F(x0+s*delta)/(2 delta) (two replicas/DOF).
+            # forward: H[:,k] += -F(x0+delta)/delta (one replica/DOF); the +F(x0)/delta
+            #          base term is added once per structure in _get_efh_numerical.
             resp_node, tgt, fac = [], [], []
             for slot, r in enumerate(chunk):
                 i = rep_i[r]; k = 3 * rep_a[r] + rep_c[r]
-                f = -rep_s[r] / (2.0 * delta)
+                f = (-rep_s[r] / delta) if forward else (-rep_s[r] / (2.0 * delta))
                 base_i = i * nmax2
                 for ap in mov_resp[i]:
                     resp_node.append(coff[slot] + ap)
@@ -622,6 +650,7 @@ class UMABatchCalc:
         return dict(
             chunks=plan_chunks, n_replicas=R, n_chunks=len(chunks),
             max_atoms_in_chunk=max_atoms_in_chunk, nmax=nmax,
+            forward=forward, mov=mov,
         )
 
     # ------------------------------------------------------------ get_efh_gpu
@@ -782,6 +811,28 @@ class UMABatchCalc:
             H_flat.index_add_(0, ch["tgt"], contrib)
 
         H_eV = H_flat.reshape(B, nmax, nmax)
+
+        # forward-difference base term: the chunk loop deposited only the perturbed
+        # -F(x0+delta e_k)/delta columns; complete H[row,k] = -(F(x0+delta e_k)-F(x0))
+        # /delta by adding the shared +F(x0)/delta (the ONE base forward, already in
+        # F_pad eV) to every movable (row,k) cell. Column-independent -> broadcast the
+        # base force vector across all movable columns. (central path leaves H as-is.)
+        if plan.get("forward"):
+            inv_d = 1.0 / self._delta
+            mov = plan["mov"]
+            for b in range(B):
+                if not mov[b]:
+                    continue
+                idx = torch.tensor(
+                    [3 * a + c for a in mov[b] for c in range(3)],
+                    dtype=torch.long, device=device,
+                )
+                base = F_pad[b, idx] * inv_d                       # (d,) eV/A / A
+                H_eV[b].index_put_(
+                    (idx[:, None], idx[None, :]),
+                    H_eV[b][idx[:, None], idx[None, :]] + base[:, None],
+                )
+
         H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))               # symmetrize
 
         return (

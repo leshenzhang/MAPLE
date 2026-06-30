@@ -248,23 +248,65 @@ class UMACalculator(FAIRChemCalculator):
         if not importlib.util.find_spec("fairchem"):
             raise ImportError("fairchem-core is not installed. Please install it first.")
 
-        predictor = self._build_predictor(
-            checkpoint,
-            overrides,
-            device,
+        # LAZY MODEL LOAD (R2-F1): defer _build_predictor()/load_predict_unit out
+        # of __init__ so that the engine's eagerly-attached single calc -- which
+        # is NEVER forwarded on the batched (list/Molecules) dispatch path -- does
+        # not load a second resident copy of the UMA checkpoint into VRAM. The
+        # predictor (and the upstream FAIRChemCalculator metadata that depends on
+        # it) is built on first real use via _ensure_predictor(), invoked at the
+        # top of calculate(). Serial results are byte-identical -- same predictor,
+        # same task_name -- only constructed later.
+        super(FAIRChemCalculator, self).__init__()  # ASE Calculator base state only
+        self._predictor_config = dict(
+            checkpoint=checkpoint,
+            overrides=overrides,
+            device=device,
             checkpoint_path=checkpoint_path,
             inference_settings=inference_settings,
         )
-        super().__init__(predict_unit=predictor, task_name=task or "omol")
+        self._predictor_task = task or "omol"
+        self._predictor_unit = None  # sentinel: not yet built
+        # task_name is needed by the dispatcher (_uma_task) on the batched path
+        # WITHOUT loading the model; expose it eagerly. _ensure_predictor() resets
+        # it to the identical value via the upstream metadata path.
+        self._task_name = task or "omol"
+        # ASE's get_property() gates on implemented_properties BEFORE calling
+        # calculate(), so it must be populated without loading the model. UMA
+        # always provides energy/forces (+ free_energy alias); _ensure_predictor()
+        # overwrites this with the exact predictor-derived list on first compute.
+        self.implemented_properties = ["energy", "forces", "free_energy"]
 
         self.device = torch.device(device)
-        self._predictor_unit = predictor
         self._auto_task = task is None
         self.hessian = "numerical"
 
         # Shared helper sets self.solvent_correction (and self.chargecalc when
-        # applicable); identical contract to CalcABC.implicit_solv_init.
+        # applicable); identical contract to CalcABC.implicit_solv_init. Does not
+        # touch the UMA predictor, so it stays eager.
         init_implicit_solvent(self, implicit, solvent, self.device)
+
+    def _ensure_predictor(self):
+        """Build the UMA predictor on first real use and run the upstream
+        FAIRChemCalculator metadata setup (self.predictor, self._task_name,
+        implemented_properties, self.a2g). Idempotent and called at the top of
+        calculate(); on the batched path calculate() is never invoked on the
+        attached single calc, so the model is never loaded here."""
+        if self._predictor_unit is not None:
+            return self._predictor_unit
+        cfg = self._predictor_config
+        predictor = self._build_predictor(
+            cfg["checkpoint"],
+            cfg["overrides"],
+            cfg["device"],
+            checkpoint_path=cfg["checkpoint_path"],
+            inference_settings=cfg["inference_settings"],
+        )
+        # Run the exact upstream metadata setup with the real predictor. This
+        # re-runs ASE Calculator.__init__ (resets results/atoms), which is safe:
+        # _ensure_predictor() is always called before any forward pass.
+        FAIRChemCalculator.__init__(self, predict_unit=predictor, task_name=self._predictor_task)
+        self._predictor_unit = predictor
+        return predictor
 
     def _set_task_from_atoms(self, atoms: Atoms) -> None:
         if not self._auto_task:
@@ -402,6 +444,7 @@ class UMACalculator(FAIRChemCalculator):
                 torch.as_tensor(E0, dtype=torch.float64))
 
     def calculate(self, atoms, properties=None, system_changes=None):
+        self._ensure_predictor()  # LAZY: build UMA model on first real forward
         properties = reject_implicit_solvent_derivatives(self, properties)
         system_changes = all_changes if system_changes is None else system_changes
 

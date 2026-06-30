@@ -941,13 +941,18 @@ class LQABatch:
         t = dt.clone()
         cur = _torch.zeros(B, dtype=_torch.float64, device=dev)
         done = (~active) | (gnorm < 1e-12)
-        for _ in range(euler_n):
+        for i in range(euler_n):
             expo = _torch.exp(-2.0 * w * t[:, None])         # (B, M)
             dsdt = _torch.sqrt((gstar * gstar * expo).sum(dim=1).clamp_min(0.0))
             cur = _torch.where(done, cur, cur + dsdt * dt)
             reach = cur >= step
             done = done | reach
-            if bool(done.all()):
+            # Both `cur` and `t` are frozen for done rows by the where-masks (here and
+            # below), so a row's final `t` (the only loop output, used for alphas/dx)
+            # never changes once it is done. Checking done.all() -- a GPU->CPU sync --
+            # every 64 iters instead of every iter only lets a few already-frozen rows
+            # spin a bit longer: byte-identical result, ~64x fewer host syncs.
+            if (i % 64 == 0 or i == euler_n - 1) and bool(done.all()):
                 break
             t = _torch.where(done, t, t + dt)
 
