@@ -171,6 +171,7 @@ class BatchedNVT(JobABC):
             raise NotImplementedError(
                 "BatchedNVT currently supports isolated (non-periodic) replicas only.")
         self._reject_ceiling_features()
+        self._warn_frozen_atoms()
 
         # HMR (mass-only) -- BEFORE building the mass buffer / thermostats.
         for at in self.atoms_list:
@@ -223,6 +224,48 @@ class BatchedNVT(JobABC):
                 f"{', '.join(bad)} (deliberate C3 ceiling). RATTLE constraints, GaMD, "
                 "steered MD, PLUMED, Colvars and posres are available on the "
                 "single-system NVT path -- run those systems one at a time.")
+
+    def _warn_frozen_atoms(self):
+        """R2 fix (B-81) FixAtoms SILENTLY IGNORED: the batched NVT/REMD/GaMD path
+        advances ALL atoms via the vectorized VV buffer + ``calc.step_cart_`` -- it
+        does NOT honor ASE FixAtoms / frozen-atom constraints (no movable mask is
+        threaded into the batched displacement). Previously such constraints were
+        dropped silently and the 'frozen' atoms moved anyway. Emit a clear WARNING so
+        the user is not misled (honoring frozen atoms on this path is not implemented;
+        use the single-system NVT for hard FixAtoms constraints). Detection only --
+        no behavior change for unconstrained inputs (the common case)."""
+        import warnings
+        try:
+            from ase.constraints import FixAtoms
+        except Exception:
+            FixAtoms = ()
+        offenders = []
+        for b, at in enumerate(self.atoms_list):
+            n_fixed = 0
+            for c in (getattr(at, "constraints", None) or []):
+                is_fix = (isinstance(c, FixAtoms) if FixAtoms else False) \
+                    or ("Fix" in type(c).__name__)
+                if not is_fix:
+                    continue
+                idx = getattr(c, "index", None)
+                try:
+                    n_fixed += int(np.asarray(idx).size) if idx is not None else 1
+                except Exception:
+                    n_fixed += 1
+            if n_fixed:
+                offenders.append((b, n_fixed))
+        if offenders:
+            tot = sum(n for _, n in offenders)
+            msg = (f"BatchedNVT: {tot} frozen atom(s) across {len(offenders)} replica(s) "
+                   f"{[f'rep{b}:{n}' for b, n in offenders]} carry ASE FixAtoms/frozen "
+                   f"constraints, but the BATCHED NVT/REMD/GaMD path does NOT honor "
+                   f"frozen atoms -- ALL atoms are integrated and WILL MOVE. Use the "
+                   f"single-system NVT for hard FixAtoms constraints.")
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            try:
+                self.log_info(["\n[WARNING] " + msg + "\n"])
+            except Exception:
+                pass
 
     # ----------------------------------------------------- GPU-opt Lever 1 (fp32)
     def _apply_precision(self):
@@ -472,10 +515,28 @@ class BatchedNVT(JobABC):
         ang_fires = ae > 0 and (step % ae == 0)
         if not (com_fires or ang_fires):
             return v
+        # R2 fix (B-81) STALE-GEOMETRY angular projection: the rigid-body rotation
+        # removal needs the CURRENT geometry (COM, r, inertia tensor I, and thus
+        # omega = I^-1 L are ALL position-dependent). self.atoms_list[b] is FROZEN at
+        # t=0 -- the master coords advance inside the calc (step_cart_), never written
+        # back to the topology holders -- so passing it removed the t=0 rotational
+        # component from the CURRENT velocity (wrong projection, biased internal KE/T).
+        # FIX: for the angular branch, pull the CURRENT positions from the calc's
+        # master coord buffer (concatenated in replica order) and project against that.
+        # The COM-translation branch is position-FREE (masses + velocities only), so it
+        # is unaffected; the default path (remove_angular_every=0) is byte-unchanged.
+        cur_pos = None
+        if ang_fires:
+            cur_pos = self.calc.coord.detach().to("cpu").numpy()   # (N_atoms,3) Angstrom
+            cum = np.concatenate(([0], np.cumsum(self.n_b))).astype(int)
         for b in range(self.B):
             vb = self._v_real(v, b)
+            atoms_b = self.atoms_list[b]
+            if cur_pos is not None:
+                atoms_b = atoms_b.copy()
+                atoms_b.set_positions(cur_pos[cum[b]:cum[b + 1]])   # CURRENT geometry
             vb, _proj = apply_runtime_motion_projection(
-                self.atoms_list[b], vb, step=step,
+                atoms_b, vb, step=step,
                 remove_com_every=self.params.remove_com_every,
                 remove_angular_every=self.params.remove_angular_every)
             self._set_v_real(v, b, vb)
@@ -505,13 +566,26 @@ class BatchedNVT(JobABC):
         ke_int = 0.5 * (mreal * vr_int * vr_int).sum(dim=(1, 2))     # (B,) padding mass=0 -> no pad term
         return ke_full, ke_int
 
-    def _record(self, v, E):
+    def _record(self, v, E, step=None):
         """Record per-replica KE/PE/T from the (sync) velocity. T is formed from
         the COM-subtracted (internal, 3N-3) kinetic energy so it matches the
         n_dof=3N-3 divisor -- the kinetic-T calibration fix (a per-particle OU
         Langevin thermostat also thermostats the 3 COM modes; leaving that COM
         energy in KE while dividing by 3N-3 over-reports T by 3N/(3N-3)). See
-        ``utils.calculate_temperature``. The KE_Ha history keeps the raw full KE."""
+        ``utils.calculate_temperature``. The KE_Ha history keeps the raw full KE.
+
+        R2 fix (B-81) UNBOUNDED GPU-HISTORY GROWTH: previously this appended 3
+        on-device tensors EVERY step regardless of the declared ``log_every``, so the
+        retained history scaled with steps (VRAM creep on long runs). FIX: when the
+        caller passes ``step``, cadence-gate the append by ``log_every`` (the final
+        step is always recorded so the summary reflects the end state). The tensors
+        stay ON-DEVICE (no per-append .to('cpu') -- that would reintroduce the
+        per-step D2H sync stall, O2b); only the append cadence is reduced. step=None
+        (legacy callers, e.g. gamd_batched) keeps the every-step behavior."""
+        if step is not None:
+            le = max(1, int(self.params.log_every or 1))
+            if (step % le != 0) and (step != self.params.steps):
+                return
         ke_full, ke_int = self._ke_full_internal(v)
         self._hist_KE.append(ke_full)
         self._hist_PE.append(E)
@@ -532,7 +606,7 @@ class BatchedNVT(JobABC):
         v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick
         v = self._apply_thermostat(v, vrescale=True)      # per-replica Bussi A7
         v = self._apply_projection(v, step)               # per-replica COM/angular
-        self._record(v, E)                                # T from COM-subtracted KE
+        self._record(v, E, step)                          # T from COM-subtracted KE
         self._steps_done = step
         return v, E, F
 
@@ -551,7 +625,7 @@ class BatchedNVT(JobABC):
         v = self._apply_projection(v, step)               # per-replica COM/angular
         # report SYNC (standard) KE/T: v_std = v_carried + 0.5*(F/m)*dt
         v_sync = v + 0.5 * F / self.mass * self.dt_au
-        self._record(v_sync, E)                           # T from COM-subtracted KE
+        self._record(v_sync, E, step)                     # T from COM-subtracted KE
         self._steps_done = step
         return v, E, F
 

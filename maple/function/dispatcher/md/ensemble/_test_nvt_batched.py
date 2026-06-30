@@ -93,14 +93,20 @@ def run_smoke_b2(steps=1000, seed=7):
     a0 = ethanol(shift=(0, 0, 0))
     a1 = ethanol(shift=(60.0, 0, 0))          # far apart; block-diagonal anyway
     bc = MaceOffBatchCalc(model_path=MODEL, device=DEV, dtype=torch.float64)
+    # log_every=1: dense per-step T history (tight tail-mean estimate for a tiny
+    # 9-atom system) -- also exercises the B-81 fix#3 cadence path at every-step.
     paras = dict(timestep=0.5, steps=steps, temperature=300.0, thermostat="langevin",
-                 friction=0.02, remove_com_every=100, random_seed=seed, verbose=0)
+                 friction=0.02, remove_com_every=100, log_every=1,
+                 random_seed=seed, verbose=0)
     with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as f:
         out = f.name
     sim = BatchedNVT(out, [a0, a1], calc=bc, paras=paras).run()
     # last-50% mean T (tight estimate for a tiny 9-atom system; per-step T has
     # huge canonical fluctuations at n_dof=24, so a wide window is needed).
-    half = steps // 2
+    # B-81 fix#3: the recorded history is cadence-gated by log_every, so index the
+    # tail by the RECORDED-frame count (len // 2), not the raw step count.
+    nrec = len(sim.results[0]["T_K"])
+    half = nrec // 2
     T0 = float(np.mean(sim.results[0]["T_K"][half:]))
     T1 = float(np.mean(sim.results[1]["T_K"][half:]))
     # perturb-one ENERGY isolation on the post-run batch state.
