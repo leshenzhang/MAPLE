@@ -104,6 +104,20 @@ class BatchRFO:
         self.device = torch.device(device)
         self.verbose = int(verbose)
 
+        # === Forward-reuse optimization (mirror BPRFO FIX #2 + FIX #1) ===
+        # BatchRFO's single-structure oracle (optimization/algorithm/RFO.py) keeps the
+        # accepted trial's forces and threads the committed forward forward; BatchRFO
+        # regressed by (a) dropping the inner trial forces and recomputing them with a
+        # fresh forward purely for the convergence check (the :233 get_ef_gpu), and
+        # (b) re-evaluating the SAME committed geometry's base forward at the top of the
+        # next outer iter inside get_efh_gpu. Both are eliminated below (UMA is
+        # block-diagonal => the reused E/F are bit-identical to a fresh forward at the
+        # byte-identical committed geometry, up to fp32 run-to-run noise). Default ON;
+        # set MAPLE_RFO_NO_FWD_REUSE=1 to restore the legacy recompute path = the
+        # byte-parity oracle (precedent: BPRFO's MAPLE_NO_FWD_REUSE).
+        self._reuse_forward = (os.environ.get("MAPLE_RFO_NO_FWD_REUSE", "0") != "1")
+        self._fwd_reused = 0   # diagnostics: # forwards eliminated by reuse
+
         self.output = os.path.abspath(output)
         self.out_dir = os.path.dirname(self.output) or "."
         os.makedirs(self.out_dir, exist_ok=True)
@@ -174,6 +188,13 @@ class BatchRFO:
         self._final_status = [None] * B0
 
         outer_it = 0
+        # FIX #1: committed (E,F) at the geometry that will be the TOP of the next outer
+        # iteration (== the committed geometry of this iteration; no step happens between
+        # the end of an outer iter and the get_efh_gpu at the start of the next one). When
+        # set, it is fed to get_efh_gpu(base_ef=...) so its base forward (the gradient
+        # point) is skipped. Reset to None on the first iter and after any batch shrink
+        # (geometry/batch ordering changed -> a real base forward must run).
+        base_ef_next = None
         while outer_it < self.max_outer_iter and len(atoms_list) > 0:
             outer_it += 1
             real_mask = self._real_mask
@@ -184,7 +205,14 @@ class BatchRFO:
             # keyed cache); the batch does ONE get_efh_gpu per outer iteration, and an
             # in-iteration reject restores the SAME geometry -> the cached H stays valid
             # across inner retries, exactly like the single oracle.
-            E_old, F_raw, H_raw, _ = calc.get_efh_gpu()
+            # FIX #1: when base_ef_next is set (reuse ON), the committed (E,F) already
+            # evaluated at THIS exact geometry (end of last outer iter) is passed in so
+            # get_efh_gpu skips its base forward; the FD Hessian is still computed fresh.
+            if self._reuse_forward and base_ef_next is not None:
+                E_old, F_raw, H_raw, _ = calc.get_efh_gpu(base_ef=base_ef_next)
+                self._fwd_reused += 1
+            else:
+                E_old, F_raw, H_raw, _ = calc.get_efh_gpu()
             E_old = E_old.to(dtype=DTYPE)
             F_raw = F_raw.to(dtype=DTYPE)
             H_raw = 0.5 * (H_raw + H_raw.transpose(-1, -2)).to(dtype=DTYPE)
@@ -222,17 +250,38 @@ class BatchRFO:
 
             do_log = (self.verbose == 1)
 
-            # Inner trust-region loop (per-structure masked accept/reject/shrink/expand)
-            trust_r, last_step, last_rho, step_accepted = self._inner_loop(
-                it=outer_it, calc=calc, w=w, V=V, g_proj=g_proj,
-                H=H_cart, g_cart=g_cart, trust_r=trust_r, last_step=last_step,
-                real_mask=real_mask, E_old=E_old, log=do_log,
-            )
+            # Inner trust-region loop (per-structure masked accept/reject/shrink/expand).
+            # FIX #2: it also returns the committed-geometry (E,F) it already evaluated --
+            # the accepted trial's forward sits at base+s_cart == the committed geometry,
+            # and the legacy code dropped its forces via `_`, forcing the :233 forward to
+            # recompute them at the identical geometry.
+            trust_r, last_step, last_rho, step_accepted, E_committed, F_committed = \
+                self._inner_loop(
+                    it=outer_it, calc=calc, w=w, V=V, g_proj=g_proj,
+                    H=H_cart, g_cart=g_cart, trust_r=trust_r, last_step=last_step,
+                    real_mask=real_mask, E_old=E_old, F_base=F_use, log=do_log,
+                )
 
-            # Committed-geometry E/F (for convergence) -- one forward at the new point
-            E_fin, F_fin = calc.get_ef_gpu()
-            E_fin = E_fin.to(dtype=DTYPE)
-            g_new = -F_fin.to(dtype=DTYPE) * rmask
+            # Committed-geometry E/F (for convergence). FIX #2: reuse the inner loop's
+            # committed (E,F) -- block-diagonal UMA forward => bit-identical to a fresh
+            # forward at the same coords. On reuse-OFF, run the legacy fresh forward
+            # (the byte-parity oracle = the old :233 get_ef_gpu).
+            if self._reuse_forward:
+                E_fin = E_committed
+                F_fin = F_committed
+                self._fwd_reused += 1
+            else:
+                E_fin, F_fin = calc.get_ef_gpu()
+                E_fin = E_fin.to(dtype=DTYPE)
+                F_fin = F_fin.to(dtype=DTYPE)
+            g_new = -F_fin * rmask
+
+            # FIX #1: thread committed (E,F) to next iter's get_efh_gpu base forward.
+            # calc.coord now sits at the committed geometry (accepted commits in the
+            # inner loop were NOT restored), so this is the geometry at the top of the
+            # next outer iter. Invalidated (None) below if a batch shrink reorders/resizes
+            # the batch (the threaded rows would no longer align with the new ordering).
+            base_ef_next = (E_fin, F_fin) if self._reuse_forward else None
 
             done = self._check_convergence(
                 it=outer_it, E=E_fin, g_new=g_new, last_step=last_step,
@@ -247,6 +296,9 @@ class BatchRFO:
 
             survive_local = (~done).nonzero(as_tuple=False).flatten()
             if survive_local.numel() < done.numel():
+                # batch shrink -> the committed (E,F) rows no longer align with the
+                # reindexed survivor batch; force a real base forward next iter.
+                base_ef_next = None
                 # commit current geometries back into the (pre-slice) atoms objects
                 self._sync_atoms_from_calc(calc, atoms_list)
 
@@ -277,6 +329,8 @@ class BatchRFO:
         n_conv = sum(1 for s in self._final_status if s == "converged")
         n_max = sum(1 for s in self._final_status if s == "max_iter")
         self._w(f"\n# Final status: converged={n_conv} max_iter={n_max}\n")
+        self._w(f"# fwd_reused (forwards eliminated by reuse)={self._fwd_reused} "
+                f"reuse_forward={self._reuse_forward}\n")
         self._close_log()
 
     # ===================================================
@@ -373,13 +427,22 @@ class BatchRFO:
     # ===================================================
     @torch.no_grad()
     def _inner_loop(self, it, calc, w, V, g_proj, H, g_cart,
-                    trust_r, last_step, real_mask, E_old, log=True):
+                    trust_r, last_step, real_mask, E_old, F_base, log=True):
         device = self.device
         B, n = g_proj.shape
 
         accepted = torch.zeros(B, dtype=torch.bool, device=device)
         step_accepted = torch.zeros(B, dtype=torch.bool, device=device)
         last_rho = torch.full((B,), float("nan"), dtype=DTYPE, device=device)
+
+        # === FIX #2: committed-geometry E/F, threaded back to run() so it can skip the
+        # post-step convergence forward (legacy :233 get_ef_gpu). Init to the base point
+        # (E_old / F_base at entry): a row that never accepts a step stays at base, so its
+        # committed E/F == base. On each accept the row is overwritten with the accepted
+        # trial's E and forces (the trial forward at base+s_cart IS the committed geometry,
+        # whose forces the legacy code dropped via `_`).
+        E_committed = E_old.clone()
+        F_committed = F_base.clone()
 
         for _try in range(self.max_inner_attempts):
             pend = ~accepted
@@ -394,8 +457,12 @@ class BatchRFO:
 
             calc.backup_coords()
             calc.step_cart_(s_try)
-            E_new, _ = calc.get_ef_gpu()
+            # FIX #2: KEEP the trial forces (legacy dropped them via `_`). For an accepted
+            # row, base+s_cart IS the committed geometry, so F_trial == the post-step
+            # forward's forces (block-diagonal UMA) -> run() reuses them, skipping :233.
+            E_new, F_trial = calc.get_ef_gpu()
             E_new = E_new.to(dtype=DTYPE)
+            F_trial = F_trial.to(dtype=DTYPE)
             calc.restore_coords()
 
             # quadratic model change (cartesian == mass-weighted, parity-exact)
@@ -419,6 +486,10 @@ class BatchRFO:
                 calc.step_cart_(s_commit)
                 last_step[acc] = s_commit[acc]
                 step_accepted |= acc
+                # FIX #2: accepted rows now sit at base+s_cart == committed geometry, the
+                # exact point the trial forward (above) evaluated -> record its E/F there.
+                E_committed[acc] = E_new[acc]
+                F_committed[acc] = F_trial[acc]
                 self._dump_xyz_subset(calc, acc, it)
 
             # trust-radius update (legacy == single-RFO run(): expand on good rho at
@@ -431,7 +502,7 @@ class BatchRFO:
                 self._w(self._fmt_iter_head(it, acc, rej, rho, trust_r, E_new))
             accepted |= acc
 
-        return trust_r, last_step, last_rho, step_accepted
+        return trust_r, last_step, last_rho, step_accepted, E_committed, F_committed
 
     # ===================================================
     # CONVERGENCE

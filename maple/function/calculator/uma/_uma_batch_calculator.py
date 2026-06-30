@@ -302,6 +302,7 @@ class UMABatchCalc:
         self.mol_idx = None
         self._local_atom = None
         self.coord = None
+        self._fwd_count = 0   # diagnostics: total batched model forwards (_forward calls)
         self.N_atoms = 0
         self.Nmax_atoms = 0
         self.nmax_dof = 0
@@ -456,6 +457,7 @@ class UMABatchCalc:
         # _clone_batch() is already on-device (topology moved in prepare()); the
         # _to_device inside _predict_forces is the only one left (no-op here, kept
         # for the CPU-built batches passed at the partial/full-Hessian call sites).
+        self._fwd_count += 1
         ad = self._clone_batch()
         ad.pos = coord.to(device=self.device, dtype=torch.float32)
         E, F, _ = self._predict_forces(ad)
@@ -654,7 +656,7 @@ class UMABatchCalc:
         )
 
     # ------------------------------------------------------------ get_efh_gpu
-    def get_efh_gpu(self, movable_masks=None):
+    def get_efh_gpu(self, movable_masks=None, base_ef=None):
         """Energy + forces + per-structure NUMERICAL Hessian (batched central FD).
 
         Returns
@@ -691,6 +693,17 @@ class UMABatchCalc:
         Mode dispatch (OPT-IN): ``hessian_mode='autograd'`` routes to the exact
         energy-graph double-backward Hessian; ANY failure hard-falls to the
         numerical FD body below (the default + parity oracle).
+
+        ``base_ef`` (OPT-IN, BatchRFO FIX #1): when the caller has ALREADY evaluated
+        (E, F) at the current ``self.coord`` (e.g. the committed-geometry forward of the
+        previous optimizer step, geometry unchanged), pass ``base_ef=(E_Ha (B,),
+        F_Ha (B, nmax_dof))`` (Hartree, padded) to SKIP the base-point forward (line
+        ~779) and reuse it as the returned gradient. The central-FD Hessian is computed
+        FRESH from ``self.coord`` regardless (it never uses the base force), so this is
+        parity-exact -- it only removes one redundant model forward. Caller is
+        responsible for guaranteeing ``self.coord`` is unchanged since ``base_ef`` was
+        measured. Honored only on the numerical FD path (the default + oracle); the
+        autograd path ignores it and recomputes.
         """
         # OPT-IN autograd Hessian; on any error fall through to the numerical oracle.
         if self.hessian_mode == "autograd":
@@ -700,8 +713,8 @@ class UMABatchCalc:
                 pass
         # OPT-IN VRAM-adaptive chunk sizing (default OFF -> fixed-chunk oracle).
         if self.auto_chunk and self.device.type == "cuda":
-            return self._get_efh_numerical_auto(movable_masks)
-        return self._get_efh_numerical(movable_masks)
+            return self._get_efh_numerical_auto(movable_masks, base_ef=base_ef)
+        return self._get_efh_numerical(movable_masks, base_ef=base_ef)
 
     # ---------------------------------------------- VRAM-adaptive chunk helpers
     def _vram_budget_atoms(self) -> int:
@@ -723,7 +736,7 @@ class UMABatchCalc:
         floor = max(1, int(self.Nmax_atoms))
         return max(floor, min(self.vram_chunk_cap, amax))
 
-    def _get_efh_numerical_auto(self, movable_masks):
+    def _get_efh_numerical_auto(self, movable_masks, base_ef=None):
         """VRAM-adaptive FD Hessian: size the chunk atom budget to fill VRAM toward
         vram_safety, then on a CUDA OOM halve the budget and retry (never crashes).
         Math is identical to the fixed-chunk oracle -- chunk size changes only how
@@ -741,7 +754,7 @@ class UMABatchCalc:
         attempts = 0
         while True:
             try:
-                return self._get_efh_numerical(movable_masks)
+                return self._get_efh_numerical(movable_masks, base_ef=base_ef)
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower() or attempts >= 12:
                     raise
@@ -755,7 +768,7 @@ class UMABatchCalc:
                 self._auto_chunk_retries += 1
                 attempts += 1
 
-    def _get_efh_numerical(self, movable_masks=None):
+    def _get_efh_numerical(self, movable_masks=None, base_ef=None):
         """Numerical central-FD Hessian body (the default + byte-parity oracle).
 
         Chunk atom budget = self._h_max_atoms (fixed hessian_max_atoms by default, or
@@ -775,11 +788,22 @@ class UMABatchCalc:
         nmax = self.nmax_dof
         nmax2 = nmax * nmax
 
-        # (c) base-point energy + padded forces -- ONE forward, reused as gradient
-        E_eV, F_eV = self._forward(self.coord)
-        F_pad = torch.zeros((B, nmax), dtype=dtype, device=device)
-        if self.N_atoms > 0:
-            F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)
+        # (c) base-point energy + padded forces -- ONE forward, reused as gradient.
+        # FIX #1 (base_ef): if the caller already evaluated (E,F) at THIS exact
+        # self.coord, reuse it and SKIP this forward. base_ef = (E_Ha (B,), F_Ha
+        # (B,nmax)) in Hartree/padded layout; we divide back to eV so the final
+        # *EV2HARTREE below round-trips to the caller's values (fp round-trip ~1 ULP,
+        # far under the ~1e-6 noise floor). The FD Hessian below is unaffected -- it
+        # perturbs self.coord and never reads this base force -> parity-exact.
+        if base_ef is not None:
+            E_base_Ha, F_base_Ha = base_ef
+            E_eV = (E_base_Ha / EV2HARTREE).to(dtype=dtype, device=device)
+            F_pad = (F_base_Ha / EV2HARTREE).to(dtype=dtype, device=device)
+        else:
+            E_eV, F_eV = self._forward(self.coord)
+            F_pad = torch.zeros((B, nmax), dtype=dtype, device=device)
+            if self.N_atoms > 0:
+                F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)
         P = (nmax_a - self._n_b).to(torch.int64)
 
         if self.N_atoms == 0:
