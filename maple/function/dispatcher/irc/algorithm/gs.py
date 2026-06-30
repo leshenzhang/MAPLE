@@ -761,3 +761,466 @@ class GS:
             ],
             self.output,
         )
+
+
+# ======================================================================== #
+#                            BATCHED GS-IRC                                 #
+# ======================================================================== #
+# Batched Gonzalez-Schlegel IRC over B transition-state structures sharing ONE
+# UMA *batch* calculator (prepare / get_ef_gpu / get_efh_gpu / step_cart_ /
+# set_coords_). All B paths are propagated in lockstep. GS is the DEFAULT IRC
+# integrator (command_control: "irc": {"method": "gs"}); the single-structure
+# GS above is left UNTOUCHED as the parity oracle, and this batched form is
+# OPT-IN for a list/Molecules of transition states.
+#
+# This mirrors the LQABatch pattern (same padding layout, same TS-mode
+# selection, same per-structure active masking & convergence) but implements
+# the GS macro step:
+#   - pivot half-step downhill along -g_anchor,
+#   - constrained micro-cycle optimisation on a hypersphere of radius
+#     0.5*step (MW), each micro-cycle = ONE batched get_ef_gpu + a batched
+#     eigh + a batched 1D-Newton Lagrange-multiplier (lambda) solve + a
+#     batched Bofill/BFGS update of the mass-weighted Hessian.
+# Per-structure micro convergence (|dx| <= micro_step_thresh) freezes that
+# structure's coords while the rest of the batch keeps iterating, so every
+# structure runs its OWN GS trajectory -- byte-faithful to the single oracle
+# up to fp64 eigh/Newton reordering (<< the UMA fp32 forward noise).
+#
+# Units identical to the single-structure GS: positions Angstrom, forces
+# Eh/Angstrom, Hessian Eh/Angstrom^2, energy Eh, MW coords sqrt(amu)*Angstrom
+# with q_mw = q_cart / D, H_mw = D (x) D * H, g_mw = D * g_cart  (D = 1/sqrt(m)).
+#
+# NOTE: the OPT-IN periodic exact-Hessian recalc (p.hessian_recalc=K>0) is a
+# single-structure-only feature here -- the GS micro-cycle count diverges per
+# structure under lockstep, so a *cumulative* micro-counter (single's recalc
+# trigger) does not vectorise cleanly. The default p.hessian_recalc=None
+# (Bofill/BFGS update every micro-cycle, exact Hessian only at each side's
+# start point) is the common path and is fully supported batched.
+import torch as _torch
+
+
+def _apply_paras_gs(p: "GSParams", paras):
+    """Apply a {'gs'|'irc': {...}} or flat dict of overrides onto a GSParams.
+
+    Same alias table as GS.__init__ (kept separate so the batch path can reuse
+    it without touching the single-structure constructor)."""
+    if not isinstance(paras, dict):
+        return p
+    low = {k.lower(): v for k, v in paras.items()}
+    sub = None
+    for key in ("gs", "irc"):
+        if key in low and isinstance(low[key], dict):
+            sub = low[key]
+            break
+    if sub is None:
+        sub = low
+    sub_low = {k.lower(): v for k, v in sub.items()}
+    aliases = {
+        "sd_len_bohr": "step_length_bohr",
+        "steplength_bohr": "step_length_bohr",
+        "max_points": "max_steps",
+        "hessian_update": "hessian_update",
+        "max_micro_cycles": "max_micro_cycles",
+        "micro_step_thresh": "micro_step_thresh",
+        "hessian_recalc": "hessian_recalc",
+        "target_mode": "target_mode",
+        "f_max_th": "f_max_th",
+        "f_rms_th": "f_rms_th",
+        "tol_maxf": "f_max_th",
+        "tol_rmsf": "f_rms_th",
+        "print_each": "print_each",
+        "write_traj": "write_traj",
+    }
+    for k, v in sub_low.items():
+        if k in aliases:
+            setattr(p, aliases[k], v)
+        elif hasattr(p, k):
+            setattr(p, k, v)
+    return p
+
+
+class GSBatch:
+    """Batched Gonzalez-Schlegel IRC integrator over B transition states.
+
+    Consumes the UMA *batch* calculator API (NOT a per-atoms ASE calculator):
+        calc.prepare(atoms_list, fixed_nmax)
+        calc.get_ef_gpu()  -> (E (B,), F (B,M))            [Hartree, Eh/A]
+        calc.get_efh_gpu() -> (E (B,), F (B,M), H (B,M,M), P (B,))
+        calc.step_cart_(s (B,M))         # in-place padded Cartesian displacement
+        calc.set_coords_(coord (N,3))    # reset packed Cartesian coords
+
+    Parameters mirror GSParams (same defaults / overrides via `paras`)."""
+
+    def __init__(self, atoms_list, calc, output: str = "gs_batch.out",
+                 params=None, paras=None, device=None):
+        self.atoms_list = list(atoms_list)
+        self.calc = calc
+        self.output = output
+        self.p = params if params is not None else GSParams()
+        _apply_paras_gs(self.p, paras)
+
+        if getattr(self.p, "hessian_recalc", None) is not None and \
+                int(self.p.hessian_recalc) > 0:
+            raise NotImplementedError(
+                "GSBatch: periodic exact-Hessian recalc (hessian_recalc>0) is "
+                "single-structure only (the GS micro-counter diverges per "
+                "structure under lockstep). Use hessian_recalc=None (default).")
+
+        self.B = len(self.atoms_list)
+        if self.B == 0:
+            raise ValueError("GSBatch: empty atoms_list")
+
+        self.device = _torch.device(
+            device if device is not None
+            else ("cuda" if _torch.cuda.is_available() else "cpu")
+        )
+        self._step_len_mw = float(self.p.step_length_bohr * BOHR_TO_ANG)
+        self._efh_calls = 0       # diagnostics: # exact get_efh_gpu Hessian forwards
+        self._ef_calls = 0        # diagnostics: # cheap get_ef_gpu forwards
+        self._build_padding()
+
+    # ----------------------------- setup ----------------------------------
+    def _build_padding(self):
+        """Build padded mass-weight vector D, DOF mask, DOF counts, TS coords.
+        Identical layout to LQABatch._build_padding."""
+        B = self.B
+        dev = self.device
+        nmax_a = max(len(a) for a in self.atoms_list)
+        M = 3 * nmax_a
+        self.nmax_dof = M
+
+        Dpad = _torch.ones((B, M), dtype=_torch.float64, device=dev)
+        dof_mask = _torch.zeros((B, M), dtype=_torch.bool, device=dev)
+        n_dof = _torch.zeros(B, dtype=_torch.float64, device=dev)
+        qcart_ts = _torch.zeros((B, M), dtype=_torch.float64, device=dev)
+        coord_rows = []
+
+        for i, a in enumerate(self.atoms_list):
+            m = np.asarray(a.get_masses(), dtype=np.float64)
+            m = np.where(m > 0.0, m, 1.0)
+            d = 1.0 / np.sqrt(np.repeat(m, 3))
+            ni3 = d.shape[0]
+            Dpad[i, :ni3] = _torch.tensor(d, dtype=_torch.float64, device=dev)
+            dof_mask[i, :ni3] = True
+            n_dof[i] = float(ni3)
+            pos = np.asarray(a.get_positions(), dtype=np.float64)
+            qcart_ts[i, :ni3] = _torch.tensor(pos.reshape(-1), dtype=_torch.float64, device=dev)
+            coord_rows.append(_torch.tensor(pos, dtype=_torch.float64, device=dev))
+
+        self.Dpad = Dpad
+        self.dof_mask = dof_mask
+        self.n_dof = n_dof
+        self._qcart_ts = qcart_ts
+        self._q_ts_mw = qcart_ts / Dpad
+        self._ts_coord_N3 = _torch.cat(coord_rows, dim=0)
+
+    # --------------------------- small helpers ----------------------------
+    @staticmethod
+    def _unit_rows(v):
+        n = v.norm(dim=1, keepdim=True)
+        return v / n.clamp_min(1e-16)
+
+    def _force_metrics(self, F):
+        maxG = F.abs().amax(dim=1)
+        sumsq = (F * F).sum(dim=1)
+        rmsG = _torch.sqrt(sumsq / self.n_dof.clamp_min(1.0))
+        return maxG, rmsG
+
+    # ------------------------- TS mode selection --------------------------
+    def _ts_modes(self):
+        """One batched get_efh_gpu() at TS -> batched eigh -> per-structure mode.
+        Identical to LQABatch._ts_modes (shared TS mode selection)."""
+        self.calc.set_coords_(self._ts_coord_N3)
+        E_ts, F_ts, H_ts, _ = self.calc.get_efh_gpu()
+        self._efh_calls += 1
+        Hmw = self.Dpad[:, :, None] * H_ts * self.Dpad[:, None, :]
+        Hmw = 0.5 * (Hmw + Hmw.transpose(1, 2))
+        w, V = _torch.linalg.eigh(Hmw)
+        k = int(self.p.target_mode)
+        idx = k - 1
+        eigval = w[:, idx]
+        vneg = V[:, :, idx].clone()
+        n_strong_neg = (w < -1e-4).sum(dim=1)
+        n_neg = (w < 0.0).sum(dim=1)
+        valid = (eigval < -1e-6) & (n_neg >= k)
+        am = vneg.abs().argmax(dim=1)
+        rows = _torch.arange(self.B, device=self.device)
+        sgn = _torch.sign(vneg[rows, am])
+        sgn = _torch.where(sgn == 0, _torch.ones_like(sgn), sgn)
+        vneg = vneg * sgn[:, None]
+        return E_ts, vneg, eigval, valid, n_strong_neg
+
+    # -------------------- batched MW Hessian updates ----------------------
+    @staticmethod
+    def _bofill_update_mw_batched(H, s, y, upd, real_mask):
+        """Batched MW-space Bofill update mirroring GS._bofill_update.
+
+        H (B,M,M) MW Hessian; s=coords_diff (B,M), y=grad_diff (B,M); upd (B,)
+        rows to update; real_mask (B,M). Per-row gated; denominators clamped only
+        when ~0 (degenerate/inactive rows) so active rows are byte-faithful to
+        the single-structure unguarded update."""
+        DT = H.dtype
+        rm = real_mask.to(DT)
+        dx = s.to(DT) * rm
+        dg = y.to(DT) * rm
+        Hdx = _torch.einsum('bij,bj->bi', H, dx)
+        z = dg - Hdx
+        zdx = (z * dx).sum(1)
+        dx2 = (dx * dx).sum(1)
+        zz = (z * z).sum(1)
+        safe = upd & (zdx.abs() > 0) & (dx2 > 0) & (zz > 0)
+        zdx_s = _torch.where(zdx.abs() > 1e-300, zdx, _torch.ones_like(zdx))
+        dx2_s = _torch.where(dx2 > 1e-300, dx2, _torch.ones_like(dx2))
+        zz_s = _torch.where(zz > 1e-300, zz, _torch.ones_like(zz))
+        zzT = _torch.einsum('bi,bj->bij', z, z)
+        dxzT = _torch.einsum('bi,bj->bij', dx, z)
+        zdxT = _torch.einsum('bi,bj->bij', z, dx)
+        dxdxT = _torch.einsum('bi,bj->bij', dx, dx)
+        ms = zzT / zdx_s.view(-1, 1, 1)
+        psb = (dxzT + zdxT) / dx2_s.view(-1, 1, 1) \
+            - (zdx_s / (dx2_s * dx2_s)).view(-1, 1, 1) * dxdxT
+        mix = (zdx_s * zdx_s) / (zz_s * dx2_s)
+        dH = mix.view(-1, 1, 1) * ms + (1.0 - mix).view(-1, 1, 1) * psb
+        dH = _torch.where(safe.view(-1, 1, 1), dH, _torch.zeros_like(dH))
+        return H + dH
+
+    @staticmethod
+    def _bfgs_update_mw_batched(H, s, y, upd, real_mask):
+        """Batched MW-space symmetric-BFGS update mirroring GS._bfgs_update."""
+        DT = H.dtype
+        rm = real_mask.to(DT)
+        sN = s.to(DT) * rm
+        yN = y.to(DT) * rm
+        ys = (yN * sN).sum(1)
+        Hs = _torch.einsum('bij,bj->bi', H, sN)
+        sTHs = (sN * Hs).sum(1)
+        safe = upd & (ys > 1e-12) & (sTHs > 1e-12)
+        ys_s = _torch.where(ys > 1e-300, ys, _torch.ones_like(ys))
+        sTHs_s = _torch.where(sTHs.abs() > 1e-300, sTHs, _torch.ones_like(sTHs))
+        yyT = _torch.einsum('bi,bj->bij', yN, yN)
+        HssH = _torch.einsum('bi,bj->bij', Hs, Hs)
+        dH = yyT / ys_s.view(-1, 1, 1) - HssH / sTHs_s.view(-1, 1, 1)
+        dH = _torch.where(safe.view(-1, 1, 1), dH, _torch.zeros_like(dH))
+        return H + dH
+
+    # ------------------- batched 1D-Newton lambda solve -------------------
+    def _on_sphere(self, lam, w, grad_star, displ_star, modemask, constraint):
+        """Batched constraint residual |p(lam)|^2 - constraint, p in eigenbasis.
+        lam (B,); w/grad_star/displ_star/modemask (B,M); returns (B,)."""
+        denom = w - lam[:, None]
+        denom = _torch.where(modemask, denom, _torch.ones_like(denom))
+        num = grad_star - lam[:, None] * displ_star
+        dxs = -(num) / denom
+        dxs = dxs * modemask
+        p = displ_star + dxs
+        return (p * p).sum(1) - constraint
+
+    def _newton_lambda(self, w, grad_star, displ_star, modemask, constraint,
+                       active, maxiter=50, tol=1e-10):
+        """Vectorized 1D Newton root-finder for the GS Lagrange multiplier.
+        Mirrors GS._newton_1d (FD-derivative, lambda*=0.5 fallback) row-wise;
+        converged/inactive rows are frozen."""
+        B = self.B
+        dev = self.device
+        # lambda_0 = first 'big' eigenvalue (ascending) scaled 1.5 if <0 else 0.5
+        has_big = modemask.any(dim=1)
+        idx_first = modemask.to(_torch.float64).argmax(dim=1)        # first True
+        lam0 = w.gather(1, idx_first[:, None]).squeeze(1)
+        lam0 = _torch.where(lam0 < 0.0, lam0 * 1.5, lam0 * 0.5)
+        lam = lam0.clone()
+        act = active & has_big
+        for _ in range(maxiter):
+            if not bool(act.any()):
+                break
+            f = self._on_sphere(lam, w, grad_star, displ_star, modemask, constraint)
+            conv = f.abs() < tol
+            act = act & ~conv
+            if not bool(act.any()):
+                break
+            h = 1e-4 * lam.abs().clamp_min(1.0)
+            f1 = self._on_sphere(lam + h, w, grad_star, displ_star, modemask, constraint)
+            df = (f1 - f) / h
+            small = df.abs() < 1e-16
+            df_s = _torch.where(small, _torch.ones_like(df), df)
+            lam_newton = lam - f / df_s
+            lam_half = lam * 0.5
+            lam_upd = _torch.where(small, lam_half, lam_newton)
+            lam = _torch.where(act, lam_upd, lam)
+        return lam, has_big
+
+    # --------------------------- one direction ----------------------------
+    def _propagate_side(self, sign, vneg, valid):
+        """Propagate all B structures one side (sign=+1 fwd / -1 bwd).
+        Returns list (len B) of per-structure record dicts {E,maxG,rmsG,x}."""
+        B, M = self.B, self.nmax_dof
+        p = self.p
+        Dpad = self.Dpad
+        step = self._step_len_mw
+        constraint = (0.5 * step) ** 2
+        use_bfgs = (str(p.hessian_update).lower() != "bofill")
+
+        # reset calc to TS, then displace 0.5*step along the unit neg mode
+        self.calc.set_coords_(self._ts_coord_N3)
+        cur_calc = self._q_ts_mw.clone()
+        vdir = self._unit_rows(vneg) * sign
+        q0 = self._q_ts_mw + (0.5 * step) * vdir
+        q0 = _torch.where(valid[:, None], q0, self._q_ts_mw)
+        self.calc.step_cart_((q0 - cur_calc) * Dpad)
+        cur_calc = q0.clone()
+
+        # exact Hessian anchor at the displaced start point
+        E, F, H_cart, _ = self.calc.get_efh_gpu()
+        self._efh_calls += 1
+        H_mw = Dpad[:, :, None] * H_cart * Dpad[:, None, :]
+        H_mw = 0.5 * (H_mw + H_mw.transpose(1, 2))
+
+        q_mw = q0.clone()
+        prev_coords = q0.clone()
+        prev_grad = Dpad * (-F)
+        displacement = _torch.zeros((B, M), dtype=_torch.float64, device=self.device)
+        cur_F = F                                  # current eval at q_mw (anchor reuse)
+
+        store = [{"E": [], "maxG": [], "rmsG": [], "x": []} for _ in range(B)]
+        active = valid.clone()
+        # GS single records point 0 unconditionally then always does >=1 macro
+        # step (no point-0 convergence check) -- mirror that here.
+        self._record(store, E, F, q_mw, active)
+
+        for _it in range(1, p.max_steps + 1):
+            if not bool(active.any()):
+                break
+            g_anchor = Dpad * (-cur_F)                       # reuse anchor forward
+            g_norm = g_anchor.norm(dim=1)
+            stop = active & (g_norm < 1e-12)                 # single: gradient ~0 -> break
+            active = active & ~stop
+            if not bool(active.any()):
+                break
+
+            prev_coords = q_mw.clone()
+            prev_grad = g_anchor.clone()
+            pivot_step = -(0.5 * step) * g_anchor / g_norm.clamp_min(1e-30)[:, None]
+            # jump to anchor + 2*pivot_step (active rows only; inactive frozen)
+            q_mw = q_mw + (2.0 * pivot_step) * active[:, None].to(_torch.float64)
+            displacement = pivot_step * active[:, None].to(_torch.float64)
+
+            micro_active = active.clone()
+            for _im in range(int(p.max_micro_cycles)):
+                if not bool(micro_active.any()):
+                    break
+                # move calc to current q_mw and get the gradient there
+                self.calc.step_cart_((q_mw - cur_calc) * Dpad)
+                cur_calc = q_mw.clone()
+                Em, Fm = self.calc.get_ef_gpu()
+                self._ef_calls += 1
+                gradient = Dpad * (-Fm)
+
+                coords_diff = q_mw - prev_coords
+                grad_diff = gradient - prev_grad
+                upd = micro_active
+                prev_coords = _torch.where(upd[:, None], q_mw, prev_coords)
+                prev_grad = _torch.where(upd[:, None], gradient, prev_grad)
+                if use_bfgs:
+                    H_mw = self._bfgs_update_mw_batched(
+                        H_mw, coords_diff, grad_diff, upd, self.dof_mask)
+                else:
+                    H_mw = self._bofill_update_mw_batched(
+                        H_mw, coords_diff, grad_diff, upd, self.dof_mask)
+
+                w, V = _torch.linalg.eigh(H_mw)
+                modemask = w.abs() > 1e-8
+                grad_star = _torch.einsum('bmk,bm->bk', V, gradient) * modemask
+                displ_star = _torch.einsum('bmk,bm->bk', V, displacement) * modemask
+
+                lam, has_big = self._newton_lambda(
+                    w, grad_star, displ_star, modemask, constraint, micro_active)
+
+                denom = w - lam[:, None]
+                denom = _torch.where(modemask, denom, _torch.ones_like(denom))
+                num = grad_star - lam[:, None] * displ_star
+                dx_star = -(num) / denom * modemask
+                dx = _torch.einsum('bmk,bk->bm', V, dx_star)
+                step_ok = (micro_active & has_big)[:, None].to(_torch.float64)
+                dx = dx * step_ok
+
+                displacement = displacement + dx
+                q_mw = q_mw + dx
+
+                dxn = dx.norm(dim=1)
+                micro_done = micro_active & (dxn <= p.micro_step_thresh)
+                micro_active = micro_active & ~micro_done
+
+            # final eval at the new macro point
+            self.calc.step_cart_((q_mw - cur_calc) * Dpad)
+            cur_calc = q_mw.clone()
+            E_new, F_new = self.calc.get_ef_gpu()
+            self._ef_calls += 1
+            cur_F = F_new
+            self._record(store, E_new, F_new, q_mw, active)
+
+            maxG, rmsG = self._force_metrics(F_new)
+            conv = (maxG <= p.f_max_th) & (rmsG <= p.f_rms_th)
+            active = active & ~conv
+
+        return store
+
+    def _record(self, store, E, F, q_mw, active):
+        cart = q_mw * self.Dpad
+        maxG, rmsG = self._force_metrics(F)
+        Ecpu = E.detach().cpu()
+        mGcpu = maxG.detach().cpu()
+        rGcpu = rmsG.detach().cpu()
+        cart_cpu = cart.detach().cpu().numpy()
+        for i in range(self.B):
+            if not bool(active[i]):
+                continue
+            ni = len(self.atoms_list[i])
+            store[i]["E"].append(float(Ecpu[i]))
+            store[i]["maxG"].append(float(mGcpu[i]))
+            store[i]["rmsG"].append(float(rGcpu[i]))
+            store[i]["x"].append(cart_cpu[i, :3 * ni].reshape(ni, 3).copy())
+
+    # ------------------------------- run ----------------------------------
+    def run(self):
+        """Run batched forward+backward GS-IRC for all B structures.
+
+        Returns a list (len B) of per-structure result dicts:
+            {"index": i, "valid": bool, "neg_eigval": float, "n_strong_neg": int,
+             "E_ts": float, "forward": {records}, "backward": {records}}"""
+        self.calc.prepare(self.atoms_list, fixed_nmax=self.nmax_dof)
+        E_ts, vneg, eigval, valid, n_strong = self._ts_modes()
+
+        fwd = self._propagate_side(+1.0, vneg, valid)
+        bwd = self._propagate_side(-1.0, vneg, valid)
+
+        E_ts_cpu = E_ts.detach().cpu()
+        eig_cpu = eigval.detach().cpu()
+        nstr_cpu = n_strong.detach().cpu()
+        valid_cpu = valid.detach().cpu()
+
+        results = []
+        for i in range(self.B):
+            results.append({
+                "index": i,
+                "valid": bool(valid_cpu[i]),
+                "neg_eigval": float(eig_cpu[i]),
+                "n_strong_neg": int(nstr_cpu[i]),
+                "E_ts": float(E_ts_cpu[i]),
+                "forward": {"records": fwd[i]},
+                "backward": {"records": bwd[i]},
+            })
+        return results
+
+
+def run_gs_irc(atoms_or_list, output: str = "gs.out", paras=None,
+               calc=None, params=None, device=None):
+    """Unified GS-IRC entry point (single-structure backward compatible).
+
+    - single ASE Atoms with attached ASE calc -> original single GS (unchanged).
+    - list/tuple of Atoms -> batched GSBatch consuming the UMA batch calc."""
+    if isinstance(atoms_or_list, (list, tuple)):
+        if calc is None:
+            raise ValueError("run_gs_irc(batch): a batch calculator `calc` is required")
+        return GSBatch(list(atoms_or_list), calc, output=output,
+                       params=params, paras=paras, device=device).run()
+    gs = GS(atoms_or_list, output=output, params=params, paras=paras)
+    return gs.run()

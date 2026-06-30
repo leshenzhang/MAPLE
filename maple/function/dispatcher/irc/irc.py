@@ -21,6 +21,11 @@ class IRC(JobABC):
         # fix; default behaviour for the in-place single algorithms is unchanged.)
         with timer("IRC Calculation"):
             if self.method == 'gs':
+                from maple.function.utility import Molecules
+                # OPT-IN batched GS-IRC for a list/Molecules of transition
+                # states; a single Atoms keeps the unchanged single GS oracle.
+                if isinstance(self.atoms, (list, Molecules)):
+                    return self._run_batched_gs()
                 from .algorithm import GS
                 irc = GS(self.atoms, output=self.output, paras=self.commandcontrol)
                 return irc.run()
@@ -66,6 +71,29 @@ class IRC(JobABC):
                               paras=self.commandcontrol, calc=calc,
                               device=batch_device_str(self.commandcontrol))
         self._write_batched_lqa(results, atoms_list)
+        return results
+
+    # ==================================================================
+    # OPT-IN GPU-batched GS-IRC (default IRC integrator; single GS = oracle)
+    # ==================================================================
+    def _run_batched_gs(self):
+        """Batched GS-IRC over B transition states via run_gs_irc (-> GSBatch).
+        Single-Atoms GS is the oracle and is left untouched."""
+        from ..dispatcher import resolve_batched_calc, batch_device_str
+        from .algorithm.gs import run_gs_irc
+        from maple.function.utility import Molecules
+
+        atoms_list = (self.atoms.multiatoms if isinstance(self.atoms, Molecules)
+                      else list(self.atoms))
+        if not atoms_list:
+            return None
+        attached = getattr(atoms_list[0], 'calc', None)
+        calc = resolve_batched_calc(self.commandcontrol, atoms_list,
+                                    attached_calc=attached)
+        results = run_gs_irc(atoms_list, output=self.output,
+                             paras=self.commandcontrol, calc=calc,
+                             device=batch_device_str(self.commandcontrol))
+        self._write_batched_lqa(results, atoms_list)   # identical result schema
         return results
 
     def _write_batched_lqa(self, results, atoms_list):
