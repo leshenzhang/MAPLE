@@ -92,3 +92,36 @@ PYTHONPATH=<worktree> PYTHONSAFEPATH=1 \
 Regression gate (CI-friendly, no GPU): `pytest tests/smoke_md_capability.py`
 asserts mace-mp-0 is the only PBC+stress backend, the molecular MACE/AIMNet
 backends never enable NPT, and uma/mace-off stay N/A/PENDING.
+
+---
+
+# BATCHED MD PBC capability matrix (Phase-1A: NVT-PBC, fixed cell)
+
+This is the **batched** path (`ensemble/nvt_batched.py`, `ensemble/batched.py`,
+`B>1` co-batched calculators), distinct from the single-system table above.
+Phase-1A lifts the blanket isolated-only reject (`nvt_batched.py:170-172`,
+`batched.py:151-157`) and replaces it with a per-replica capability + box-size
+gate (`_setup_pbc_gate`): periodic batches require a `SUPPORTS_PBC` backend and
+every periodic replica must pass the GROMACS-style box guard (perpendicular width
+>= 2*r_max). Cell is calc-internal state set at `prepare()`; the MD loop and
+`get_ef_gpu` return contract are **unchanged** (NVT only — NPT-PBC/stress is
+Phase 2C, out of scope).
+
+| batched backend | class | SUPPORTS_PBC | NVT-PBC status |
+|---|---|---|---|
+| **MACE-OFF** | `MaceOffBatchCalc` | **True** | **PASS** — full double-gate (GPU min-image edge builder; A1/A2/A3/A4/A5 + B1/B2). Molecular FM used periodically = extrapolative; validate observables. |
+| **UMA-periodic** | `UMABatchCalc` (task=omat/oc20/...) | **True** | **CODE-COMPLETE, runtime DEFERRED** — cell+pbc preserved, periodic-task gate, per-forward AtomicData rebuild (no stale edges). Blocked from runtime validation: cxtorch `fairchem` import broken (pydantic 2.x `IncEx`) + no periodic UMA checkpoint cached. |
+| **std-MACE** | `MACEBatchCalc` | False (unchanged) | **DEFERRED (Phase-1A scope cut)** — needs a periodic block-diagonal `radius_graph_pbc` edge builder (1–1.5 wk) + a traced model that accepts nonzero shifts at B>1. |
+| **AIMNet2-decoupled** | `AIMNet2DecoupledBatchCalc` | False | **N/A by design** — gas-phase MLIP; periodic batch rejected by the `SUPPORTS_PBC` gate with a clear message. |
+| **MACE-POL** | `MacePolBatchCalc` | False | **N/A by design** — non-periodic; rejected by the gate. |
+
+**Batched algorithms all inherit PBC for free** (verified): `REMD`,
+`BatchedGaMD`, `BatchedSMD`, `BatchedUmbrella` subclass `BatchedNVT` and call
+`super().__init__`, so they ride the ONE lifted gate + the ONE shared
+`get_ef_gpu`. No per-method PBC code. GaMD ran a 60-step periodic trajectory with
+exactly one forward/step; REMD/SMD/Umbrella admit periodic construction; a
+non-`SUPPORTS_PBC` backend is rejected.
+
+Provenance (batched-PBC): worktree `feat/md-pbc` (base `feat/md-r2fixes`
+@ `22a1a9e`), env `envs/plumed` (torch 2.6.0+cu124), MACE-OFF23_medium
+(r_max=5.0). See `test_results/md-pbc_validation.md` for gate numbers + job IDs.

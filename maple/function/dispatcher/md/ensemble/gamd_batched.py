@@ -37,8 +37,10 @@ ACROSS the occupied bins (each occupied bin -> ``floor(B/n_occ)`` or
 ``+1`` walkers, sum = B). The split/merge mechanics and weight bookkeeping are the
 paper's; only the per-bin target is set to keep B fixed. This is the honest
 adaptation to a fixed-batch MD core and is exactly what the WE gate checks
-(total weight conserved + occupancy flattened). Isolated (non-periodic) replicas
-only (inherited from ``BatchedNVT``).
+(total weight conserved + occupancy flattened). PBC (Phase-1A): periodic walkers
+ARE supported, inherited from ``BatchedNVT`` (the GaMD boost rides the same single
+get_ef_gpu that carries the per-replica cell; no per-method PBC code) on a
+SUPPORTS_PBC batch backend.
 """
 
 from dataclasses import dataclass

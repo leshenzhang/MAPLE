@@ -25,7 +25,8 @@ chemist convention used by ``bias.umbrella`` / its PLUMED window writer); it is
 converted to Ha/Angstrom^2 for the in-buffer restraint. The CV and PMF are in
 Angstrom / kcal/mol.
 
-ponytail: isolated (non-periodic) replicas only (inherited from ``BatchedNVT``);
+PBC (Phase-1A): periodic windows ARE supported, inherited from ``BatchedNVT``
+(the umbrella bias rides the same shared get_ef_gpu that carries the cell);
 PLUMED/Colvars-driven windows stay on the single-system path (this is the native
 batched umbrella, not a PLUMED batcher). WHAM is reused, not rewritten.
 """

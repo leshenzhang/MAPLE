@@ -29,8 +29,16 @@ Padded layout: replica ``b``, atom ``a``, axis ``c`` -> flat column ``3*a + c``;
 columns ``3*n_b .. nmax_dof`` are zero padding. Units: mace returns eV / eV·Å⁻¹;
 this calc returns Hartree / Hartree·Å⁻¹ (EV2HARTREE = 1/27.211386245988).
 
-ponytail: gas-phase / isolated systems only (the mace AtomicData here is built
-without a cell). Periodic batching is out of scope for this backend.
+PBC (Phase-1A): periodic batching IS supported. When the replicas carry a cell
+(``atoms.pbc.any()``), ``prepare`` stores a per-replica cell (B,3,3) as
+calc-internal state and ``_build_edges_gpu`` builds a minimum-image periodic
+radius graph on the GPU (per-replica triclinic-correct image shifts), feeding the
+nonzero cartesian ``shifts`` the mace forward already consumes. The MD loop and
+``get_ef_gpu`` return contract are UNCHANGED (cell is fixed -> NVT only). Box-width
+>= 2*r_max is enforced by the loop gate (box_guard) so the minimum image is
+unique. MACE-OFF23 is a MOLECULAR foundation model: a periodic neighbour build is
+mechanically correct but PHYSICALLY EXTRAPOLATIVE for condensed phases -- validate
+the observable (T, RDF) before trusting production runs.
 """
 
 import os
@@ -47,6 +55,12 @@ class MaceOffBatchCalc:
 
     # Pure local MLIP: a block-diagonal batch is exactly isolated (no charge eq.).
     batch_isolated = True
+    # PBC (Phase-1A): mace AtomicData.from_config is natively periodic and the mace
+    # forward already consumes per-edge cartesian ``shifts``; this calc builds a
+    # minimum-image periodic graph when the replicas carry a cell. The box guard
+    # (>= 2*r_max) is enforced by the batched MD loop gate, so the box_guard helper
+    # reads this flag + r_max.
+    SUPPORTS_PBC = True
 
     def __init__(self,
                  model_path: str = _DEFAULT_MODEL,
@@ -149,6 +163,34 @@ class MaceOffBatchCalc:
         self._coord_backup = None
         self._prepared = True
 
+        # PBC (Phase-1A): detect periodicity ONCE and store the per-replica cell as
+        # calc-internal state. The MD loop never sees the cell (it is fixed for NVT);
+        # _build_edges_gpu reads it to emit minimum-image periodic edge shifts. v1
+        # requires a HOMOGENEOUS pbc state (all replicas periodic OR all isolated);
+        # the inverse cell is precomputed (cell fixed in NVT) for the fractional
+        # minimum-image wrap. Heterogeneous CELL SHAPES across replicas ARE allowed
+        # (each candidate pair looks up its own replica's cell/inverse).
+        pbc_flags = [bool(np.any(np.asarray(a.pbc))) for a in atoms_list]
+        self._periodic = bool(any(pbc_flags))
+        if self._periodic:
+            if not all(pbc_flags):
+                raise NotImplementedError(
+                    "MaceOffBatchCalc periodic batch requires a HOMOGENEOUS pbc state: "
+                    "either every replica periodic or every replica isolated. A mixed "
+                    "periodic/isolated batch is not supported (Phase-1A).")
+            cells = np.stack([np.asarray(a.get_cell(), dtype=np.float64) for a in atoms_list])
+            self._cell = torch.tensor(cells, dtype=self.dtype, device=self.device)  # (B,3,3)
+            self._cell_inv = torch.linalg.inv(self._cell)                           # (B,3,3)
+            # 27 integer image offsets {-1,0,1}^3 around the wrapped nearest image.
+            combos = torch.tensor(
+                [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
+                dtype=self.dtype, device=self.device)                               # (27,3)
+            self._shift_combos = combos
+        else:
+            self._cell = None
+            self._cell_inv = None
+            self._shift_combos = None
+
         # R2 opt (B-81): build the STATIC batch dict ONCE (node_attrs / head / batch /
         # ptr / cell / weight fields are geometry-INVARIANT) and the block-diagonal
         # intra-replica candidate-pair index ONCE, both resident on the GPU. The
@@ -168,17 +210,21 @@ class MaceOffBatchCalc:
         per step. The one-time AtomicData build keeps the set_default_dtype context
         (correct & cheap once); the per-step hot path has NO dtype toggle."""
         device = self.device
-        # block-diagonal intra-replica candidate pairs (global atom indices).
-        ci_l, cj_l = [], []
+        # block-diagonal intra-replica candidate pairs (global atom indices) + the
+        # replica index of each pair (PBC: used to look up the per-replica cell).
+        ci_l, cj_l, rep_l = [], [], []
         for b in range(self.B):
             n = int(self.n_b[b]); off = int(self._ptr[b])
             if n >= 2:
                 iu, ju = torch.triu_indices(n, n, offset=1, device=device)
                 ci_l.append(iu + off); cj_l.append(ju + off)
+                rep_l.append(torch.full((iu.numel(),), b, dtype=torch.long, device=device))
         self._cand_i = (torch.cat(ci_l) if ci_l
                         else torch.zeros((0,), dtype=torch.long, device=device))
         self._cand_j = (torch.cat(cj_l) if cj_l
                         else torch.zeros((0,), dtype=torch.long, device=device))
+        self._cand_rep = (torch.cat(rep_l) if rep_l
+                          else torch.zeros((0,), dtype=torch.long, device=device))
 
         if self.B == 0:
             self._static = None
@@ -246,6 +292,8 @@ class MaceOffBatchCalc:
             z = torch.zeros((2, 0), dtype=torch.long, device=device)
             s = torch.zeros((0, 3), dtype=self.dtype, device=device)
             return z, s, s
+        if self._periodic:
+            return self._build_edges_pbc(coord)
         rij = coord[self._cand_i] - coord[self._cand_j]
         d2 = (rij * rij).sum(dim=-1)
         keep = d2 < (self.r_max * self.r_max)            # matscipy strict-<
@@ -254,6 +302,53 @@ class MaceOffBatchCalc:
         edge_index = torch.stack([src, dst], dim=0)
         shifts = torch.zeros((edge_index.size(1), 3), dtype=self.dtype, device=device)
         return edge_index, shifts, shifts
+
+    def _build_edges_pbc(self, coord):
+        """Minimum-image periodic radius graph on the GPU (per-replica triclinic cell).
+
+        For each intra-replica candidate pair (i<j) the raw displacement
+        ``r_ij0 = r_j - r_i`` is wrapped to its NEAREST periodic image via fractional
+        coordinates (``n0 = round(r_ij0 @ cell^-1)``, robust to arbitrary coordinate
+        drift), then the 27 integer shifts ``{-1,0,1}^3`` AROUND that nearest cell are
+        tested. Under the box guard (perpendicular width >= 2*r_max, enforced by the
+        MD loop gate) AT MOST ONE image per ORDERED pair lands within ``r_max``, so the
+        edge set is exactly the ASE/matscipy minimum-image set with no double counting.
+
+        mace edge convention: for a directed edge (sender i, receiver j) the model
+        forms ``vec = pos[j] - pos[i] + shift`` with ``shift`` the CARTESIAN image
+        offset (``unit_shift @ cell``). We emit the forward edge (i->j, +shift) and the
+        reverse (j->i, -shift) for every kept image. ``unit_shifts`` is returned as
+        zeros: the energy/force forward (``compute_force=True``, no virials) consumes
+        only the cartesian ``shifts``; integer unit shifts are a stress-path field.
+        """
+        device = self.device
+        ci, cj, rep = self._cand_i, self._cand_j, self._cand_rep
+        cellp = self._cell[rep]            # (P,3,3)
+        invp = self._cell_inv[rep]         # (P,3,3)
+        rij0 = coord[cj] - coord[ci]       # (P,3)  (r_j - r_i)
+        # nearest-image base cell in fractional space (handles unwrapped drift).
+        n0 = torch.round(torch.einsum("pc,pck->pk", rij0, invp))     # (P,3)
+        rmax2 = self.r_max * self.r_max
+        src_l, dst_l, sh_l = [], [], []
+        for S in self._shift_combos:                                 # (3,)
+            sint = S.view(1, 3) - n0                                 # (P,3) total int shift
+            scart = torch.einsum("pk,pkc->pc", sint, cellp)          # (P,3) cartesian shift
+            rij = rij0 + scart
+            d2 = (rij * rij).sum(dim=-1)
+            keep = d2 < rmax2                                        # matscipy strict-<
+            if bool(keep.any()):
+                kci, kcj = ci[keep], cj[keep]
+                ksh = scart[keep]
+                src_l.append(kci); dst_l.append(kcj); sh_l.append(ksh)      # i->j, +shift
+                src_l.append(kcj); dst_l.append(kci); sh_l.append(-ksh)     # j->i, -shift
+        if src_l:
+            edge_index = torch.stack([torch.cat(src_l), torch.cat(dst_l)], dim=0)
+            shifts = torch.cat(sh_l, dim=0)
+        else:
+            edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+            shifts = torch.zeros((0, 3), dtype=self.dtype, device=device)
+        unit_shifts = torch.zeros((edge_index.size(1), 3), dtype=self.dtype, device=device)
+        return edge_index, shifts, unit_shifts
 
     def _batched_ef_eV(self):
         """ONE native multi-graph forward -> (E_eV (B,), F_eV (N_atoms,3)).

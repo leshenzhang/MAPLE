@@ -31,7 +31,9 @@ Pipeline:
 
 Units: ``smd_k`` is in **Ha/Angstrom^2** (the single-system ``bias.steered`` /
 ``posres_fc`` convention); CV / lambda in Angstrom; work / Delta-G reported in
-kcal/mol. Isolated (non-periodic) replicas only (inherited from BatchedNVT).
+kcal/mol. PBC (Phase-1A): periodic replicas ARE supported, inherited from
+BatchedNVT (the lifted gate + the shared get_ef_gpu carry the per-replica cell;
+no per-method PBC code) when run on a SUPPORTS_PBC batch backend.
 ponytail: ``jarzynski_1d`` + the CV gradient are REUSED, not rewritten; the only
 new physics is the moving centre + per-pull work accumulator in the bias.
 """

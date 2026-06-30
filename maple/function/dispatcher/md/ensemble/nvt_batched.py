@@ -51,6 +51,7 @@ from ..thermostat.langevin import LangevinThermostat
 from ..thermostat.vrescale import VRescaleThermostat
 from ..constraints import maybe_repartition_masses
 from ..anneal import make_anneal_fn
+from ..box_guard import check_box_size
 from ..utils import (
     AMU_TO_AU,
     BOHR_TO_ANGSTROM,
@@ -167,9 +168,7 @@ class BatchedNVT(JobABC):
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(f"Unknown thermostat '{self.params.thermostat}'. "
                              f"Choose from: {self._THERMOSTAT_CHOICES}")
-        if any(any(at.pbc) for at in atoms_list):
-            raise NotImplementedError(
-                "BatchedNVT currently supports isolated (non-periodic) replicas only.")
+        self._setup_pbc_gate(calc, atoms_list)
         self._reject_ceiling_features()
         self._warn_frozen_atoms()
 
@@ -208,6 +207,41 @@ class BatchedNVT(JobABC):
                 f"LEAK into each other (perturbing one system changes another). Use a "
                 f"local/decoupled batch calc (MACE / MACE-OFF / UMA / AIMNet2-decoupled), "
                 f"or run replicas one at a time via the single-system NVT.")
+
+    def _setup_pbc_gate(self, calc, atoms_list):
+        """PBC (Phase-1A) replacement for the old blanket isolated-only reject.
+
+        - all replicas isolated  -> default path, BIT-UNCHANGED (returns immediately,
+          never touches box_guard, never reads cell).
+        - all replicas periodic  -> require a PBC-capable batched backend
+          (``SUPPORTS_PBC``) and run the per-replica GROMACS-style box guard
+          (perpendicular width >= 2*r_max) so the calc's minimum-image neighbour build
+          is unique. The cell rides through ``calc.prepare(atoms_list)`` as
+          calc-internal state; the MD loop stays cell-agnostic and ``get_ef_gpu`` is
+          unchanged (NVT, fixed cell).
+        - mixed periodic/isolated in one batch -> rejected (Phase-1A, v1).
+
+        NVT only: NPT-PBC (stress/barostat) is Phase 2C and out of scope here.
+        """
+        pbc_flags = [bool(np.any(np.asarray(at.pbc))) for at in atoms_list]
+        if not any(pbc_flags):
+            return                                  # default isolated path unchanged
+        if not all(pbc_flags):
+            raise NotImplementedError(
+                "BatchedNVT (Phase-1A) requires a HOMOGENEOUS pbc state across the "
+                "batch: either every replica periodic or every replica isolated. A "
+                "mixed periodic/isolated batch is not supported.")
+        if not bool(getattr(calc, "SUPPORTS_PBC", False)):
+            raise NotImplementedError(
+                f"BatchedNVT got periodic replicas but calculator "
+                f"'{type(calc).__name__}' is non-periodic (SUPPORTS_PBC is False). "
+                f"PBC-capable batched backends: MACE-OFF (MaceOffBatchCalc), "
+                f"UMA-periodic (periodic task). AIMNet2-decoupled and MACE-POL are "
+                f"gas-phase by construction and reject pbc=True.")
+        box_mode = getattr(self.params, "box_check", "strict")
+        for b, at in enumerate(atoms_list):
+            check_box_size(at, calc=calc, mode=box_mode,
+                           context=f"BatchedNVT preflight replica {b}")
 
     def _reject_ceiling_features(self):
         p = self.params
