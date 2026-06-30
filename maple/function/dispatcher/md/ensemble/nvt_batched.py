@@ -49,6 +49,7 @@ from maple.function.utility import Molecules
 
 from ..thermostat.langevin import LangevinThermostat
 from ..thermostat.vrescale import VRescaleThermostat
+from ..thermostat.nose_hoover import NoseHooverChain
 from ..constraints import maybe_repartition_masses
 from ..anneal import make_anneal_fn
 from ..utils import (
@@ -76,9 +77,13 @@ class BatchedNVTParams:
     timestep:        float = 0.5            # fs
     steps:           int   = 500            # MD steps
     temperature:     float = 300.0          # K (canonical target)
-    thermostat:      str   = "langevin"     # 'langevin' | 'v-rescale'
+    thermostat:      str   = "langevin"     # 'langevin' | 'v-rescale' | 'nose-hoover'/'nhc'
     friction:        float = 0.01           # 1/fs   (Langevin)
-    tau_t:           float = 100.0          # fs     (v-rescale)
+    tau_t:           float = 100.0          # fs     (v-rescale; also NHC coupling τ)
+    # --- Nosé-Hoover chains (used only when thermostat='nose-hoover'/'nhc') ---
+    chain_length:    int   = 3              # M coupled thermostats (Martyna 1992/1996)
+    nhc_n_respa:     int   = 1              # RESPA sub-steps for the chain
+    nhc_n_yoshida:   int   = 3              # Suzuki-Yoshida order (1/3/5/7)
     anneal:          str   = ""             # T schedule (K); "" = constant T
     traj_every:      int   = 50             # steps between recorded frames
     log_every:       int   = 50             # steps between main-log lines
@@ -124,7 +129,7 @@ class BatchedNVTParams:
 class BatchedNVT(JobABC):
     """Batched canonical (NVT) MD over B replicas with one forward per step."""
 
-    _THERMOSTAT_CHOICES = {"langevin", "v-rescale"}
+    _THERMOSTAT_CHOICES = {"langevin", "v-rescale", "nose-hoover", "nhc"}
     # class names whose batch couples systems (per-system energies NOT independent)
     _COUPLED_CALC_NAMES = {"AIMNet2BatchCalc", "MACEPolBatchCalc"}
 
@@ -342,6 +347,8 @@ class BatchedNVT(JobABC):
             self._prepare_buffers()
             if self.params.thermostat == "v-rescale":
                 self._run_vrescale()
+            elif self.params.thermostat in ("nose-hoover", "nhc"):
+                self._run_nhc()
             else:
                 self._run_langevin()
             self._finalize()
@@ -372,6 +379,8 @@ class BatchedNVT(JobABC):
             self._prepare_buffers()
             if self.params.thermostat == "v-rescale":
                 self._run_vrescale()
+            elif self.params.thermostat in ("nose-hoover", "nhc"):
+                self._run_nhc()
             else:
                 self._run_langevin()
             self._finalize()
@@ -441,6 +450,14 @@ class BatchedNVT(JobABC):
                                         tau_t=self.params.tau_t,
                                         timestep=self.params.timestep,
                                         rng=self._rngs[b], n_dof=int(self.n_dof[b]))
+            elif self.params.thermostat in ("nose-hoover", "nhc"):
+                th = NoseHooverChain(at, temperature=self.params.temperature,
+                                     tau_t=self.params.tau_t,
+                                     timestep=self.params.timestep,
+                                     n_dof=int(self.n_dof[b]),
+                                     chain_length=self.params.chain_length,
+                                     n_respa=self.params.nhc_n_respa,
+                                     n_yoshida=self.params.nhc_n_yoshida)
             else:
                 th = LangevinThermostat(at, temperature=self.params.temperature,
                                         friction=self.params.friction,
@@ -497,6 +514,19 @@ class BatchedNVT(JobABC):
                 vb, _dw = self._thermostats[b].apply(vb)     # Bussi A7 (+ work)
             else:
                 vb = self._thermostats[b].apply(vb)          # LF-Middle OU
+            self._set_v_real(v, b, vb)
+        return v
+
+    def _apply_nhc_half(self, v):
+        """Per-replica Nosé-Hoover chains half-step (force-free, DETERMINISTIC).
+
+        Reuses B's authoritative ``NoseHooverChain`` class verbatim (each replica
+        owns its chain state in ``self._thermostats[b]``); the returned bath energy
+        is not recorded here.  Because NHC carries no RNG the per-replica delegation
+        is bit-exact against the single-system path (parity needs no stream match)."""
+        for b in range(self.B):
+            vb = self._v_real(v, b)
+            vb, _e_chain = self._thermostats[b].apply(vb)
             self._set_v_real(v, b, vb)
         return v
 
@@ -655,6 +685,38 @@ class BatchedNVT(JobABC):
             v, E, F = self._step_langevin(v, F, step)
         self.v = v
 
+    # ======================================================== Nosé-Hoover chains
+    def _step_nhc(self, v, F, step):
+        """ONE Nosé-Hoover chains VV step (factored out so REMD can call it per
+        step). Symmetric NHC-VV split (Martyna 1996): NHC(dt/2) -> [B1 half kick ->
+        A full drift -> ONE forward -> B2 half kick] -> NHC(dt/2). The inner VV core
+        is byte-identical to the v-rescale step (and to the single-system
+        ``integrator.step``: B1 uses the cached F, B2 the fresh F), so wrapping it in
+        two deterministic NHC halves gives BIT-EXACT single<->batched parity.
+        Returns (v, E, F)."""
+        self._set_anneal_T(step)
+        v = self._apply_nhc_half(v)                       # NHC half (dt/2)
+        v = v + 0.5 * F / self.mass * self.dt_au          # B1 half kick (cached F)
+        self._displace(v, 1.0)                            # A full drift
+        E, F = self._forces_au()                          # ONE forward
+        v = v + 0.5 * F / self.mass * self.dt_au          # B2 half kick (fresh F)
+        v = self._apply_nhc_half(v)                       # NHC half (dt/2)
+        v = self._apply_projection(v, step)               # per-replica COM/angular
+        self._record(v, E, step)                          # T from COM-subtracted KE
+        self._steps_done = step
+        return v, E, F
+
+    def _run_nhc(self):
+        """Deterministic Nosé-Hoover chains (Martyna 1992/1996). Mirrors
+        nvt._run_simulation NHC branch: NHC(dt/2) -> VV(dt) -> NHC(dt/2) per step.
+        NHC is force-free (0 extra forwards, SAME 1-forward/step as v-rescale) and
+        deterministic (no RNG) -> single<->batched parity is exact."""
+        v = self.v
+        E, F = self._forces_au()                              # cache F at t=0
+        for step in range(1, self.params.steps + 1):
+            v, E, F = self._step_nhc(v, F, step)
+        self.v = v
+
     # ----------------------------------------------------------------- finalize
     def _finalize(self):
         torch = self._torch
@@ -700,6 +762,9 @@ class BatchedNVT(JobABC):
             lines.append(f"Friction:        {p.friction:.4f} 1/fs\n")
         else:
             lines.append(f"tau_t:           {p.tau_t:.1f} fs\n")
+        if p.thermostat in ("nose-hoover", "nhc"):
+            lines.append(f"NHC chain:       M={p.chain_length} "
+                         f"(RESPA={p.nhc_n_respa}, SY={p.nhc_n_yoshida})\n")
         lines.append(f"Remove COM ev.:  {p.remove_com_every} steps (runtime, per replica)\n")
         prec = str(p.precision or "").strip().lower() or "fp64(default)"
         lines.append(f"Precision:       {prec}  (calc dtype={self.dtype})\n")

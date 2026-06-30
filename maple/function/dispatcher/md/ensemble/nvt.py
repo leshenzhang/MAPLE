@@ -25,6 +25,7 @@ from maple.function.timer import timer
 from ..integrator.velocity_verlet import VelocityVerlet
 from ..thermostat.langevin import LangevinThermostat
 from ..thermostat.vrescale import VRescaleThermostat
+from ..thermostat.nose_hoover import NoseHooverChain
 from ..utils import (
     VELOCITY_REPR_LFMIDDLE_CARRIED,
     VELOCITY_REPR_STANDARD,
@@ -172,6 +173,21 @@ class NVTParams:
     tau_t:           float = 100.0        # fs  [Bussi 2007; GROMACS Manual 2024; LAMMPS fix nvt]
 
     # ------------------------------------------------------------------
+    # Nosé-Hoover chains parameters (used only when thermostat='nose-hoover'/'nhc').
+    # Deterministic, time-reversible canonical map (Martyna 1992/1996).  τ is taken
+    # from tau_t above (GROMACS coupling-period convention; sets Q = N_f kT τ²).
+    #   chain_length:  number of coupled thermostats M (>=3 restores ergodicity for
+    #                  stiff/few-mode systems where a single NH fails). Default 3.
+    #   nhc_n_respa:   RESPA sub-steps for the (stiff) chain integration. Default 1.
+    #   nhc_n_yoshida: Suzuki-Yoshida order (1/3/5/7) for the chain integration. Default 3.
+    # Refs: Martyna, Klein & Tuckerman (1992) JCP 97, 2635;
+    #       Martyna, Tuckerman, Tobias & Klein (1996) Mol. Phys. 87, 1117.
+    # ------------------------------------------------------------------
+    chain_length:    int   = 3            # M (Nosé-Hoover chains)
+    nhc_n_respa:     int   = 1            # RESPA sub-steps for the chain
+    nhc_n_yoshida:   int   = 3            # Suzuki-Yoshida order (1/3/5/7)
+
+    # ------------------------------------------------------------------
     # Output frequencies
     #
     # GROMACS/AMBER defaults (nstxout=500×2fs=1ps) target classical FF
@@ -252,7 +268,7 @@ class NVT(JobABC):
     Integrates with the MAPLE dispatcher via JobABC.
     """
 
-    _THERMOSTAT_CHOICES = {'langevin', 'v-rescale'}
+    _THERMOSTAT_CHOICES = {'langevin', 'v-rescale', 'nose-hoover', 'nhc'}
 
     def __init__(self, output: str, atoms: Atoms, paras: Optional[dict] = None):
         super().__init__(output)
@@ -332,6 +348,17 @@ class NVT(JobABC):
                 friction=self.params.friction,
                 timestep=self.params.timestep,
                 rng=self._rng,
+            )
+        elif self.params.thermostat in ('nose-hoover', 'nhc'):
+            self.thermostat = NoseHooverChain(
+                atoms,
+                temperature=self.params.temperature,
+                tau_t=self.params.tau_t,
+                timestep=self.params.timestep,
+                n_dof=self._runtime_n_dof,
+                chain_length=self.params.chain_length,
+                n_respa=self.params.nhc_n_respa,
+                n_yoshida=self.params.nhc_n_yoshida,
             )
         else:  # v-rescale
             self.thermostat = VRescaleThermostat(
@@ -491,6 +518,11 @@ class NVT(JobABC):
             lines.append(f"Friction (γ):       {self.params.friction:.4f} 1/fs\n")
         else:
             lines.append(f"τ_T:                {self.params.tau_t:.1f} fs\n")
+        if self.params.thermostat in ('nose-hoover', 'nhc'):
+            lines.append(
+                f"NHC chain length:   {self.params.chain_length} "
+                f"(RESPA={self.params.nhc_n_respa}, Suzuki-Yoshida={self.params.nhc_n_yoshida})\n"
+            )
         lines += [
             f"\nOutput frequencies:\n",
             f"  Log every:        {self.params.log_every} steps\n",
@@ -583,6 +615,7 @@ class NVT(JobABC):
             is_langevin and velocity_representation == VELOCITY_REPR_LFMIDDLE_CARRIED
         )
         is_vrescale = self.params.thermostat == 'v-rescale'
+        is_nhc = self.params.thermostat in ('nose-hoover', 'nhc')
 
         self.logger.start_simulation(
             ensemble='nvt',
@@ -595,7 +628,7 @@ class NVT(JobABC):
             n_dof=self._runtime_n_dof,
             dof_description=self._runtime_dof_description,
             write_sync_thermo=write_sync_thermo,
-            write_conserved_energy=is_vrescale,
+            write_conserved_energy=is_vrescale or is_nhc,
         )
         self.logger.log_main([
             f"\nStarting NVT simulation ({self.params.thermostat})...\n\n"
@@ -623,6 +656,9 @@ class NVT(JobABC):
         # runtime motion projection is allowed to coexist with V-rescale.
         is_vrescale = self.params.thermostat == 'v-rescale'
         w_bath = 0.0
+        # NHC conserved-quantity bookkeeping: H~ = H_phys + E_chain, where E_chain
+        # is the chain bath energy (state function returned by NoseHooverChain.apply).
+        e_chain = 0.0
 
         anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
@@ -630,7 +666,16 @@ class NVT(JobABC):
             if anneal_fn is not None:
                 self.thermostat.set_temperature(anneal_fn(step))
 
-            if is_vrescale:
+            if is_nhc:
+                # Symmetric NHC-VV split (Martyna 1996): half-step thermostat ->
+                # full velocity-Verlet step -> half-step thermostat.  Each apply()
+                # advances the chain by dt/2; the pair realises exp(iL_NHC dt/2)
+                # exp(iL_VV dt) exp(iL_NHC dt/2).  e_chain after the trailing half
+                # is the end-of-step chain contribution to H~.
+                v, _e0 = self.thermostat.apply(v)
+                v, forces = integrator.step(v, forces)
+                v, e_chain = self.thermostat.apply(v)
+            elif is_vrescale:
                 v, forces = integrator.step(v, forces)
                 v, delta_w = self.thermostat.apply(v)
                 w_bath += delta_w
@@ -650,7 +695,7 @@ class NVT(JobABC):
                 remove_com_every=self.params.remove_com_every,
                 remove_angular_every=self.params.remove_angular_every,
             )
-            if is_vrescale:
+            if is_vrescale or is_nhc:
                 w_bath += delta_w_proj
 
             abs_step         = step_offset + step
@@ -677,8 +722,15 @@ class NVT(JobABC):
                 kinetic_energy_sync = calculate_kinetic_energy(self.atoms, v_sync)
                 total_energy_sync = kinetic_energy_sync + potential_energy
 
-            # Conserved energy: H̃ = H − Σ ΔW (V-rescale only)
-            conserved = (kinetic_energy + potential_energy - w_bath) if is_vrescale else None
+            # Conserved energy:
+            #   V-rescale: H̃ = H − Σ ΔW (thermostat + projection work ledger)
+            #   NHC:       H̃ = H + E_chain − Σ ΔW_proj (chain state + projection ledger)
+            if is_vrescale:
+                conserved = kinetic_energy + potential_energy - w_bath
+            elif is_nhc:
+                conserved = kinetic_energy + potential_energy + e_chain - w_bath
+            else:
+                conserved = None
 
             self.logger.log_step(
                 step=abs_step,
