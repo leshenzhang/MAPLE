@@ -115,8 +115,16 @@ class TransitionState(JobABC):
                 else:
                     raise ValueError('For AutoNEB method, you should provide a Molecules object or a list of structures.')
 
+            elif self.method == 'geodesic':
+                # Training-free geodesic TS-guess: build the geodesic path R->P in
+                # the Morse-scaled interatomic-distance metric (optionally FIRE-relax
+                # + climb on the MLIP) and take the highest-energy node as the TS
+                # guess. Output feeds straight into BatchPRFO. Accepts a Molecules
+                # ([R, P]) or a list [R, P].
+                self._run_geodesic_guess()
+
             else:
-                raise ValueError(f'Method {self.method} not recognized. Available methods are: prfo, neb, string, dimer, autoneb.')
+                raise ValueError(f'Method {self.method} not recognized. Available methods are: prfo, neb, string, dimer, autoneb, geodesic.')
 
     # ==================================================================
     # OPT-IN GPU-batched saddle searches (Task: ai-maple-gpu dispatch)
@@ -135,6 +143,35 @@ class TransitionState(JobABC):
         mols = Molecules(atoms_list)
         mols.calc = calc
         return mols, atoms_list
+
+    def _run_geodesic_guess(self):
+        """Training-free geodesic TS-guess generation. A single reaction
+        (Molecules([R,P]) / list [R,P]) writes one TS guess; for a batch of
+        reactions call GeodesicTSGuess.run_multiband directly. The guess is a
+        valid input to the 'prfo' method (BatchPRFO) for exact refinement."""
+        from .algorithm import GeodesicTSGuess
+        from maple.function.utility import Molecules
+        if isinstance(self.atoms, Molecules):
+            mol_in = self.atoms
+        elif isinstance(self.atoms, list):
+            if len(self.atoms) < 2:
+                raise ValueError('For geodesic method, provide reactant + product (>=2 structures).')
+            mol_in = Molecules(self.atoms)
+        else:
+            raise ValueError('For geodesic method, provide a Molecules object or a list [reactant, product].')
+        # Attach a batched calc if one is not already carried (enables MLIP HEI
+        # picking / FIRE relax; without it a geometric midpoint node is returned).
+        if getattr(mol_in, 'calc', None) is None:
+            try:
+                from ..dispatcher import resolve_batched_calc
+                attached = getattr(mol_in.multiatoms[0], 'calc', None)
+                mol_in.calc = resolve_batched_calc(self.params, mol_in.multiatoms,
+                                                   attached_calc=attached)
+            except Exception:
+                pass
+        geo = GeodesicTSGuess(output=self.output, atoms_or_molecules=mol_in,
+                              paras=self.params)
+        geo.run()
 
     def _run_batched_prfo(self):
         """Batched RS-PRFO saddle search over B TS guesses (BatchPRFO). Robust
