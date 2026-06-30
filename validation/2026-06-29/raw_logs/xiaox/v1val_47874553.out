@@ -1,0 +1,65 @@
+== host ==
+gpu108-23-r
+NVIDIA A100-SXM4-80GB, 81920 MiB
+torch 2.11.0+cu128 cuda 12.8
+
+########## V1 MAIN (val tree: opts 1,2,3,4,5,7,8) ##########
+=== V1 main on /ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE | device=cuda torch=2.11.0+cu128 N=8 ===
+=== GPU: NVIDIA A100-SXM4-80GB ===
+V1ROW|{"opt": "1_uma_ef_batch", "parity": "max|dE|=1.31e-08Ha max|dF|=3.75e-08Ha/A", "noise_floor": "1e-6", "benefit": "0.51x (774ms serial->1515ms batch, B=8)", "default_safe": "yes (batch is the only ef path; identical to single)", "verdict": "ISSUE: parity max|dE|=1.31e-08Ha max|dF|=3.75e-08Ha/A or speed 0.51<1", "extra": ""}
+V1ROW|{"opt": "2_uma_efh_batch", "parity": "max|dH|=1.59e-05 eig max|d|=1.15e-05 Ha/A^2", "noise_floor": "1e-5", "benefit": "1.06x (3106ms->2918ms, B=4)", "default_safe": "yes", "verdict": "ISSUE: parity max|dH|=1.59e-05 eig max|d|=1.15e-05 Ha/A^2 speed 1.06", "extra": ""}
+V1ROW|{"opt": "3_uma_hvp_fd", "parity": "cos(Hn_fd, H@n)=0.99998 rel_err=7.68e-03", "noise_floor": "cos>0.999 / rel<5e-2 (O(delta) trunc)", "benefit": "matrix-free HVP (no dense H build); enables iterative TS eigensolver", "default_safe": "opt-in (Dimer/iterative); dense FD stays default", "verdict": "POSITIVE+SAFE", "extra": ""}
+V1ROW|{"opt": "4_partial_hessian", "parity": "movable-block(5/10) vs full-block max|dH|=8.30e-06 Ha/A^2", "noise_floor": "1e-5", "benefit": "1.68x fewer forwards (5/10 atoms moved)", "default_safe": "opt-in (movable_masks=None=full default)", "verdict": "POSITIVE+SAFE", "extra": ""}
+V1ROW|{"opt": "5_fast_inference_acoff", "parity": "max|dE|=1.31e-08Ha max|dF|=2.63e-08Ha/A", "noise_floor": "1e-5 (graph/fusion noise)", "benefit": "1.49x forward (159.6->107.1ms)", "default_safe": "yes (default fast_inference=False = eager oracle CONFIRMED)", "verdict": "POSITIVE+SAFE", "extra": ""}
+V1ROW|{"opt": "7_aimnet_decoupled", "parity": "ERR", "noise_floor": "-", "benefit": "-", "default_safe": "?", "verdict": "ISSUE: ModuleNotFoundError: No module named 'aimnet2calc'", "extra": "ModuleNotFoundError: No module named 'aimnet2calc'"}
+[ERR] 7_aimnet_decoupled: Traceback (most recent call last):
+  File "/ibex/user/xiaox/zls/ai-maple-gpu/bench/val_v1/v1_main.py", line 36, in guard
+    fn()
+  File "/ibex/user/xiaox/zls/ai-maple-gpu/bench/val_v1/v1_main.py", line 197, in opt7_aimnet_decoupled
+    cd = AIMNet2DecoupledBatchCalc(f"{MDIR}/aimnet2.pt", device=DEV, dtype=torch.float32)
+  File "/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE/maple/function/calculator/aimnet/_aimnet2_decoupled_batch_calculator.py", line 70, in __init__
+    from aimnet2calc import AIMNet2Calculator  # lazy: keep maple import light
+ModuleNotFoundError: No module named 'aimnet2calc'
+
+V1ROW|{"opt": "8a_ani_batch", "parity": "SKIP", "noise_floor": "-", "benefit": "-", "default_safe": "n/a", "verdict": "SKIP: torchani not installed (ModuleNotFoundError)", "extra": ""}
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+V1ROW|{"opt": "8_mace_ani", "parity": "ERR", "noise_floor": "-", "benefit": "-", "default_safe": "?", "verdict": "ISSUE: RuntimeError: Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)", "extra": "RuntimeError: Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)"}
+[ERR] 8_mace_ani: Traceback (most recent call last):
+  File "/ibex/user/xiaox/zls/ai-maple-gpu/bench/val_v1/v1_main.py", line 36, in guard
+    fn()
+  File "/ibex/user/xiaox/zls/ai-maple-gpu/bench/val_v1/v1_main.py", line 242, in opt8_mace_ani
+    cb.prepare(mols); Eb, Fb = cb.get_ef_gpu()
+  File "/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE/maple/function/calculator/mace/_mace_batch_calculator.py", line 128, in prepare
+    raise RuntimeError(
+RuntimeError: Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)
+
+
+=== V1_MAIN ROWS ===
+  1_uma_ef_batch           | ISSUE: parity max|dE|=1.31e-08Ha max|dF|=3.75e-08Ha/A or speed 0.51<1 | max|dE|=1.31e-08Ha max|dF|=3.75e-08Ha/A
+  2_uma_efh_batch          | ISSUE: parity max|dH|=1.59e-05 eig max|d|=1.15e-05 Ha/A^2 speed 1.06 | max|dH|=1.59e-05 eig max|d|=1.15e-05 Ha/A^2
+  3_uma_hvp_fd             | POSITIVE+SAFE  | cos(Hn_fd, H@n)=0.99998 rel_err=7.68e-03
+  4_partial_hessian        | POSITIVE+SAFE  | movable-block(5/10) vs full-block max|dH|=8.30e-06 Ha/A^2
+  5_fast_inference_acoff   | POSITIVE+SAFE  | max|dE|=1.31e-08Ha max|dF|=2.63e-08Ha/A
+  7_aimnet_decoupled       | ISSUE: ModuleNotFoundError: No module named 'aimnet2calc' | ERR
+  8a_ani_batch             | SKIP: torchani not installed (ModuleNotFoundError) | SKIP
+  8_mace_ani               | ISSUE: RuntimeError: Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.) | ERR
+V1_MAIN_DONE
+== main rc=0 ==
+
+########## OPT6 cross-tree device-resident parity ##########
+---- dump VAL (device-resident) ----
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_moe.py:118: UserWarning: index_reduce_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:160.)
+  composition = composition_by_atom.new_zeros(
+[dump] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE saved E(8,) F(8, 33) H(30, 30) -> /ibex/user/xiaox/zls/ai-maple-gpu/bench/val_v1/ef_val.npz
+DUMP_DONE
+---- dump CANON (cpu-clone+H2D) ----
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_moe.py:118: UserWarning: index_reduce_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:160.)
+  composition = composition_by_atom.new_zeros(
+[dump] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/MAPLE saved E(8,) F(8, 33) H(30, 30) -> /ibex/user/xiaox/zls/ai-maple-gpu/bench/val_v1/ef_canon.npz
+DUMP_DONE
+---- compare ----
+V1ROW|{"opt": "6_topology_device_resident", "parity": "max|dE|=1.31e-08Ha max|dF|=3.23e-08Ha/A max|dH|=6.57e-06Ha/A^2 (byteE=False byteF=False)", "noise_floor": "1e-6 (ideally byte-identical)", "benefit": "removes per-forward CPU-collate+H2D (topology moved to device once in prepare)", "default_safe": "yes (only ef path; same numerics)", "verdict": "POSITIVE+SAFE"}
+opt6 verdict: POSITIVE+SAFE | max|dE|=1.31e-08Ha max|dF|=3.23e-08Ha/A max|dH|=6.57e-06Ha/A^2 (byteE=False byteF=False)
+COMPARE_DONE
+== opt6 rc=0 ==
+V1_SBATCH_DONE

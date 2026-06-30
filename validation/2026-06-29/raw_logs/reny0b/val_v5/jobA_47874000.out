@@ -1,0 +1,154 @@
+== host ==
+gpu202-16-l
+NVIDIA A100-SXM4-80GB, 81920 MiB
+
+################ A1: validate_all (merge regression: imports/partial-Hessian-block/BPRFO/NEB/Dimer) ################
+=== validate_all on /ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE | device=cuda torch=2.11.0+cu128 ===
+[PASS ] 0_imports                    ( 14.9s)  BatchPRFO/NEB/Dimer/BatchDimer/initial_hessian/BatchLBFGS/SinglePoint/LQA/LQABatch/calc all import
+[PASS ] 1_aimnet_couples_D28         (  2.5s)  E(batch3)-E(single)=1.57e-01 Ha => charge-eq COUPLES (D-28 expected; use UMA for batch)
+[PASS ] 2_aimnet_hessian_parity      (  2.0s)  H max|diff|=4.77e-07 eig max|diff|=6.02e-07
+[PASS ] 3_uma_decouple               (  7.2s)  perturb mol0 0.1A -> max|dE_others|=1.31e-08 Ha (decoupled)
+[PASS ] 4_uma_efh_numerical          (  1.9s)  reactant Hessian eig finite; n_neg(<-1e-3)=0 (minimum~0-1)
+[FAIL ] 5_bprfo_legacy               ( 47.1s)  legacy: converged 2/4, median TS-RMSD=0.070A
+[PASS ] 6_bprfo_iterative            (154.7s)  iterative: converged 3/4, median TS-RMSD=0.081A
+[PASS ] 7_bprfo_lindh_nw             ( 26.4s)  lindh+tsinject+nw+modeguard: converged 4/4, median TS-RMSD=0.231A
+[PASS ] 8_neb_multiband_parity       ( 10.9s)  2 identical bands base_case: |dBarrier|=6.92e-07 Ha (batch determinism)
+[PASS ] 9_neb_dyneb                  ( 10.4s)  dyneb+climbing barrier=2.64 eV, forwards=98
+[PASS ] 10_batchdimer                ( 52.5s)  BatchDimer median TS-RMSD=0.018A (saddle search ran)
+[PASS ] 11_partial_hessian           (  0.8s)  partial(5/10 atoms) movable-block vs full-block max|dH|=5.34e-06 Ha/A^2 (exact constrained-PES block)
+/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE/maple/function/calculator/uma/_uma_batch_calculator.py:1061: RuntimeWarning: UMABatchCalc autograd mode: the autograd Hessian/HVP is self-consistent but the eSCN-MoE backbone's custom ops give an INCOMPLETE double-backward (~1e-2 Ha/A^2, delta-independent, vs numerical FD). Use hessian_mode='numerical' (default) for an accurate UMA Hessian. See module docstring ACCURACY CAVEAT.
+  self._warn_autograd_once()
+[PASS ] 12_autodiff_hessian          (  3.6s)  autograd Hessian runs, finite=True, |AD-FD|max=1.05e-02 Ha/A^2 (UMA eSCN known ~1e-2 => FD default)
+
+=== SUMMARY: 12/13 PASS ===
+  !! 5_bprfo_legacy: FAIL legacy: converged 2/4, median TS-RMSD=0.070A
+VALIDATE_ALL_DONE
+A1 rc=0
+
+################ A2: PHVA / partial-Hessian correctness (#5) ################
+[task1] record idx=17 formula=C3H7N3O natoms=14 state=reactant
+[task1] Z = [6, 7, 6, 7, 6, 8, 7, 1, 1, 1, 1, 1, 1, 1]
+[task1] full Hessian: shape=(42, 42) wall=1.01s  E=-358.049746 Ha
+
+[task1:half_first] movable=7/14 atoms (DOFs=21, #FD-forwards=42)
+[task1:half_first]   movable indices = [0, 1, 2, 3, 4, 5, 6]
+[task1:half_first]   wall partial=0.39s
+[task1:half_first]   (G1) max|H_part_block - H_full_block| = 1.133e-05 Ha/A^2  (gate <1e-4)
+[task1:half_first]   (G2) max|H_part[frozen rows]|         = 0.000e+00 Ha/A^2  (gate <1e-6)
+[task1:half_first]   (G3) max|freq_part - freq_full_block| = 2.114e-03 cm^-1   (gate <1e-2)
+[task1:half_first]   PHVA active-subspace freqs (cm^-1, partial):     91.1    166.6    214.4    290.7    306.0    424.3    546.0    599.5    670.0    795.6    822.4   1044.8   1088.2   1133.3   1171.1   1263.7   1292.6   1414.5   1501.4   1724.4   1756.5
+[task1:half_first]   full sub-block        freqs (cm^-1)        :     91.1    166.6    214.4    290.7    306.0    424.3    546.0    599.5    670.0    795.6    822.4   1044.8   1088.2   1133.3   1171.1   1263.7   1292.6   1414.5   1501.4   1724.4   1756.5
+[task1:half_first]   ==> PASS
+
+[task1:scattered] movable=7/14 atoms (DOFs=21, #FD-forwards=42)
+[task1:scattered]   movable indices = [0, 2, 4, 6, 8, 10, 12]
+[task1:scattered]   wall partial=0.38s
+[task1:scattered]   (G1) max|H_part_block - H_full_block| = 1.123e-05 Ha/A^2  (gate <1e-4)
+[task1:scattered]   (G2) max|H_part[frozen rows]|         = 0.000e+00 Ha/A^2  (gate <1e-6)
+[task1:scattered]   (G3) max|freq_part - freq_full_block| = 3.397e-03 cm^-1   (gate <1e-2)
+[task1:scattered]   PHVA active-subspace freqs (cm^-1, partial):    132.8    469.9    598.6    640.2    700.6    728.9    789.0    854.1    905.5    941.2   1053.3   1216.9   1248.3   1298.8   1305.7   1458.7   1530.7   1590.6   2989.4   3452.2   3591.1
+[task1:scattered]   full sub-block        freqs (cm^-1)        :    132.8    469.9    598.6    640.2    700.6    728.9    789.0    854.1    905.5    941.2   1053.3   1216.9   1248.3   1298.8   1305.7   1458.7   1530.7   1590.6   2989.4   3452.2   3591.1
+[task1:scattered]   ==> PASS
+
+[task1:core6] movable=6/14 atoms (DOFs=18, #FD-forwards=36)
+[task1:core6]   movable indices = [0, 1, 2, 3, 4, 5]
+[task1:core6]   wall partial=0.35s
+[task1:core6]   (G1) max|H_part_block - H_full_block| = 7.050e-06 Ha/A^2  (gate <1e-4)
+[task1:core6]   (G2) max|H_part[frozen rows]|         = 0.000e+00 Ha/A^2  (gate <1e-6)
+[task1:core6]   (G3) max|freq_part - freq_full_block| = 1.970e-03 cm^-1   (gate <1e-2)
+[task1:core6]   PHVA active-subspace freqs (cm^-1, partial):     97.7    216.5    288.4    318.7    508.6    555.0    590.3    701.4    812.8    893.8   1088.2   1133.3   1148.1   1252.2   1270.2   1452.9   1721.1   1741.9
+[task1:core6]   full sub-block        freqs (cm^-1)        :     97.7    216.5    288.4    318.7    508.6    555.0    590.3    701.4    812.8    893.8   1088.2   1133.3   1148.1   1252.2   1270.2   1452.9   1721.1   1741.9
+[task1:core6]   ==> PASS
+
+[task1] FULL Hessian all-atom mass-weighted freqs (cm^-1):
+           -0.8    -0.6     0.1    25.9    42.2    65.0   110.9   213.3   232.3   238.5   332.1   392.9   406.3   426.8   507.7   570.7   615.2   645.6   688.0   817.8   829.0  1021.6  1108.0  1108.4  1127.9  1209.7  1306.6  1421.8  1440.7  1488.2  1501.9  1591.7  1608.1  1733.8  1770.0  2955.7  3000.9  3092.5  3535.5  3545.8  3674.1  3693.1
+[task1] n_imag(<-1 cm^-1)=0  (reactant minimum -> expect ~0-1)
+
+[task1] OVERALL CORRECTNESS GATE: PASS  {'half_first': True, 'scattered': True, 'core6': True}
+TASK1_DONE
+A2 rc=0
+
+################ A3: IRC oracle (canonical per-iter) ################
+[oracle] N=6 efh=103 ef=0 valid=[True, True, True, True, True, True]
+  [0] valid=True eig=-0.4847 fwd_steps=46 bwd_steps=51 Ets=-392.659794
+  [1] valid=True eig=-0.0958 fwd_steps=51 bwd_steps=51 Ets=-355.468713
+  [2] valid=True eig=-0.0286 fwd_steps=51 bwd_steps=51 Ets=-226.075975
+  [3] valid=True eig=-0.0936 fwd_steps=51 bwd_steps=51 Ets=-301.311069
+  [4] valid=True eig=-0.0065 fwd_steps=4 bwd_steps=51 Ets=-301.390935
+  [5] valid=True eig=-0.0061 fwd_steps=51 bwd_steps=51 Ets=-301.284212
+IRC_ORACLE_DONE
+A3 rc=0
+
+################ A4: IRC sandbox (merge every-64 vs oracle #2 + batch-vs-single #1) ################
+[sandbox] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE  N=6
+
+[merge full-batch] efh=103 ef=0 valid=[True, True, True, True, True, True]
+[merge B=1 each]   efh(sum)=566 per-struct efh=[98, 103, 103, 103, 56, 103]
+
+===== (#2) every-64 sync vs canonical per-iter ORACLE =====
+  efh/ef counts:  oracle(efh=103,ef=0) merge(efh=103,ef=0)  identical=True
+  valid flags identical = True
+  max|dE_path| = 4.731e-07 Ha   max|dX_endpoint| = 9.957e-06 A
+  BYTE-IDENTICAL (every-64 == per-iter) = False
+
+===== (#1) batched LQA == single-structure (B=1) LQA =====
+  valid flags identical (batch vs B=1) = True
+  per-structure efh counts: batch-implied=103 (forward+backward share the batch) ; B=1 efh each=[98, 103, 103, 103, 56, 103]
+  max|dE_path| (batch vs B=1) = 4.293e-07 Ha
+  max|dX_endpoint|            = 2.098e-05 A
+  PARITY <= noise(1e-05) : PASS
+
+================ IRC SUMMARY ================
+#2 every-64 byte-identical to per-iter oracle = False (max|dE|=4.7e-07 max|dX|=1.0e-05, valid=True, counts=True)
+#1 batched==single  max|dE|=4.3e-07 Ha max|dX|=2.1e-05 A valid=True
+IRC_SANDBOX_DONE
+A4 rc=0
+
+################ A5: batched 2D PES scan parity (#3) ################
+torch 2.11.0+cu128 cuda True NVIDIA A100-SXM4-80GB
+molecule: C2H3N3O2 natoms 10 symbols ['N', 'C', 'N', 'O', 'C', 'O', 'N', 'H', 'H', 'H']
+initial CVs: d(5-6)=1.1999  d(7-10)=1.0071
+building batched UMA calc ...
+building serial UMA calc ...
+
+================================================================
+MODE = rigid
+================================================================
+[serial_rigid] wall=15.77s  points=36
+[batched_wavefront_rigid] wall=0.49s  points=36
+matched points: 36
+ENERGY parity : max|dE|=3.510e-08 Ha  mean|dE|=9.725e-09 Ha
+GEOMETRY id   : max|dx|=0.000e+00 A
+RIGID PARITY PASS (bound max|dE| < 1e-5 Ha)
+SPEEDUP [rigid]: serial=15.77s batched=0.49s => 32.44x
+
+================================================================
+MODE = relaxed
+================================================================
+[serial_relaxed] wall=27.20s  points=36
+[batched_wavefront_relaxed] wall=6.36s  points=36
+[wavefront] matched points: 36
+[wavefront] PES energy   : max|dE|=1.034e-04 Ha mean=4.179e-05 Ha
+[wavefront] RMSD (raw)   : max=2.014e-02 mean=1.217e-02 A
+[wavefront] RMSD (Kabsch): max=1.995e-02 mean=1.213e-02 A
+[wavefront] CV fidelity  : batched max_err=1.554e-05 A
+[wavefront] per-point    : 4/36 strict-match (dE<1e-4 & RMSD<1e-3); 35/36 accept (dE<1e-4 OR RMSD<1e-3 OR <=min)
+[wavefront] RELAXED PARITY PARTIAL(35/36)
+SPEEDUP [relaxed/wavefront]: serial=27.20s batched=6.36s => 4.28x
+[batched_independent_relaxed] wall=4.10s  points=36
+[independent] matched points: 36
+[independent] PES energy   : max|dE|=8.631e-05 Ha mean=3.725e-05 Ha
+[independent] RMSD (raw)   : max=3.933e-02 mean=2.144e-02 A
+[independent] RMSD (Kabsch): max=2.540e-02 mean=1.415e-02 A
+[independent] CV fidelity  : batched max_err=1.554e-05 A
+[independent] per-point    : 1/36 strict-match (dE<1e-4 & RMSD<1e-3); 36/36 accept (dE<1e-4 OR RMSD<1e-3 OR <=min)
+[independent] RELAXED PARITY PASS
+SPEEDUP [relaxed/independent]: serial=27.20s batched=4.10s => 6.63x
+
+=== SUMMARY ===
+rigid {'ws': 15.765356306917965, 'wb': 0.48598435427993536, 'maxdE': 3.51000153386849e-08, 'maxdx': 0.0, 'verdict': 'PASS'}
+relaxed_wavefront {'ws': 27.204499536193907, 'wb': 6.357157424092293, 'maxdE': 0.0001033619999475377, 'rmsd_kab_max': 0.019952385343668493, 'naccept': 35, 'npts': 36, 'verdict': 'PARTIAL(35/36)'}
+relaxed_independent {'ws': 27.204499536193907, 'wb': 4.100430371239781, 'maxdE': 8.630730002323617e-05, 'rmsd_kab_max': 0.025397141592441535, 'naccept': 36, 'npts': 36, 'verdict': 'PASS'}
+DONE
+A5 rc=0
+V5_JOBA_DONE

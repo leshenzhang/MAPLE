@@ -1,0 +1,65 @@
+== host ==
+gpu108-16-l
+NVIDIA A100-SXM4-80GB, 81920 MiB
+torch 2.11.0+cu128 cuda 12.8
+
+############# BATCHED-vs-SINGLE OPTIMIZER PARITY MATRIX (merge_all) #############
+=== parity_OPT on /ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE | dev=cuda torch=2.11.0+cu128 ===
+recs: [54, 99, 2, 22] natoms: [7, 8, 9, 9]
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_md.py:194: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
+
+[FLOOR] calc-path max|dE|=1.75e-08 Ha  max|dF|=1.70e-08 Ha/A -> ETOL=1.0e-05 Ha GEOM_FLOOR=1.0e-05 A
+
+[PASS ] opt_LBFGS                  final max|dE|=4.29e-06Ha RMSD=1.03e-03A (same min) | step1 max|dx|=9.02e-03A [step1>tol:convention]
+[FAIL ] opt_SDCG                   final max|dE|=1.37e-04Ha RMSD=6.55e-03A (same min) | step1 max|dx|=1.29e-08A
+[FAIL ] opt_SD                     final max|dE|=9.27e-04Ha RMSD=1.08e-02A (same min) | step1 max|dx|=1.29e-08A
+[PASS ] opt_RFO                    step1 max|dx|=5.90e-06A | final max|dE|=1.75e-08Ha RMSD=5.92e-07A
+[PASS ] opt_DIIS                   conv-equiv vs SDCG min: max|dE|=6.58e-05Ha RMSD=1.29e-02A (no standalone single-DIIS; energy=same min)
+[PASS ] get_efh_vs_single_H        max|dH|=1.14e-05 Ha/A^2 (both FD d=2e-3)
+[PASS ] get_efh_batch_iso          B-batched vs B=1 Hessian max|dH|=1.37e-05 Ha/A^2 (isolation)
+
+=== PARITY (OPTIMIZERS) SUMMARY ===
+FLOOR: dE=1.75e-08Ha dF=1.70e-08Ha/A  (5/7 PASS)
+  PASS  opt_LBFGS                  final max|dE|=4.29e-06Ha RMSD=1.03e-03A (same min) | step1 max|dx|=9.02e-03A [step1>tol:convention]
+  FAIL  opt_SDCG                   final max|dE|=1.37e-04Ha RMSD=6.55e-03A (same min) | step1 max|dx|=1.29e-08A
+  FAIL  opt_SD                     final max|dE|=9.27e-04Ha RMSD=1.08e-02A (same min) | step1 max|dx|=1.29e-08A
+  PASS  opt_RFO                    step1 max|dx|=5.90e-06A | final max|dE|=1.75e-08Ha RMSD=5.92e-07A
+  PASS  opt_DIIS                   conv-equiv vs SDCG min: max|dE|=6.58e-05Ha RMSD=1.29e-02A (no standalone single-DIIS; energy=same min)
+  PASS  get_efh_vs_single_H        max|dH|=1.14e-05 Ha/A^2 (both FD d=2e-3)
+  PASS  get_efh_batch_iso          B-batched vs B=1 Hessian max|dH|=1.37e-05 Ha/A^2 (isolation)
+PARITY_OPT_DONE
+MATRIX_RC=0
+
+############# POINT 6: BatchRFO nmax-fix (canon vs merge: call-count + byte-identical) #############
+===== nmax ROLE=canon (canonical batch_rfo: throwaway forward) =====
+[canon] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/MAPLE
+[canon] N=6 SEL=[54, 99, 2, 22, 0, 1] natoms=[7, 8, 9, 9, 10, 10] dev=cuda
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_md.py:194: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
+[canon] wall=28.9s  nmax=30  get_ef_gpu_calls=63  nconv=6/6
+NMAX_canon_DONE
+rc=0
+===== nmax ROLE=merge (merge_all batch_rfo: calc.nmax_dof) =====
+[merge] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE
+[merge] N=6 SEL=[54, 99, 2, 22, 0, 1] natoms=[7, 8, 9, 9, 10, 10] dev=cuda
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_md.py:194: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
+[merge] wall=30.9s  nmax=30  get_ef_gpu_calls=62  nconv=6/6
+
+================ NMAX-FIX SUMMARY ================
+nmax            : canon=30  merge=30   EQUAL=True
+get_ef_gpu calls: canon=63  merge=62   merge_one_fewer=True
+status          : canon=['converged', 'converged', 'converged', 'converged', 'converged', 'converged']
+                  merge=['converged', 'converged', 'converged', 'converged', 'converged', 'converged']  match=True
+max|dpos| merge vs canon = 3.921e-02 A  (fp32 GPU-nondeterminism floor ~1e-5..1e-6)
+PASS = False  (nmax-equal AND one-fewer-call AND status-match AND geom<1e-3)
+NMAX_merge_DONE
+rc=0
+VALV2_SBATCH_DONE

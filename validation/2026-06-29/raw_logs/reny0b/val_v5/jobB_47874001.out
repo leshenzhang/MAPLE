@@ -1,0 +1,97 @@
+== host ==
+gpu101-09-l
+NVIDIA A100-SXM4-80GB, 81920 MiB
+
+################ B1: fwddiff ROLE=canon (canonical central oracle) ################
+[canon] 0_transition_state natoms=10 saved central H (30, 30)
+[canon] 1_transition_state natoms=10 saved central H (30, 30)
+[canon] 2_transition_state natoms=9 saved central H (27, 27)
+[canon] 3_transition_state natoms=10 saved central H (30, 30)
+[canon] 4_transition_state natoms=10 saved central H (30, 30)
+[canon] 0_reactant natoms=10 saved central H (30, 30)
+[canon] 1_reactant natoms=10 saved central H (30, 30)
+[canon] 2_reactant natoms=9 saved central H (27, 27)
+CANON_DONE
+B1 rc=0
+
+################ B2: fwddiff ROLE=sandbox (MERGE central+forward #4) ################
+[sandbox] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE
+[sandbox] structures: 5 TS + 3 minima = 8
+
+[0_transition_state] n=10 3m=30  R_central=60 (fwd_mol=61)  R_forward=30 (fwd_mol=31)  ratio=1.97x
+        freq MAE=1.111  maxerr=9.771 cm^-1   n_imag central=1 forward=1  AGREE
+        Hessian max|dH|=1.693e-02 Ha/A^2   ZPE central=13816.3 forward=13815.0 (d=-1.2) cm^-1
+        imag central: [-1893.9]   forward: [-1894.3] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=1.01e-05
+
+[1_transition_state] n=10 3m=30  R_central=60 (fwd_mol=61)  R_forward=30 (fwd_mol=31)  ratio=1.97x
+        freq MAE=1.360  maxerr=4.891 cm^-1   n_imag central=2 forward=2  AGREE
+        Hessian max|dH|=2.334e-02 Ha/A^2   ZPE central=12796.3 forward=12796.1 (d=-0.2) cm^-1
+        imag central: [-842.   -14.9]   forward: [-842.8  -17.9] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=1.27e-05
+
+[2_transition_state] n=9 3m=27  R_central=54 (fwd_mol=55)  R_forward=27 (fwd_mol=28)  ratio=1.96x
+        freq MAE=1.198  maxerr=6.672 cm^-1   n_imag central=2 forward=2  AGREE
+        Hessian max|dH|=1.770e-02 Ha/A^2   ZPE central=14506.2 forward=14510.3 (d=+4.1) cm^-1
+        imag central: [-459.6  -10.9]   forward: [-460.2  -11. ] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=9.72e-06
+
+[3_transition_state] n=10 3m=30  R_central=60 (fwd_mol=61)  R_forward=30 (fwd_mol=31)  ratio=1.97x
+        freq MAE=1.484  maxerr=6.121 cm^-1   n_imag central=1 forward=1  AGREE
+        Hessian max|dH|=1.002e-02 Ha/A^2   ZPE central=15349.7 forward=15351.5 (d=+1.9) cm^-1
+        imag central: [-832.4]   forward: [-832.2] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=1.16e-05
+
+[4_transition_state] n=10 3m=30  R_central=60 (fwd_mol=61)  R_forward=30 (fwd_mol=31)  ratio=1.97x
+        freq MAE=1.400  maxerr=5.757 cm^-1   n_imag central=1 forward=1  AGREE
+        Hessian max|dH|=1.153e-02 Ha/A^2   ZPE central=15529.9 forward=15526.1 (d=-3.9) cm^-1
+        imag central: [-219.5]   forward: [-221.7] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=7.45e-06
+
+[0_reactant] n=10 3m=30  R_central=60 (fwd_mol=61)  R_forward=30 (fwd_mol=31)  ratio=1.97x
+        freq MAE=1.681  maxerr=9.533 cm^-1   n_imag central=0 forward=1  DISAGREE
+        Hessian max|dH|=1.658e-02 Ha/A^2   ZPE central=15082.3 forward=15081.5 (d=-0.8) cm^-1
+        imag central: []   forward: [-12.4] cm^-1
+        soft-mode flip: central [-6.000e-01  3.000e-01  7.000e-01  3.200e+01  4.010e+01  6.120e+01
+  1.892e+02  3.131e+02]
+                        forward [-12.4  -4.8  -3.   29.4  39.3  61.9 189.3 320.1] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=6.61e-06
+
+[1_reactant] n=10 3m=30  R_central=60 (fwd_mol=61)  R_forward=30 (fwd_mol=31)  ratio=1.97x
+        freq MAE=1.311  maxerr=4.933 cm^-1   n_imag central=0 forward=1  DISAGREE
+        Hessian max|dH|=2.604e-02 Ha/A^2   ZPE central=13582.3 forward=13580.3 (d=-2.0) cm^-1
+        imag central: []   forward: [-11.2] cm^-1
+        soft-mode flip: central [-5.2 -0.8 -0.3  0.6 20.3 56.6 81.5 95.1]
+                        forward [-11.2  -8.3  -4.2   3.2  19.7  56.9  81.3  94.9] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=9.04e-06
+
+[2_reactant] n=9 3m=27  R_central=54 (fwd_mol=55)  R_forward=27 (fwd_mol=28)  ratio=1.96x
+        freq MAE=1.390  maxerr=6.972 cm^-1   n_imag central=0 forward=1  DISAGREE
+        Hessian max|dH|=1.991e-02 Ha/A^2   ZPE central=15264.4 forward=15268.7 (d=+4.4) cm^-1
+        imag central: []   forward: [-10.7] cm^-1
+        soft-mode flip: central [-7.000e-01 -1.000e-01  4.000e-01  2.910e+01  5.770e+01  7.540e+01
+  2.511e+02  2.548e+02]
+                        forward [-10.7  -6.1  -3.2  19.4  55.1  71.4 253.2 255.1] cm^-1
+        byte-parity central vs canonical: exact=False max|dH|=4.89e-06
+
+
+================ SUMMARY ================
+struct                  n   Rc   Rf    fMAE    fMax  nImC  nImF      maxdH    dZPE  byteEq
+0_transition_state     10   60   30   1.111   9.771     1     1   1.69e-02    -1.2   False
+1_transition_state     10   60   30   1.360   4.891     2     2   2.33e-02    -0.2   False
+2_transition_state      9   54   27   1.198   6.672     2     2   1.77e-02     4.1   False
+3_transition_state     10   60   30   1.484   6.121     1     1   1.00e-02     1.9   False
+4_transition_state     10   60   30   1.400   5.757     1     1   1.15e-02    -3.9   False
+0_reactant             10   60   30   1.681   9.533     0     1   1.66e-02    -0.8   False
+1_reactant             10   60   30   1.311   4.933     0     1   2.60e-02    -2.0   False
+2_reactant              9   54   27   1.390   6.972     0     1   1.99e-02     4.4   False
+
+----------------------------------------
+mean freq MAE (vib)       = 1.367 cm^-1
+max  freq err (any mode)  = 9.771 cm^-1
+n_imag agreement (all)    = False
+mean forward reduction    = 1.97x  (central 60 vs forward 30 replicas + 1 base)
+default-central byte-identical to canonical = False
+FWDDIFF_VAL_DONE
+B2 rc=0
+V5_JOBB_DONE

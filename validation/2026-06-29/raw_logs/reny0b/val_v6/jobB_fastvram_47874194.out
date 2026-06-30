@@ -1,0 +1,50 @@
+== host ==
+gpu202-16-l
+== GPU ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+== fast_inference x auto_chunk composition validation (N=128) FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_fastvram/MAPLE ==
+[fv] device=NVIDIA A100-SXM4-80GB total=81154 MiB torch=2.11.0+cu128 N=128 PKL=ts1x_seed42_100.pkl
+
+[fv] ===== A. ac_off vs ac_on forward VRAM transient slope =====
+   [prof fast=False] B=   8 atoms=    81 transient=   686.7 MiB  peakAlloc=   686.7 MiB
+   [prof fast=False] B=  16 atoms=   170 transient=   229.1 MiB  peakAlloc=   806.6 MiB
+   [prof fast=False] B=  32 atoms=   366 transient=   506.9 MiB  peakAlloc=  1084.5 MiB
+   [prof fast=False] B=  64 atoms=   820 transient=  1196.7 MiB  peakAlloc=  1774.5 MiB
+   [prof fast=False] B=  96 atoms=  1291 transient=  1925.3 MiB  peakAlloc=  2503.6 MiB
+   [prof fast=False] B= 128 atoms=  1664 transient=  2446.9 MiB  peakAlloc=  3025.6 MiB
+   [prof fast= True] B=   8 atoms=    81 transient=   927.5 MiB  peakAlloc=   945.8 MiB
+   [prof fast= True] B=  16 atoms=   170 transient=   781.4 MiB  peakAlloc=  1358.9 MiB
+   [prof fast= True] B=  32 atoms=   366 transient=  1739.9 MiB  peakAlloc=  2317.6 MiB
+   [prof fast= True] B=  64 atoms=   820 transient=  4123.0 MiB  peakAlloc=  4700.9 MiB
+   [prof fast= True] B=  96 atoms=  1291 transient=  6642.2 MiB  peakAlloc=  7220.4 MiB
+   [prof fast= True] B= 128 atoms=  1664 transient=  8442.8 MiB  peakAlloc=  9021.5 MiB
+
+[fv] ac_on  (fast=False): slope=1.3095 MiB/atom  overhead=206.7 MiB
+[fv] ac_off (fast=True ): slope=4.9770 MiB/atom  overhead=133.0 MiB
+[fv] ac_off/ac_on slope ratio = 3.80x  (extra activation storage = 3.6675 MiB/atom)
+[fv] -> recommended vram_slope_mib_per_atom_fast = 5.723 (= ac_off slope x1.15 margin)
+
+[fv] ===== B. forward speedup at scale (B=128) + parity =====
+[fv] forward time  ac_on=919.03 ms  ac_off=697.56 ms -> speedup 1.32x
+[fv] forward PARITY ac_off vs ac_on (Hartree): max|dE|=2.629e-08  max|dF|=3.121e-08
+
+[fv] ===== C. Hessian: fast+auto_chunk composition (B=128) =====
+[fv] baseline  ac_on+auto_chunk : Hessian 203.37s  chunk=42900 atoms  peak=35058 MiB (43%)  retries=0
+[fv] ac_on model would size chunk = 42885 atoms (slope 1.5)
+[fv] PREVIOUSLY-OOM: ac_off @ ac_on-chunk=42885 -> CUDA OOM (as expected, this is what the fast slope fixes)
+[fv] FIX  ac_off+auto_chunk(fast slope=5.72): Hessian 200.54s  chunk=11138 atoms  peak=64990 MiB (80%)  retries=0
+[fv] HESSIAN speedup ac_off/ac_on = 1.01x  (target ~1.6x)
+[fv] HESSIAN PARITY ac_off vs ac_on (Hartree): max|dH|=1.160e-05  max|dE|=3.067e-08
+[fv] SAFETY-NET ac_off+auto_chunk(optimistic slope=1.5, safety=0.95): completed 230.41s  retries=2  peak=79635 MiB (98%)  parity max|dH|=1.273e-05
+
+[fv] ===== SUMMARY =====
+  ac_off slope            : 4.977 MiB/atom (ac_on 1.309, ratio 3.80x)
+  recommended fast slope  : 5.723 MiB/atom
+  forward speedup @B=128   : 1.32x  parity dE=2.63e-08 dF=3.12e-08
+  Hessian speedup @B=128   : 1.01x  parity dH=1.16e-05
+  peak VRAM fix           : 80%  retries=0
+  OOM-safety (retry net)  : HELD
+
+FASTVRAM_VALIDATE_OK
+== exit rc=0 ==
+V6_FVRAM_SBATCH_DONE

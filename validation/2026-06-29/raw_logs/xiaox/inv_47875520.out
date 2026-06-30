@@ -1,0 +1,24 @@
+== host ==
+cn603-22-l
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_md.py:194: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
+FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE
+dev=cpu SEL=[54, 99, 2, 22] natoms=[7, 8, 9, 9]
+[OK ] single_54        nmax_dof(attr)= 21  F.shape[1]= 21  equal=True  fwds_to_read_nmax_dof=0
+[OK ] single_99        nmax_dof(attr)= 24  F.shape[1]= 24  equal=True  fwds_to_read_nmax_dof=0
+[OK ] single_2         nmax_dof(attr)= 27  F.shape[1]= 27  equal=True  fwds_to_read_nmax_dof=0
+[OK ] single_22        nmax_dof(attr)= 27  F.shape[1]= 27  equal=True  fwds_to_read_nmax_dof=0
+[OK ] full_batch       nmax_dof(attr)= 27  F.shape[1]= 27  equal=True  fwds_to_read_nmax_dof=0
+[OK ] perturbed_full   nmax_dof(attr)= 27  F.shape[1]= 27  equal=True  fwds_to_read_nmax_dof=0
+[OK ] reversed_full    nmax_dof(attr)= 27  F.shape[1]= 27  equal=True  fwds_to_read_nmax_dof=0
+
+================ NMAX-FIX ISOLATED VERDICT ================
+calc.nmax_dof == get_ef_gpu().F.shape[1] for ALL batches : True
+=> substitution is VALUE-IDENTICAL (byte-identical nmax, hence byte-identical
+   downstream trajectory with the same calc) AND reading calc.nmax_dof costs
+   ZERO forwards => exactly ONE fewer get_ef_gpu()/forward per BatchRFO.run().
+PASS = True
+NMAX_INVARIANT_DONE
+VALV2_INV_DONE rc=0

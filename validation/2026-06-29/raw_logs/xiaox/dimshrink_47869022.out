@@ -1,0 +1,46 @@
+== host ==
+gpu101-16-l
+== GPU ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+== which python ==
+/home/wangc0i/miniconda3/envs/cxtorch/bin/python
+== FORK ==
+/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_dimshrink/MAPLE
+=== dimshrink_parity | FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_dimshrink/MAPLE dev=cuda torch=2.11.0+cu128 ===
+SEL recs: [54, 10, 25, 24, 67, 68, 45, 78, 79, 53, 56, 92] natoms: [7, 10, 11, 12, 12, 13, 14, 14, 15, 16, 17, 19]
+[FLOOR] calc-path max|dE|=3.50e-08 Ha (9.54e-07 eV) max|dF|=2.90e-08 Ha/A
+
+--- run 1: shrink_on_converge=True (NEW) ---
+--- run 2: shrink_on_converge=False (ORACLE) ---
+
+================= PER-STRUCTURE PARITY (shrink vs oracle) =================
+ i nat   sig    RMSD_A      dE_eV     dCurv       st_s       st_o imag_s imag_o match
+ 0   7 0.015  1.52e-07   0.00e+00  1.95e-05  converged  converged      1      1    OK
+ 1  10 0.020  4.94e-07   4.77e-07  2.13e-06  converged  converged      1      1    OK
+ 2  11 0.026  2.67e-08   0.00e+00  1.72e-05  converged  converged      1      1    OK
+ 3  12 0.031  2.69e-04   2.96e-05  2.54e-05  converged  converged      1      1    OK
+ 4  12 0.037  1.05e-05   9.54e-07  1.03e-05  converged  converged      1      1    OK
+ 5  13 0.042  2.19e-07   4.77e-07  1.73e-05  converged  converged      1      1    OK
+ 6  14 0.048  1.68e-07   2.38e-07  1.23e-05  converged  converged      1      1    OK
+ 7  14 0.053  1.30e-06   7.15e-07  9.45e-06  converged  converged      1      1    OK
+ 8  15 0.059  9.47e-08   0.00e+00  2.54e-06  converged  converged      1      1    OK
+ 9  16 0.064  1.16e-07   0.00e+00  2.15e-05  converged  converged      1      1    OK
+10  17 0.070  2.72e-07   1.43e-06  6.68e-06  converged  converged      1      1    OK
+11  19 0.075  1.10e-07   4.77e-07  7.23e-06  converged  converged      1      1    OK
+
+================= FORWARD-WORK + WALL SAVINGS =================
+                    metric         shrink         oracle      saved
+          outer iterations            132            132 (same: slowest sets it)
+          get_ef_gpu CALLS            858            826      -3.9%
+    system-forwards (Bsum)           7679           9912      22.5%
+      ATOM-forwards (work)         107335         132160      18.8%
+             wall time (s)         103.50         114.51       9.6%
+
+================= VERDICT =================
+max RMSD=2.69e-04 A (tol 5e-03) | max dE=2.96e-05 eV (tol 4.77e-05) | status_mismatch=0 imag_mismatch=0
+n_converged shrink=12/12 oracle=12/12
+system-forward savings = 22.5% | atom-forward (GPU-work) savings = 18.8% | wall savings = 9.6%
+PARITY: PASS
+DIMSHRINK_DONE
+== exit rc=0 ==
+DIMSHRINK_SBATCH_DONE

@@ -1,0 +1,71 @@
+== host ==
+gpu109-09-r
+== GPU ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+torch 2.11.0+cu128 cuda 12.8
+
+##### F1 load-cost + GPU: batched opt (canonical = eager redundant load) #####
+[probe] MODE=vram_batched FORK=/ibex/user/xiaox/zls/ai-maple-gpu/MAPLE N=8 dev=cuda ALLOC_CONF=expandable_segments:True
+[probe] eager UMACalculator construct: t=15.393s  host RSS +1268.9 MB  GPU +0.0 MB
+[probe] batched opt peak GPU=734.5 MB  host RSS=2857.6 MB  final_pos.sum=0.24874038
+PROBE_DONE
+canon rc=0
+
+##### F1 load-cost + GPU: batched opt (MERGE = lazy, no redundant load) #####
+[probe] MODE=vram_batched FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE N=8 dev=cuda ALLOC_CONF=expandable_segments:True
+[probe] eager UMACalculator construct: t=0.000s  host RSS +0.0 MB  GPU +0.0 MB
+[probe] batched opt peak GPU=734.5 MB  host RSS=1917.5 MB  final_pos.sum=0.24874038
+PROBE_DONE
+sand rc=0
+
+##### BATCHED parity (standalone UMABatchCalc forward) #####
+[probe] MODE=batched_sp FORK=/ibex/user/xiaox/zls/ai-maple-gpu/MAPLE N=8 dev=cuda ALLOC_CONF=expandable_segments:True
+[probe] batched_sp E.sum=-2537.1811748522 |F|max=6.400642e-02
+PROBE_DONE
+canon rc=0
+[probe] MODE=batched_sp FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE N=8 dev=cuda ALLOC_CONF=expandable_segments:True
+[probe] batched_sp E.sum=-2537.1811748513 |F|max=6.400641e-02
+PROBE_DONE
+sand rc=0
+
+##### SERIAL parity (single-Atoms calculate; exercises lazy build) #####
+[probe] MODE=serial FORK=/ibex/user/xiaox/zls/ai-maple-gpu/MAPLE N=8 dev=cuda ALLOC_CONF=expandable_segments:True
+[probe] serial E=-392.75699315005323 |F|max=1.714986e-02
+PROBE_DONE
+canon rc=0
+[probe] MODE=serial FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE N=8 dev=cuda ALLOC_CONF=expandable_segments:True
+[probe] serial E=-392.75699315881496 |F|max=1.714985e-02
+PROBE_DONE
+sand rc=0
+
+########## COMPARE ##########
+=== F1 redundant eager-load cost (canonical) vs lazy (MERGE) ===
+  construct wall-time:   canon=15.393s  sand=0.000s  saved=15.393s
+  host RSS delta:        canon=+1268.9MB  sand=+0.0MB  saved=1268.9MB
+  GPU after construct:   canon=+0.0MB  sand=+0.0MB
+  GPU peak batched run:  canon=734.5MB  sand=734.5MB  (no regression)
+  host RSS peak run:     canon=2857.6MB  sand=1917.5MB  saved=940.1MB
+=== BATCHED parity (canon vs merge) ===
+  [batched_sp] E: byte-identical=False  max|d|=8.762e-09  shape=(8,)
+  [batched_sp] F: byte-identical=False  max|d|=3.286e-08  shape=(8, 33)
+=== BATCHED opt final geometry parity (canon vs merge) ===
+  [opt_final] final_pos: byte-identical=True  max|d|=0.000e+00  shape=(81, 3)
+=== SERIAL parity (canon vs merge) ===
+  [serial] E: byte-identical=False  max|d|=8.762e-09  shape=(1,)
+  [serial] F: byte-identical=False  max|d|=1.676e-08  shape=(10, 3)
+VERDICT  batched_sp_identical=False  opt_final_identical=True  serial_identical=False
+
+########## IMPORT SMOKE (merge) ##########
+  OK maple
+  OK maple.main
+  OK maple.function.engine
+  OK maple.function.calculator.uma._uma_calculator
+  OK maple.function.dispatcher.dispatcher
+  maple/__init__ alloc env: expandable_segments:True
+import smoke OK
+
+## F2 in-process hook with env UNSET (setdefault must set it) ##
+  unset->after import maple: expandable_segments:True
+## F2 setdefault must NOT clobber a user value ##
+  user-set preserved: garbage_user_val
+V6_MLOAD_SBATCH_DONE

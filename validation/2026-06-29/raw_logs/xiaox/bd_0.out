@@ -1,0 +1,42 @@
+
+========================================================================
+                 BatchDimer  (batched GPU dimer saddle search)          
+========================================================================
+B systems                : 12
+padded DOF (nmax)        : 57
+HVP                      : forward FD (1 eval, classic HJ)
+rotation                 : Heyden trig (J.Chem.Phys.2005,123,224101)
+translation              : trust-radius steepest descent
+Refs: HJ J.Chem.Phys.1999,111,7010 (10.1063/1.480097); Heyden 2005 (10.1063/1.2104507); Kastner-Sherwood 2008 (10.1063/1.2815812)
+------------------------------------------------------------------------
+[iter    1] active= 12/12  E[min/max]=-362.86264/-247.14403  curv<0=12/12  max|F|=0.51164  max|Frot|=0.06094  rot_fe=10 cum_fe=11
+[iter    2] active= 12/12  E[min/max]=-362.89248/-247.14816  curv<0=11/12  max|F|=0.20174  max|Frot|=0.20227  rot_fe=10 cum_fe=22
+[iter    3] active= 12/12  E[min/max]=-362.89890/-247.14874  curv<0=11/12  max|F|=0.12468  max|Frot|=0.26068  rot_fe=10 cum_fe=33
+[iter    4] active= 12/12  E[min/max]=-362.90309/-247.14901  curv<0=11/12  max|F|=0.07955  max|Frot|=0.24970  rot_fe=10 cum_fe=44
+[iter    5] active= 12/12  E[min/max]=-362.90610/-247.14915  curv<0=11/12  max|F|=0.06906  max|Frot|=0.06712  rot_fe=10 cum_fe=55
+[iter   10] active= 12/12  E[min/max]=-362.91432/-247.14940  curv<0=12/12  max|F|=0.04306  max|Frot|=0.13363  rot_fe=10 cum_fe=110
+[iter   20] active= 12/12  E[min/max]=-362.92005/-247.14951  curv<0=12/12  max|F|=0.02131  max|Frot|=0.00940  rot_fe=10 cum_fe=220
+[iter   30] active= 11/12  E[min/max]=-362.92170/-247.14955  curv<0=12/12  max|F|=0.01316  max|Frot|=0.00300  rot_fe=10 cum_fe=330
+[iter   40] active= 11/12  E[min/max]=-362.92229/-247.14956  curv<0=12/12  max|F|=0.00782  max|Frot|=0.00116  rot_fe=10 cum_fe=439
+[iter   50] active= 10/12  E[min/max]=-362.92255/-247.14958  curv<0=12/12  max|F|=0.00541  max|Frot|=0.00106  rot_fe=5 cum_fe=513
+[iter   60] active=  8/12  E[min/max]=-362.92267/-247.14958  curv<0=12/12  max|F|=0.00415  max|Frot|=0.00108  rot_fe=5 cum_fe=573
+[iter   70] active=  7/12  E[min/max]=-362.92274/-247.14958  curv<0=12/12  max|F|=0.00344  max|Frot|=0.00108  rot_fe=5 cum_fe=631
+[iter   80] active=  5/12  E[min/max]=-362.92279/-247.14958  curv<0=12/12  max|F|=0.00297  max|Frot|=0.00108  rot_fe=5 cum_fe=679
+[iter   90] active=  2/12  E[min/max]=-362.92282/-247.14958  curv<0=12/12  max|F|=0.00258  max|Frot|=0.00108  rot_fe=3 cum_fe=727
+[iter  100] active=  1/12  E[min/max]=-362.92282/-247.14958  curv<0=12/12  max|F|=0.00233  max|Frot|=0.00122  rot_fe=3 cum_fe=751
+[iter  110] active=  1/12  E[min/max]=-362.92282/-247.14958  curv<0=12/12  max|F|=0.00233  max|Frot|=0.00122  rot_fe=1 cum_fe=773
+[iter  120] active=  1/12  E[min/max]=-362.92282/-247.14958  curv<0=12/12  max|F|=0.00233  max|Frot|=0.00122  rot_fe=1 cum_fe=797
+[iter  130] active=  1/12  E[min/max]=-362.92282/-247.14958  curv<0=12/12  max|F|=0.00233  max|Frot|=0.00122  rot_fe=1 cum_fe=819
+[iter  132] active=  0/12  E[min/max]=-362.92282/-247.14958  curv<0=12/12  max|F|=0.00233  max|Frot|=0.00122  rot_fe=1 cum_fe=823
+
+All 12 dimers converged at iteration 132.
+
+------------------------------------------------------------------------
+                       BatchDimer summary                               
+------------------------------------------------------------------------
+converged                : 12/12
+shrink_on_converge       : False
+negative final curvature : 12/12
+total batched force evals: 825
+per-structure status     : ['converged', 'converged', 'converged', 'converged', 'converged', 'converged', 'converged', 'converged', 'converged', 'converged', 'converged', 'converged']
+per-structure curvature  : [-0.87802, -0.27723, -0.65027, -0.39226, -0.75973, -0.76736, -0.49446, -0.09806, -0.80274, -1.26318, -0.90041, -1.18761]

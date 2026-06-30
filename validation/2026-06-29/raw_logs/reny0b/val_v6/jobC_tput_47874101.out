@@ -1,0 +1,19 @@
+== host ==
+gpu109-09-r
+== GPU ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+== A7.2 THROUGHPUT (UMA batched multi-band, N=16 BLIST=1,8,16) FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE ==
+[a7tp] N=16 n_images=10 BLIST=[1, 8, 16] device=cuda
+[a7tp] 16 reactions, natoms 9..12 median 11
+
+[a7tp] SERIAL (B=1 x16): wall=230.7s conv=13/16 util_mean=26% util_max=32% VRAM_max=1467MB structures/s=0.83
+
+[a7tp] ===== BATCHED multi-band scaling =====
+   B   wall_s   conv util_mean util_max  VRAM_MB  struct/s  speedup
+   1    250.4   12/16       26%      32%     1467      0.77    0.92x
+   8    164.8   13/16       30%      67%     2665      1.16    1.40x
+  16    146.4   13/16       37%      89%     4001      1.31    1.58x
+
+A7_THROUGHPUT_OK
+== exit rc=0 ==
+V6_TPUT_SBATCH_DONE

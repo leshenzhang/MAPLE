@@ -1,0 +1,32 @@
+== host ==
+cn504-05
+torch 2.11.0+cu128 cuda_avail False
+===== nmax ROLE=canon (canonical batch_rfo: throwaway forward) =====
+[canon] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/MAPLE
+[canon] N=4 SEL=[54, 99, 2, 22] natoms=[7, 8, 9, 9] dev=cpu
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_md.py:194: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
+[canon] wall=87.3s  nmax=27  get_ef_gpu_calls=39  nconv=4/4
+NMAX_canon_DONE
+rc=0
+===== nmax ROLE=merge (merge_all batch_rfo: calc.nmax_dof) =====
+[merge] FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE
+[merge] N=4 SEL=[54, 99, 2, 22] natoms=[7, 8, 9, 9] dev=cpu
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/home/wangc0i/miniconda3/envs/cxtorch/lib/python3.10/site-packages/fairchem/core/models/uma/escn_md.py:194: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
+[merge] wall=64.1s  nmax=27  get_ef_gpu_calls=31  nconv=4/4
+
+================ NMAX-FIX SUMMARY ================
+nmax            : canon=27  merge=27   EQUAL=True
+get_ef_gpu calls: canon=39  merge=31   merge_one_fewer=False
+status          : canon=['converged', 'converged', 'converged', 'converged']
+                  merge=['converged', 'converged', 'converged', 'converged']  match=True
+max|dpos| merge vs canon = 5.552e-02 A  (fp32 GPU-nondeterminism floor ~1e-5..1e-6)
+PASS = False  (nmax-equal AND one-fewer-call AND status-match AND geom<1e-3)
+NMAX_merge_DONE
+rc=0
+VALV2_NMAXCPU_DONE

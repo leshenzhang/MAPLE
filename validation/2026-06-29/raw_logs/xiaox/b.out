@@ -1,0 +1,5 @@
+# Batch-SD optimization start
+# Maxstep: 0.2, Maxiter: 60, Device: cuda
+
+
+# Maximum iterations reached.

@@ -1,0 +1,190 @@
+== host ==
+gpu109-02-r
+== GPU ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+
+############## (A) UNIT MATH PARITY (torch vs numpy refs) ##############
+max|Δ| dynamic-k        : 2.78e-17
+max|Δ| energy-weighted-k: 0.00e+00
+max|Δ| Fp dynamic/noclimb: 1.67e-16
+max|Δ| Fp climbing       : 1.67e-16
+max|Δ| Fp ew+dyneb       : 4.44e-16
+max|Δ| LBFGS step (25 it): 2.22e-16
+PARITY_MATH_OK
+rc=0
+
+############## (B) V4 OPTS 1/2/3/5 (oracle parity + dyneb + pool + endpoint) ##############
+[v4] dev=cuda N=8 n_images=8(+2) maxiter=120 FORK=/ibex/user/xiaox/zls/ai-maple-gpu/sandbox_merge_all/MAPLE
+[v4] 8 reactions natoms 9..11
+
+[v4] === OPT 1: multi-band batched vs single-band run() oracle ===
+  rx 0 HEI 5/5  bar   59.057/  59.057 kcal  dBar=2.60e-07Ha  HEI-RMSD=5.34e-06A
+  rx 1 HEI 4/4  bar   84.874/  85.119 kcal  dBar=3.91e-04Ha  HEI-RMSD=2.65e-02A
+  rx 2 HEI 4/4  bar   63.214/  63.221 kcal  dBar=1.18e-05Ha  HEI-RMSD=3.01e-04A
+  rx 3 HEI 5/5  bar   86.110/  86.038 kcal  dBar=1.14e-04Ha  HEI-RMSD=1.92e-03A
+  rx 4 HEI 5/5  bar   40.797/  40.797 kcal  dBar=7.15e-08Ha  HEI-RMSD=5.75e-06A
+  rx 5 HEI 5/5  bar   72.262/  72.824 kcal  dBar=8.96e-04Ha  HEI-RMSD=2.23e-02A
+  rx 6 HEI 5/5  bar   45.261/  47.242 kcal  dBar=3.16e-03Ha  HEI-RMSD=1.85e-02A
+  rx 7 HEI 6/5  bar   43.353/  43.792 kcal  dBar=6.99e-04Ha  HEI-RMSD=6.88e-02A  <FLIP
+  -> max|dBar|=3.16e-03Ha (1.9816kcal) max HEI-RMSD=6.88e-02A HEI-flips=1  VERDICT=CHECK
+
+[v4] === OPT 2: DyNEB image freezing ===
+  rx 0 bar nofrz/dyneb   59.057/  58.376kcal dBar=1.09e-03Ha
+  rx 1 bar nofrz/dyneb   85.116/  85.182kcal dBar=1.05e-04Ha
+  rx 2 bar nofrz/dyneb   67.847/  63.213kcal dBar=7.38e-03Ha
+  rx 3 bar nofrz/dyneb   86.060/  91.321kcal dBar=8.38e-03Ha
+  rx 4 bar nofrz/dyneb   40.797/  41.180kcal dBar=6.09e-04Ha
+  rx 5 bar nofrz/dyneb   73.254/  82.281kcal dBar=1.44e-02Ha
+  rx 6 bar nofrz/dyneb   46.910/  23.357kcal dBar=3.75e-02Ha
+  rx 7 bar nofrz/dyneb  440.166/  57.693kcal dBar=6.10e-01Ha
+  -> max|dBar|=6.10e-01Ha (16585.633meV) (tol 5meV)  HEI-frozen-violations=0  max_frozen/band=5/8
+  -> image-evals nofrz=5720 dyneb=4421  fwd-savings=22.7%  VERDICT=CHECK
+
+[v4] === OPT 3: NEB streaming pool ===
+  rx 0 pool/lock bar   59.057/  59.057kcal dBar=8.76e-08Ha status=converged
+  rx 1 pool/lock bar   85.135/  85.114kcal dBar=3.45e-05Ha status=converged
+  rx 2 pool/lock bar   75.261/  63.222kcal dBar=1.92e-02Ha status=evicted_straggler
+  rx 3 pool/lock bar   88.951/  86.074kcal dBar=4.59e-03Ha status=evicted_straggler
+  rx 4 pool/lock bar   40.797/  40.797kcal dBar=2.85e-08Ha status=converged
+  rx 5 pool/lock bar   98.643/  72.967kcal dBar=4.09e-02Ha status=evicted_straggler
+  rx 6 pool/lock bar   43.255/  45.617kcal dBar=3.76e-03Ha status=evicted_straggler
+  rx 7 pool/lock bar  101.846/ 112.170kcal dBar=1.65e-02Ha status=evicted_straggler
+  -> B_target=4 queue=4 refilled=4(exp 4)  integrity(no lost/dup)=True all_status=True statuses={'converged': 3, 'evicted_straggler': 5}
+  -> max|dBar| pool-vs-lockstep=4.09e-02Ha  VERDICT=CHECK
+
+[v4] === OPT 5: endpoint reuse (FIX #3) ===
+  rx 0 reuse/full bar   59.05723/  59.05716kcal dBar=1.01e-07Ha
+  rx 1 reuse/full bar   85.11386/  85.11524kcal dBar=2.20e-06Ha
+  rx 2 reuse/full bar   77.73327/  78.69647kcal dBar=1.53e-03Ha
+  rx 3 reuse/full bar   86.03300/  86.08663kcal dBar=8.55e-05Ha
+  rx 4 reuse/full bar   40.79747/  40.79748kcal dBar=6.57e-09Ha
+  rx 5 reuse/full bar   98.12391/  75.21250kcal dBar=3.65e-02Ha
+  rx 6 reuse/full bar   45.54330/  45.60019kcal dBar=9.06e-05Ha
+  rx 7 reuse/full bar   56.12929/  29.79102kcal dBar=4.20e-02Ha
+  -> max|dBar| reuse-vs-full=4.20e-02Ha  byte-exact=False (iters reuse/full=705/705)
+  -> image-evals reuse=5720 full=7130  fewer-evals=19.8%  VERDICT=CHECK
+
+[v4] ===== V4 MATRIX SUMMARY =====
+  opt1_multiband         CHECK
+  opt2_dyneb             CHECK
+  opt3_pool              CHECK
+  opt5_endpoint_reuse    CHECK
+[v4] wrote /ibex/user/reny0b/zls/maple-val/val_v4/v4_j47874154.json
+
+V4_NEB_CHECK
+rc=0
+
+############## (C) OPT 4 on-device end-to-end PARITY vs numpy oracle (N=6) ##############
+[parity] N=6 climb=True maxiter=200
+[parity] running numpy oracle (on_device=False) ...
+[parity] running on-device set_coords_ (on_device=True) ...
+[parity] running on-device prepare-every-iter (NO_SETCOORDS=1) ...
+
+===== cpu  vs  devSC =====
+ rx hei_cpu hei_devSC    bar_cpu  bar_devSC   dBar(Ha)  dBar(kcal)      conv  dRMSD(A)
+  0       6       6    0.09705    0.09707   2.12e-05      0.0133       T/T  3.07e-03
+  1       5       5    0.13555    0.13555   1.75e-07      0.0001       T/T  4.58e-05
+  2       5       5    0.09091    0.09099   8.15e-05      0.0511       T/T  1.99e-02
+  3       6       6    0.17109    0.17109   3.70e-08      0.0000       T/T  9.44e-06
+  4       6       6    0.06469    0.06469   1.31e-08      0.0000       T/T  1.61e-06
+  5       5       5    0.14231    0.22116   7.89e-02     49.4796       F/F  1.87e-01
+  max|dBarrier| = 7.885e-02 Ha = 49.4796 kcal/mol
+  max|dHEI-RMSD|= 1.872e-01 A   HEI-flips=0  conv-mismatch=0
+  VERDICT: PARITY_CHECK (barrier within UMA fp32 noise?)
+
+===== cpu  vs  devPR =====
+ rx hei_cpu hei_devPR    bar_cpu  bar_devPR   dBar(Ha)  dBar(kcal)      conv  dRMSD(A)
+  0       6       6    0.09705    0.09708   3.08e-05      0.0193       T/T  9.09e-03
+  1       5       5    0.13555    0.13555   1.49e-07      0.0001       T/T  3.17e-05
+  2       5       5    0.09091    0.09098   7.24e-05      0.0454       T/T  2.59e-02
+  3       6       6    0.17109    0.17109   5.56e-08      0.0000       T/T  1.40e-05
+  4       6       6    0.06469    0.06469   1.53e-08      0.0000       T/T  2.26e-06
+  5       5       5    0.14231    0.25819   1.16e-01     72.7206       F/F  2.32e-01
+  max|dBarrier| = 1.159e-01 Ha = 72.7206 kcal/mol
+  max|dHEI-RMSD|= 2.320e-01 A   HEI-flips=0  conv-mismatch=0
+  VERDICT: PARITY_CHECK (barrier within UMA fp32 noise?)
+[parity] wrote /ibex/user/reny0b/zls/maple-val/val_v4/parity_j47874154.json
+
+PARITY_RUN_OK
+rc=0
+
+############## (D) OPT 4 benefit: baseline numpy profile (ONDEV=0, N=16) ##############
+[prof] N=16 n_images=10 maxiter=200 climb=True ondev=False dev=cuda
+[prof] 16 reactions natoms 9..12 median 11
+
+[prof] ===== RESULT (wall=117.86s) =====
+  bands=16 converged=13 forwards=201 sum_iters=1298
+  GPU util: n=1569 mean=37.5% median=34% p90=71% max=88%
+
+[prof] ===== TIME SPLIT (s, total across run) =====
+  gpu_fwd         101.671s   86.3% wall  calls=201
+  xfer_wait         0.116s    0.1% wall  calls=201
+  cpu_prepare       6.228s    5.3% wall  calls=201
+  cpu_bandmath      0.362s    0.3% wall  calls=1314
+  cpu_lbfgs         0.192s    0.2% wall  calls=5208
+  cpu_grad          0.022s    0.0% wall  calls=1314
+  cpu_pack          0.000s    0.0% wall  calls=16
+  cpu_unpack        0.030s    0.0% wall  calls=1298
+  SUM_above       108.622s   92.2% wall
+  unaccounted       9.237s    7.8% wall
+
+[prof] ===== SYNC / TRANSFER COUNTS (during run_multiband) =====
+  sync_cpu           0  (0.00/forward)
+  sync_item          0  (0.00/forward)
+  sync_numpy         0  (0.00/forward)
+  sync_tolist        0  (0.00/forward)
+  TOTAL_D2H          0  (0.00/forward)
+  forwards (get_ef_gpu)     : 201
+  D2H .numpy() (instr eval) : 402  (2.0/forward)
+  bandmath calls            : 1314
+  lbfgs calls               : 5208
+  per-forward CPU-math (bandmath+lbfgs+grad+pack+unpack): 3.02 ms
+  per-forward GPU fwd       : 505.82 ms
+  per-forward xfer_wait     : 0.58 ms
+  per-forward cpu_prepare   : 30.99 ms
+
+[prof] wrote /ibex/user/reny0b/zls/maple-val/val_v4/prof_j47874154_base.json
+
+PROF_NEB_OK
+rc=0
+
+############## (E) OPT 4 benefit: on-device profile (ONDEV=1, set_coords_, N=16) ##############
+[prof] N=16 n_images=10 maxiter=200 climb=True ondev=True dev=cuda
+[prof] 16 reactions natoms 9..12 median 11
+
+[prof] ===== RESULT (wall=115.79s) =====
+  bands=16 converged=13 forwards=201 sum_iters=1312
+  GPU util: n=1565 mean=38.8% median=37% p90=71% max=87%
+
+[prof] ===== TIME SPLIT (s, total across run) =====
+  gpu_fwd           0.000s    0.0% wall  calls=0
+  xfer_wait         0.000s    0.0% wall  calls=0
+  cpu_prepare       0.000s    0.0% wall  calls=0
+  cpu_bandmath      0.000s    0.0% wall  calls=0
+  cpu_lbfgs         0.000s    0.0% wall  calls=0
+  cpu_grad          0.000s    0.0% wall  calls=0
+  cpu_pack          0.001s    0.0% wall  calls=16
+  cpu_unpack        0.000s    0.0% wall  calls=0
+  SUM_above         0.001s    0.0% wall
+  unaccounted     115.786s  100.0% wall
+
+[prof] ===== SYNC / TRANSFER COUNTS (during run_multiband) =====
+  sync_cpu           0  (0.00/forward)
+  sync_item          0  (0.00/forward)
+  sync_numpy         0  (0.00/forward)
+  sync_tolist        0  (0.00/forward)
+  TOTAL_D2H          0  (0.00/forward)
+  forwards (get_ef_gpu)     : 0
+  D2H .numpy() (instr eval) : 0  (0.0/forward)
+  bandmath calls            : 0
+  lbfgs calls               : 0
+  per-forward CPU-math (bandmath+lbfgs+grad+pack+unpack): 0.51 ms
+  per-forward GPU fwd       : 0.00 ms
+  per-forward xfer_wait     : 0.00 ms
+  per-forward cpu_prepare   : 0.00 ms
+
+[prof] wrote /ibex/user/reny0b/zls/maple-val/val_v4/prof_j47874154_ondev.json
+
+PROF_NEB_OK
+rc=0
+V4NEB_SBATCH_DONE
