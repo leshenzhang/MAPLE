@@ -1,0 +1,5 @@
+# UniTS-Gen model weights are an external ~267MB asset (ModelScope XuLiCheng2025/UniTS-Gen-v1)
+*.pth
+*.pt
+__pycache__/
+*.pyc
