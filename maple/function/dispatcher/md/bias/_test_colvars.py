@@ -245,8 +245,16 @@ def _water_dimer(sep=2.9):
 
 
 def gate_abf():
-    """Real Colvars ABF on MACE-OFF (GPU): biased O-O distance run; check the
-    ABF sample histogram / free-energy gradient ACCUMULATES across the grid."""
+    """Real Colvars eABF on MACE-OFF (GPU): extended-Lagrangian ABF on an O-O
+    distance CV. eABF is the position-space seam's natural ABF-family method --
+    the physical system feels ONLY the bounded harmonic coupling to a fictitious
+    extended DOF (a position-space force the binding applies exactly), while the
+    extended-DOF Langevin dynamics + the ABF-on-lambda + the CZAR estimator live
+    inside Colvars and need NO system total force (which this position-only seam
+    deliberately never pushes). Plain force-based ABF is unstable here for that
+    reason -- its mean-force estimate is ungrounded -- so eABF is the correct
+    smoke. Checks that the CZAR free-energy gradient + the sample histogram
+    ACCUMULATE across the 1D grid and the run stays finite/stable."""
     import tempfile
     from ase.md.langevin import Langevin
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
@@ -255,39 +263,45 @@ def gate_abf():
     inner, dev = _load_backend('off')
     at = _water_dimer(2.9)
     lo, hi, w = 2.4, 3.8, 0.1
+    dt_fs, temp = 0.5, 300.0
     cfg = ("colvar {\n"
            "  name doo\n"
            "  width %g\n"
            "  lowerBoundary %g\n"
            "  upperBoundary %g\n"
+           "  extendedLagrangian on\n"
+           "  extendedFluctuation %g\n"
            "  distance {\n"
            "    group1 { atomNumbers 1 }\n"
            "    group2 { atomNumbers 4 }\n"
            "  }\n"
            "}\n"
            "abf {\n"
-           "  name myabf\n"
+           "  name myeabf\n"
            "  colvars doo\n"
            "  fullSamples 40\n"
-           "}\n" % (w, lo, hi))
-    at.calc = ColvarsCalculator(inner, cfg, 1.0, 400.0, atoms=at)
+           "}\n" % (w, lo, hi, w))
+    at.calc = ColvarsCalculator(inner, cfg, dt_fs, temp, atoms=at)
 
-    tmp = tempfile.mkdtemp(prefix="colvars_abf_")
+    tmp = tempfile.mkdtemp(prefix="colvars_eabf_")
     prefix = os.path.join(tmp, "run")
     _ = at.get_forces()                              # lazily builds at.calc._cv
     at.calc._cv.set_output_prefix(prefix)
 
-    MaxwellBoltzmannDistribution(at, temperature_K=400.0)
-    dyn = Langevin(at, 1.0 * units.fs, temperature_K=400.0, friction=0.02)
+    MaxwellBoltzmannDistribution(at, temperature_K=temp)
+    dyn = Langevin(at, dt_fs * units.fs, temperature_K=temp, friction=0.02)
     nsteps = 1500
-    max_abf_f = 0.0
+    max_f = 0.0
     for _i in range(nsteps):
         dyn.run(1)
-        max_abf_f = max(max_abf_f, float(np.max(np.abs(at.get_forces()))))
+        max_f = max(max_f, float(np.max(np.abs(at.get_forces()))))
     at.calc._cv.write_output_files()
 
-    cnt = os.path.join(tmp, "run.myabf.count")
-    grad = os.path.join(tmp, "run.myabf.grad")
+    # eABF writes the plain grids "<prefix>.count/.grad" AND the CZAR estimator
+    # "<prefix>.czar.grad/.czar.pmf" (colvarbias_abf.cpp). Single PMF bias -> no
+    # "<biasname>" infix. The CZAR gradient is eABF's actual free-energy estimate.
+    cnt = prefix + ".count"
+    czar = prefix + ".czar.grad"
     counts = []
     if os.path.exists(cnt):
         with open(cnt) as fh:
@@ -299,14 +313,15 @@ def gate_abf():
     counts = np.asarray(counts) if counts else np.zeros(1)
     total = float(counts.sum())
     populated = int((counts > 0).sum())
-    grad_written = os.path.exists(grad)
+    czar_written = os.path.exists(czar)
     finite_forces = np.isfinite(at.get_forces()).all()
-    ok = (grad_written and finite_forces and populated >= 2
+    stable = max_f < 1e3                              # Ha/A; blow-up was ~1.6e5
+    ok = (czar_written and finite_forces and stable and populated >= 2
           and total > 0.4 * nsteps)
-    return _emit("ABF smoke (MACE-OFF GPU): histogram accumulates",
+    return _emit("eABF smoke (MACE-OFF GPU): CZAR grad + histogram accumulate",
                  ok, ("dev=%s bins_populated=%d total_samples=%.0f/%d "
-                      "max|F|=%.4f grad_file=%s"
-                      % (dev, populated, total, nsteps, max_abf_f, grad_written)))
+                      "max|F|=%.2f czar_grad=%s"
+                      % (dev, populated, total, nsteps, max_f, czar_written)))
 
 
 def _cross_backend(which):

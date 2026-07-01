@@ -84,6 +84,15 @@ class ColvarsCalculator(Calculator):
             if hasattr(proxy, setter):
                 getattr(proxy, setter)(arg)
                 break
+        # Push MD context (timestep fs, temperature K) BEFORE parsing config so
+        # extended-Lagrangian methods (eABF / extended-system metadynamics) can
+        # integrate their fictitious DOF + thermostat; a no-op for pure
+        # position-space biases (harmonic restraint / plain ABF / metaD). dt and
+        # T are unit-system independent in Colvars (always fs / K).
+        if hasattr(proxy, "set_timestep"):
+            proxy.set_timestep(self.timestep_fs)
+        if hasattr(proxy, "set_temperature"):
+            proxy.set_temperature(self.temperature)
         proxy.read_config_string(self._config) if hasattr(
             proxy, "read_config_string") else proxy.read_config(self._config)
         self._cv = proxy

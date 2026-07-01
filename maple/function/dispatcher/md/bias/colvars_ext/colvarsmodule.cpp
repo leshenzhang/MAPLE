@@ -89,6 +89,27 @@ public:
 
   void set_output_prefix(const std::string &prefix) {
     check(proxy_->set_output_prefix(prefix), "set_output_prefix");
+    // The colvarmodule keeps its OWN prefix string (cvm_output_prefix), synced
+    // from the proxy only inside setup_output(); it is NOT auto-refreshed when
+    // the proxy prefix changes after setup. ABF/metadynamics build their grid
+    // filenames from cvmodule->output_prefix() (re-read every step), so without
+    // this line a prefix set after read_config_string is ignored and grids land
+    // in the CWD with an empty prefix (".count"/".grad"/".pmf"). Sync it here so
+    // set_output_prefix works whether called before OR after config read.
+    cvm_->output_prefix() = prefix;
+  }
+
+  // Integration timestep (fs) and target temperature (K). Extended-Lagrangian
+  // methods (eABF, extended-system metadynamics) integrate a fictitious DOF and
+  // its thermostat, which need dt>0 and T>0; the stub proxy leaves both 0 until
+  // set here. Units are fixed (fs / K) in Colvars regardless of unit_system, so
+  // no conversion. No-ops for pure position-space biases (restraint / plain ABF).
+  void set_timestep(double dt_fs) {
+    check(proxy_->set_integration_timestep(dt_fs), "set_integration_timestep");
+  }
+
+  void set_temperature(double temperature_K) {
+    check(proxy_->set_target_temperature(temperature_K), "set_target_temperature");
   }
 
   // MD step index (drives hill/output frequencies). colvars_calc.py owns the
@@ -179,6 +200,8 @@ PYBIND11_MODULE(colvars, m) {
       .def("set_unit_system", &Colvars::set_unit_system, py::arg("units"))
       .def("read_config_string", &Colvars::read_config_string, py::arg("conf"))
       .def("set_output_prefix", &Colvars::set_output_prefix, py::arg("prefix"))
+      .def("set_timestep", &Colvars::set_timestep, py::arg("dt_fs"))
+      .def("set_temperature", &Colvars::set_temperature, py::arg("temperature_K"))
       .def("set_step", &Colvars::set_step, py::arg("step"))
       .def("set_positions", &Colvars::set_positions, py::arg("positions"))
       .def("calc", &Colvars::calc)

@@ -11,10 +11,29 @@ harness (`tests/functional/run_colvars_test.cpp`) drives it from an XYZ file.
 
 ## What the binding exposes (`colvars.Colvars`)
 `set_unit_system(str)`, `read_config_string(str)`, `set_output_prefix(str)`,
-`set_step(int)`, `set_positions((N,3) float64)`, `calc()` / `update()`,
+`set_timestep(dt_fs)`, `set_temperature(T_K)`, `set_step(int)`,
+`set_positions((N,3) float64)`, `calc()` / `update()`,
 `get_energy() -> float`, `get_forces() -> (N,3) float64`,
 `write_output_files()`, `num_biases()` — the exact names/signatures
 `colvars_calc.py::_init_colvars` probes.
+
+- **Config format:** Colvars config is newline-delimited — a keyword's value
+  runs to end-of-line, so top-level statements must be on separate lines (a
+  single space-joined line makes `name` swallow the rest → `read_config_string`
+  error code 5). See `_test_colvars.py::_restraint_cfg` for the layout.
+- **eABF / extended-Lagrangian:** `set_timestep`/`set_temperature` set the
+  stub proxy's `dt` (fs) and target `T` (K) — 0 by default — so eABF and
+  extended-system metadynamics can integrate their fictitious DOF + thermostat.
+  eABF is the ABF-family method that fits this position-only seam: the physical
+  system feels only the bounded ξ↔λ harmonic coupling (applied exactly), and the
+  CZAR free-energy estimate (`<prefix>.czar.grad`) needs no system total force.
+  Plain force-based ABF is unstable here (no system force is pushed → ungrounded
+  mean-force estimate → runaway); use eABF instead.
+- **`set_output_prefix`:** syncs BOTH the proxy prefix and the module prefix
+  (`cvmodule->output_prefix()`, which ABF/metaD re-read each step for grid
+  filenames), so it works whether called before or after `read_config_string`.
+  For a single PMF-computing bias, grid files are `<prefix>.count/.grad/.pmf`
+  (no `<biasname>` infix).
 
 - **Units:** Colvars runs in its `"real"` system (kcal/mol, Å). Positions are Å
   (no conversion). `get_energy`/`get_forces` are kcal/mol and kcal/mol/Å;
