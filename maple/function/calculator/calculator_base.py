@@ -350,7 +350,7 @@ class CalcABC(ase.calculators.calculator.Calculator):
         """Translate input-header options into ctor kwargs. Backends override."""
         return {}
 
-    def _finalize_results(self, atoms, *, energy, forces=None, hessian=None, unit=None):
+    def _finalize_results(self, atoms, *, energy, forces=None, hessian=None, stress=None, unit=None):
         """Single entry: unit conversion + implicit-solvent + write self.results.
 
         Backends pass the pure model outputs (in the unit declared by
@@ -392,6 +392,10 @@ class CalcABC(ase.calculators.calculator.Calculator):
             self.results['forces'] = forces_ha
         if hessian is not None:
             self.results['hessian'] = hessian
+        if stress is not None:
+            # eV/Angstrom^3 ASE Voigt-6 from the generic PBC calc; passed through
+            # unconverted (NPT/stress path). Optional: only present for PBC models.
+            self.results['stress'] = stress
 
     def get_hessian(self, atoms, delta: float = 0.002):
         """Dispatch on self.hessian. Subclasses may override for backend autograd."""
