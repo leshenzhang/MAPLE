@@ -11,6 +11,11 @@ This gate tests the full instantaneous distribution.
 For a canonical ensemble with N_f degrees of freedom the instantaneous kinetic
 energy K obeys  2K/(kT) ~ chi^2(N_f), equivalently the Maxwell-Boltzmann KE law
   <K> = (N_f/2) kT      and      Var(K) = (N_f/2) (kT)^2.
+N_f must be the number of ACTIVE momentum DOF: remove_com_every=1 projects the
+COM every step so the 3 COM modes carry no KE and the thermostat target N_f
+(read from thermostat._n_dof = 3N-3 = 24) matches the active subspace exactly --
+otherwise (remove_com_every=0 -> N_f=3N=27 while only 24 DOF are live) the
+thermostat over-heats the internal modes and the KE marginal is a biased chi^2.
 The variance is the discriminating moment.  We assert:
   * <K>/target within +/-3 %,
   * Var(K)/target within +/-20 % (finite-sample tolerance),
@@ -64,7 +69,7 @@ def gate_canonical_ke(steps=20000, dt=0.5, T=300.0, tau_t=50.0, seed=7):
     at.calc = _MaceOffSingle(at, device=DEV)
     paras = dict(timestep=dt, steps=steps, temperature=T, thermostat="v-rescale",
                  tau_t=tau_t, init_velocities=True, random_seed=seed,
-                 remove_com=True, remove_com_every=0, remove_angular=False,
+                 remove_com=True, remove_com_every=1, remove_angular=False,
                  log_every=1, traj_every=steps, verbose=0)
     with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as f:
         out = f.name

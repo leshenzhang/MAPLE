@@ -25,6 +25,14 @@ MACE-OFF23 fp64 on a100):
 Run as a script on a GPU node (never on import).
 """
 import os, sys, tempfile
+# NVE writes a Unicode pre-equilibration advisory box to its output file; ensure
+# text file I/O uses UTF-8 even under a C/POSIX (ascii) batch locale.
+import locale as _locale
+for _loc in ("C.UTF-8", "en_US.UTF-8", "C.utf8", ""):
+    try:
+        _locale.setlocale(_locale.LC_ALL, _loc); break
+    except _locale.Error:
+        continue
 import numpy as np
 import torch
 torch.set_default_dtype(torch.float64)

@@ -27,6 +27,15 @@ compatibility guarantee that constraints='none' leaves the integrator untouched.
 Run as a script (never on import).
 """
 import os, sys, tempfile
+# NVE writes a Unicode pre-equilibration advisory box to its output file; ensure
+# text file I/O uses UTF-8 even under a C/POSIX (ascii) batch locale, so
+# jobABC.log_info() cannot raise UnicodeEncodeError. Self-contained (no env dep).
+import locale as _locale
+for _loc in ("C.UTF-8", "en_US.UTF-8", "C.utf8", ""):
+    try:
+        _locale.setlocale(_locale.LC_ALL, _loc); break
+    except _locale.Error:
+        continue
 from types import SimpleNamespace
 import numpy as np
 from ase import Atoms
