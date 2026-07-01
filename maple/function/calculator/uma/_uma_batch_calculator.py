@@ -193,6 +193,14 @@ class UMABatchCalc:
     # PBC-capable backend (read by box_guard + the batched-MD loop gate). Periodic
     # behaviour additionally requires a periodic task (checked at prepare()).
     SUPPORTS_PBC = True
+    # fairchem's per-atom ``batch`` index makes the co-batched graph block-diagonal:
+    # replica energies/forces are independent (no global charge equilibration), so
+    # BatchedNVT/REMD/... accept B>1 (read by nvt_batched._assert_batch_isolated).
+    batch_isolated = True
+    # Graph edge cutoff (matches the ``radius=6.0`` passed to AtomicData.from_ase in
+    # _a2g). box_guard.get_calculator_r_max reads this to enforce side >= 2*r_max for
+    # the periodic minimum-image guard; absent it, the guard silently no-ops.
+    r_max = 6.0
     # fairchem periodic task names (single-system gate parity, _uma_calculator.py).
     _PERIODIC_TASKS = ("omat", "oc20", "oc22", "oc25", "odac")
 
@@ -542,6 +550,26 @@ class UMABatchCalc:
         if self.N_atoms > 0:
             F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)  # vectorized scatter
         return E_eV * EV2HARTREE, F_pad * EV2HARTREE
+
+    # --------------------------------------------------- block-diagonal isolation
+    def isolation_check(self, perturb: float = 0.05) -> float:
+        """Perturb replica-0 atom-0 and return the max ENERGY leak into the OTHER
+        replicas [Ha] (mirrors MaceOffBatchCalc.isolation_check).
+
+        fairchem's ``atomicdata_list_to_batch`` tags every atom with a per-replica
+        ``batch`` index, so the co-batched graph is BLOCK-DIAGONAL: a displacement
+        inside replica 0 can only re-wire replica 0's own node block (its periodic
+        edges are rebuilt from replica 0's coords alone) and cannot reach another
+        replica. The residual leak floor is UMA's fp32 GPU-forward nondeterminism
+        (~1e-6, D-59), NOT exactly 0.0 as for the fp64-deterministic MACE-OFF path.
+        """
+        assert self._prepared and self._atoms_B >= 2
+        E0, _ = self.get_ef_gpu()
+        self.backup_coords()
+        self.coord[0, 0] += float(perturb)
+        E1, _ = self.get_ef_gpu()
+        self.restore_coords()
+        return float((E1[1:] - E0[1:]).abs().max().item())
 
     # ------------------------------------------------- partial-Hessian helper
     def _movable_key(self, movable_masks):
