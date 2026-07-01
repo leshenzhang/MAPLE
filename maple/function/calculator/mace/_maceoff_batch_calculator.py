@@ -489,6 +489,23 @@ class MaceOffBatchCalc:
         return None if not self._periodic else self._cell.clone()
 
     @torch.no_grad()
+    def set_cells_(self, cells):
+        """Set the per-replica cell to absolute ``cells`` (B,3,3) [Ang], refreshing the
+        inverse + the static per-graph stress cell (+ rcell). Used by the ASE bridge that
+        drives the single-system NPT with THIS batched engine (the barostat changes the
+        cell every step via ase set_cell, which must be pushed into the calc so the next
+        edge build + stress forward see the new box). Periodic batch only."""
+        assert self._prepared and self._periodic, "set_cells_ needs a periodic batch"
+        c = cells.to(self.device, self.dtype).reshape(self.B, 3, 3)
+        self._cell = c.clone()
+        self._cell_inv = torch.linalg.inv(self._cell)
+        if self._static is not None and self._static.get("cell") is not None:
+            self._static["cell"] = self._cell.reshape(self.B * 3, 3).clone()
+        if self._static is not None and self._static.get("rcell") is not None:
+            self._static["rcell"] = (2.0 * np.pi * torch.linalg.inv(
+                self._cell.transpose(-1, -2))).reshape(self.B * 3, 3)
+
+    @torch.no_grad()
     def rescale_isotropic_(self, mu):
         """Isotropic barostat rescale of each replica by the per-replica scalar mu (B,):
         scale REAL-atom positions about the cell origin (cartesian *= mu -- exact for a

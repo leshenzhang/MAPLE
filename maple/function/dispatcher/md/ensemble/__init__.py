@@ -8,6 +8,8 @@ Provides different statistical ensembles for MD simulations:
 
 Batched (one MLIP forward over B replicas) + enhanced-sampling ensembles:
     - BatchedMD / BatchedNVT: B-replica canonical MD (one forward/step)
+    - BatchedNPT: B-replica isothermal-isobaric MD, per-replica box + barostat
+      (one batched force+stress forward/force-eval) -- the PBC Phase-2C kernel
     - BatchedUmbrella: batched umbrella sampling (harmonic windows)
     - BatchedGaMD: batched GaMD + ParGaMD weighted-ensemble
     - BatchedSMD: batched constant-velocity steered MD -> Jarzynski Delta-G
@@ -19,10 +21,12 @@ from .nvt import NVT
 from .npt import NPT
 from .batched import BatchedMD
 from .nvt_batched import BatchedNVT, BatchedNVTParams
+from .npt_batched import BatchedNPT, BatchedNPTParams
 from .umbrella_batched import BatchedUmbrella
 from .gamd_batched import BatchedGaMD
 from .smd_batched import BatchedSMD
 from .remd import REMD, REMDParams
 
 __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
+           'BatchedNPT', 'BatchedNPTParams',
            'BatchedUmbrella', 'BatchedGaMD', 'BatchedSMD', 'REMD', 'REMDParams']
