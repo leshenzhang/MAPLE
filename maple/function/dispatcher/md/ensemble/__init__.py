@@ -23,6 +23,8 @@ from .umbrella_batched import BatchedUmbrella
 from .gamd_batched import BatchedGaMD
 from .smd_batched import BatchedSMD
 from .remd import REMD, REMDParams
+from .hremd_rest2 import REST2, REST2Params
 
 __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
-           'BatchedUmbrella', 'BatchedGaMD', 'BatchedSMD', 'REMD', 'REMDParams']
+           'BatchedUmbrella', 'BatchedGaMD', 'BatchedSMD', 'REMD', 'REMDParams',
+           'REST2', 'REST2Params']

@@ -382,6 +382,78 @@ class MaceOffBatchCalc:
         E_Ha = E_eV * EV2HARTREE
         return E_Ha, F_Ha
 
+    # ------------------------------------------------------ REST2 node-energy temper
+    def get_ef_rest_gpu(self, lambdas, solute_mask):
+        """Node-energy solute-tempered energy ``E_m`` and its TRUE conservative force.
+
+        REST2-style Hamiltonian tempering for a BLACK-BOX MLIP via the per-atom node
+        energies MACE exposes. ``out["node_energy"]`` (= node_e0 + scale_shift(node
+        interaction energy)) sums per graph to the total energy, so it is a real,
+        conservative partition of E_full. Define, per replica ``b``::
+
+            S_b   = sum_{i in solute} node_energy_i          (solute node-energy sum)
+            E_m,b = E_full,b + (lambda_b - 1) * S_b          (tempered scalar energy)
+
+        ``E_m`` is a genuine scalar function of ALL positions, hence
+        ``F_m = -dE_m/dR`` is a TRUE conservative force -- computed here by autograd
+        of the (block-diagonal, cross-isolated) weighted energy sum. This is NOT a
+        force rescale: solute node energies depend on the FULL geometry through
+        message passing, so ``F_m`` carries nonzero components on SOLVENT atoms too
+        (exactly what a naive "scale the solute forces" scheme omits, and what the FD
+        gate G2 rejects). At ``lambda==1`` the ``(lambda-1)`` factor is exactly 0, so
+        ``E_m == E_full`` and ``F_m == F_full`` bit-for-bit (gate G1).
+
+        Args:
+          lambdas     : (B,) per-replica lambda (>0; lambda==1 => physical).
+          solute_mask : (N_atoms,) bool over the CONCATENATED replica atom ordering.
+        Returns:
+          E_m_Ha (B,)            [Hartree]           tempered energy
+          F_m_Ha (B, nmax_dof)   [Hartree/Angstrom]  tempered force (padded buffer)
+          S_Ha   (B,)            [Hartree]           solute node-energy sum per replica
+        """
+        if self.B == 0:
+            z = torch.zeros((0,), dtype=self.dtype, device=self.device)
+            return z, torch.zeros((0, 0), dtype=self.dtype, device=self.device), z.clone()
+        lam = torch.as_tensor(np.asarray(lambdas, dtype=np.float64),
+                              dtype=self.dtype, device=self.device).reshape(-1)
+        assert lam.numel() == self.B, f"lambdas must be length B={self.B}, got {lam.numel()}"
+        smask = torch.as_tensor(np.asarray(solute_mask, dtype=bool), device=self.device).reshape(-1)
+        assert smask.numel() == self.N_atoms, \
+            f"solute_mask must be length N_atoms={self.N_atoms}, got {smask.numel()}"
+
+        coord = self.coord.detach().to(self.device, self.dtype).requires_grad_(True)
+        edge_index, shifts, unit_shifts = self._build_edges_gpu(coord)
+        d = dict(self._static)                       # shallow copy; static tensors reused
+        d["positions"] = coord
+        d["edge_index"] = edge_index
+        d["shifts"] = shifts
+        d["unit_shifts"] = unit_shifts
+        out = self.model(d, compute_force=False, training=False)
+        E_eV = out["energy"].reshape(-1)                     # (B,)  grad-enabled
+        node_e = out["node_energy"].reshape(-1)              # (N,)  grad-enabled
+        if not node_e.requires_grad:
+            raise RuntimeError(
+                "MACE node_energy is not differentiable; REST2 node-energy tempering "
+                "requires a grad-enabled per-atom node energy.")
+        batch_idx = self._static["batch"].to(self.device).long().reshape(-1)   # (N,) node->replica
+        contrib = node_e * smask.to(self.dtype)              # (N,)  solute-masked node energy
+        S = torch.zeros(self.B, dtype=self.dtype, device=self.device)
+        S = S.index_add(0, batch_idx, contrib)               # (B,)  solute node-energy sum
+        E_m = E_eV + (lam - 1.0) * S                         # (B,)  tempered energy (eV)
+        grad = torch.autograd.grad(E_m.sum(), coord)[0]      # (N,3) = dE_m/dR  (isolated => per-replica)
+        F_eV = (-grad).detach()
+
+        F_flat = torch.zeros(self.B * self.nmax_dof, dtype=self.dtype, device=self.device)
+        if self.N_atoms > 0:
+            base = self._base
+            F_flat[base] = F_eV[:, 0]
+            F_flat[base + 1] = F_eV[:, 1]
+            F_flat[base + 2] = F_eV[:, 2]
+        F_Ha = F_flat.view(self.B, self.nmax_dof) * EV2HARTREE
+        E_m_Ha = E_m.detach() * EV2HARTREE
+        S_Ha = S.detach() * EV2HARTREE
+        return E_m_Ha, F_Ha, S_Ha
+
     # --------------------------------------------------------------- isolation
     def isolation_check(self, perturb: float = 0.05) -> float:
         """Perturb replica-0 atom 0 and return the max ENERGY leak into the OTHER
