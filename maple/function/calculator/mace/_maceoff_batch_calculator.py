@@ -109,9 +109,11 @@ class MaceOffBatchCalc:
         explicit choice (energy drift fp32->TF32 ~1.2e-3 Ha, acceptable for NVT per
         B-33). It is a no-op for fp64 (the flag does not affect double-precision
         matmuls), so leaving it set never perturbs the fp64 default path."""
-        if self.allow_tf32 and self.dtype == torch.float32 and self.device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        # R3-6 opt: do NOT persistently set the process-global TF32 flag here (it
+        # leaked into every other calculator in the process). TF32 is instead scoped
+        # to this calc's model forward via try/finally in _batched_ef_eV. self.allow_tf32
+        # remains the source of truth; this method is now a documented no-op.
+        return
 
     def set_precision(self, dtype: torch.dtype, allow_tf32: bool = False):
         """Switch the forward precision in place (Lever 1 wiring from BatchedNVT).
@@ -226,6 +228,17 @@ class MaceOffBatchCalc:
         self._cand_rep = (torch.cat(rep_l) if rep_l
                           else torch.zeros((0,), dtype=torch.long, device=device))
 
+        # R3-7 opt: _build_edges_pbc gathers self._cell[_cand_rep] /
+        # self._cell_inv[_cand_rep] every step, but _cand_rep and the cell are both
+        # loop-invariant (fixed after prepare; no NPT hook mutates _cell). Precompute
+        # the per-candidate-pair cell / inverse-cell ONCE (byte-identical gather).
+        if self._periodic and self._cand_rep.numel() > 0:
+            self._cand_cell = self._cell[self._cand_rep]          # (P,3,3)
+            self._cand_cell_inv = self._cell_inv[self._cand_rep]  # (P,3,3)
+        else:
+            self._cand_cell = None
+            self._cand_cell_inv = None
+
         if self.B == 0:
             self._static = None
             return
@@ -322,9 +335,9 @@ class MaceOffBatchCalc:
         only the cartesian ``shifts``; integer unit shifts are a stress-path field.
         """
         device = self.device
-        ci, cj, rep = self._cand_i, self._cand_j, self._cand_rep
-        cellp = self._cell[rep]            # (P,3,3)
-        invp = self._cell_inv[rep]         # (P,3,3)
+        ci, cj = self._cand_i, self._cand_j
+        cellp = self._cand_cell            # (P,3,3)  R3-7: precomputed self._cell[_cand_rep]
+        invp = self._cand_cell_inv         # (P,3,3)  R3-7: precomputed self._cell_inv[_cand_rep]
         rij0 = coord[cj] - coord[ci]       # (P,3)  (r_j - r_i)
         # nearest-image base cell in fractional space (handles unwrapped drift).
         n0 = torch.round(torch.einsum("pc,pck->pk", rij0, invp))     # (P,3)
@@ -362,9 +375,25 @@ class MaceOffBatchCalc:
         d["edge_index"] = edge_index
         d["shifts"] = shifts
         d["unit_shifts"] = unit_shifts
-        out = self.model(d, compute_force=True, training=False)
-        E_eV = out["energy"].detach().reshape(-1).to(self.dtype)          # (B,)
-        F_eV = out["forces"].detach().to(self.dtype)                      # (N,3)
+        # R3-6 opt: TF32 is a PROCESS-GLOBAL backend flag. Scope it to THIS forward
+        # with try/finally so it never leaks into another calculator sharing the
+        # process. The matmul accumulation inside the model call is byte-identical to
+        # before (the flag holds the same value during the call); only the global
+        # backend state is restored afterwards.
+        _prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+        _prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        _want_tf32 = bool(self.allow_tf32 and self.dtype == torch.float32
+                          and self.device.type == "cuda")
+        try:
+            if _want_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            out = self.model(d, compute_force=True, training=False)
+            E_eV = out["energy"].detach().reshape(-1).to(self.dtype)          # (B,)
+            F_eV = out["forces"].detach().to(self.dtype)                      # (N,3)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = _prev_tf32
+            torch.backends.cudnn.allow_tf32 = _prev_cudnn_tf32
         return E_eV, F_eV
 
     def get_ef_gpu(self):

@@ -150,6 +150,14 @@ class MACEPolBatchCalc:
         self._base = None
         self._n_b = None
         self._coord_backup = None
+        # R3-5: loop-invariant single-graph forward tensors (set in prepare())
+        self._fwd_batch = None
+        self._fwd_ptr = None
+        self._fwd_cell = None
+        self._fwd_tc = None
+        self._fwd_ts = None
+        self._fwd_ext = None
+        self._fwd_log = None
 
         try:
             self._probe_double_backward()
@@ -207,6 +215,20 @@ class MACEPolBatchCalc:
                 ci.append(iu + off); cj.append(ju + off)
         self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
         self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
+
+        # R3-5 opt: hoist the 7 loop-invariant tensors consumed by the per-step
+        # _forward_single_graph model call out of the hot path (batch/ptr/cell are
+        # geometry-invariant; tc/ts derive from the fixed total_charge/total_spin;
+        # ext/log are the constant zero external-field / unit log-weight). Values are
+        # byte-identical to the former per-forward allocation.
+        N = self.N_atoms
+        self._fwd_batch = torch.zeros(N, dtype=torch.int64, device=device)
+        self._fwd_ptr = torch.tensor([0, N], dtype=torch.int64, device=device)
+        self._fwd_cell = torch.zeros((3, 3), dtype=self.mdtype, device=device)
+        self._fwd_tc = self.total_charge.sum().reshape(1)
+        self._fwd_ts = self.total_spin.sum().reshape(1)
+        self._fwd_ext = torch.zeros((N, 3), dtype=self.mdtype, device=device)
+        self._fwd_log = torch.ones((N,), dtype=self.mdtype, device=device)
 
         self._coord_backup = None
         self._prepared = True
@@ -316,16 +338,10 @@ class MACEPolBatchCalc:
         B, N = self._atoms_B, self.N_atoms
         coord_leaf = coord.detach().to(device=device, dtype=self.mdtype).requires_grad_(True)
         edge_index, shifts, unit_shifts = self._build_edges(coord_leaf)
-        batch = torch.zeros(N, dtype=torch.int64, device=device)   # single graph
-        ptr = torch.tensor([0, N], dtype=torch.int64, device=device)
-        cell = torch.zeros((3, 3), dtype=self.mdtype, device=device)
-        tc = self.total_charge.sum().reshape(1)                    # one graph total
-        ts = self.total_spin.sum().reshape(1)
-        ext = torch.zeros((N, 3), dtype=self.mdtype, device=device)
-        log = torch.ones((N,), dtype=self.mdtype, device=device)
-
+        # R3-5 opt: reuse the loop-invariant forward tensors hoisted in prepare().
         out = self.model(coord_leaf, self.node_attrs, edge_index, shifts, unit_shifts,
-                         batch, ptr, cell, tc, ts, ext, log)
+                         self._fwd_batch, self._fwd_ptr, self._fwd_cell,
+                         self._fwd_tc, self._fwd_ts, self._fwd_ext, self._fwd_log)
         total_energy, node_energy, _density = out[0], out[1], out[2]
 
         ne = node_energy.reshape(-1)
