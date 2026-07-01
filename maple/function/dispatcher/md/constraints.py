@@ -195,6 +195,10 @@ class ConstraintManager:
         self.inv_mj = 1.0 / masses[self.aj]
         self.inv_mu = self.inv_mi + self.inv_mj
 
+        # Jacobi convergence-iteration counters (last sweep); 0 before first call.
+        self.last_pos_iters = 0
+        self.last_vel_iters = 0
+
     # -- minimum-image displacement ------------------------------------------
     def _mic(self, d):
         """Minimum-image displacement for an (M,3) array (no-op when not PBC)."""
@@ -235,49 +239,65 @@ class ConstraintManager:
                           velocities: np.ndarray, dt_au: float) -> np.ndarray:
         """Restore all bond lengths (positions modified in place on ``atoms``)
         and apply the matching correction to ``velocities``. Returns the
-        corrected velocities."""
+        corrected velocities.
+
+        Vectorized batched-JACOBI RATTLE sweep. Every constraint correction in a
+        sweep is computed from the SAME pre-sweep positions in a single ``(M,3)``
+        minimum-image op, and the M corrections are applied SIMULTANEOUSLY via
+        ``np.add.at`` scatter (Jacobi update), instead of sequentially reusing
+        partially-updated positions (Gauss-Seidel). Jacobi is order-free and fully
+        vectorized; it converges to the identical constrained manifold as the
+        serial SHAKE sweep, only needing more outer iterations. The outer
+        convergence-iteration loop is retained, and a post-loop residual check
+        (below) guards the new path against returning an unconverged geometry."""
         if self.n_constraints == 0:
             return velocities
 
         ai, aj = self.ai, self.aj
-        inv_mi, inv_mj = self.inv_mi, self.inv_mj
-        d0sq = self.d0sq
+        inv_mi, inv_mj, inv_mu = self.inv_mi, self.inv_mj, self.inv_mu
+        d0, d0sq = self.d0, self.d0sq
         tol = self.tol
-        # reference bond directions r_i(t) - r_j(t) (classic SHAKE gradient)
+        # reference bond directions r_i(t) - r_j(t) (classic SHAKE gradient); fixed
         ref = self._mic(ref_positions[ai] - ref_positions[aj])
         # position correction dr[A] -> velocity correction dr/(dt_au*BOHR2ANG)
         vfac = 1.0 / (dt_au * BOHR_TO_ANGSTROM)
 
         pos = atoms.get_positions()
         v = velocities.copy()
-        cell, cell_inv, pbc = self._cell, self._cell_inv, self.pbc
 
+        n_iter = 0
         for _ in range(self.max_iter):
-            max_err = 0.0
-            for k in range(self.n_constraints):
-                i, j = ai[k], aj[k]
-                rij = pos[i] - pos[j]
-                if pbc:
-                    fr = rij @ cell_inv
-                    fr -= np.round(fr)
-                    rij = fr @ cell
-                d2 = rij @ rij
-                diff = d2 - d0sq[k]
-                err = abs(np.sqrt(d2) - self.d0[k])
-                if err > max_err:
-                    max_err = err
-                if err <= tol:
-                    continue
-                s = ref[k]
-                g = diff / (2.0 * self.inv_mu[k] * (rij @ s))
-                di = (g * inv_mi[k]) * s
-                dj = (g * inv_mj[k]) * s
-                pos[i] -= di
-                pos[j] += dj
-                v[i] -= di * vfac
-                v[j] += dj * vfac
+            n_iter += 1
+            # all M current bond vectors from the SAME pre-sweep positions (Jacobi)
+            rij = self._mic(pos[ai] - pos[aj])              # (M,3)
+            d2 = np.einsum("ij,ij->i", rij, rij)            # (M,)
+            err = np.abs(np.sqrt(d2) - d0)                  # (M,)
+            max_err = float(err.max())
             if max_err <= tol:
                 break
+            active = err > tol
+            diff = d2 - d0sq                                # (M,)
+            rij_dot_s = np.einsum("ij,ij->i", rij, ref)     # (M,)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                g = np.where(active, diff / (2.0 * inv_mu * rij_dot_s), 0.0)
+            di = (g * inv_mi)[:, None] * ref                # (M,3)
+            dj = (g * inv_mj)[:, None] * ref                # (M,3)
+            # Jacobi scatter: all M corrections applied simultaneously (an atom
+            # shared by several constraints accumulates via np.add.at, unbuffered)
+            np.add.at(pos, ai, -di)
+            np.add.at(pos, aj,  dj)
+            np.add.at(v,   ai, -di * vfac)
+            np.add.at(v,   aj,  dj * vfac)
+
+        # post-loop convergence guard (Jacobi needs more sweeps than Gauss-Seidel)
+        rij = self._mic(pos[ai] - pos[aj])
+        max_res = float(np.abs(np.sqrt(np.einsum("ij,ij->i", rij, rij)) - d0).max())
+        if max_res > tol:
+            raise RuntimeError(
+                f"RATTLE position projection (Jacobi) failed to converge: max bond "
+                f"residual {max_res:.3e} A > tol {tol:.3e} A after {self.max_iter} "
+                f"iterations. Raise ConstraintManager max_iter.")
+        self.last_pos_iters = n_iter
 
         atoms.set_positions(pos)
         return v
@@ -285,36 +305,52 @@ class ConstraintManager:
     # -- RATTLE velocity stage ----------------------------------------------
     def project_velocities(self, atoms: Atoms, velocities: np.ndarray) -> np.ndarray:
         """Project velocities so the relative velocity along every bond is zero
-        (RATTLE velocity stage). Returns the corrected velocities."""
+        (RATTLE velocity stage). Returns the corrected velocities.
+
+        Vectorized batched-JACOBI sweep (same scheme as ``project_positions``):
+        all M relative-velocity corrections are computed from the SAME pre-sweep
+        velocities and scattered simultaneously via ``np.add.at`` scatter, instead
+        of the serial Gauss-Seidel per-constraint update. A post-loop residual
+        check guards against returning unconverged velocities."""
         if self.n_constraints == 0:
             return velocities
 
         ai, aj = self.ai, self.aj
-        inv_mi, inv_mj = self.inv_mi, self.inv_mj
+        inv_mi, inv_mj, inv_mu = self.inv_mi, self.inv_mj, self.inv_mu
         vtol = self.vtol
         pos = atoms.get_positions()
         v = velocities.copy()
-        cell, cell_inv, pbc = self._cell, self._cell_inv, self.pbc
 
         # current bond vectors r(t+dt) (fixed during the velocity sweep)
         bond = self._mic(pos[ai] - pos[aj])
         bond2 = np.einsum("ij,ij->i", bond, bond)
 
+        n_iter = 0
         for _ in range(self.max_iter):
-            max_err = 0.0
-            for k in range(self.n_constraints):
-                i, j = ai[k], aj[k]
-                rij = bond[k]
-                rv = (v[i] - v[j]) @ rij
-                if abs(rv) > max_err:
-                    max_err = abs(rv)
-                if abs(rv) <= vtol:
-                    continue
-                kk = -rv / (self.inv_mu[k] * bond2[k])
-                v[i] += (kk * inv_mi[k]) * rij
-                v[j] -= (kk * inv_mj[k]) * rij
+            n_iter += 1
+            # relative velocity along each bond from the SAME pre-sweep v (Jacobi)
+            rv = np.einsum("ij,ij->i", v[ai] - v[aj], bond)   # (M,)
+            max_err = float(np.abs(rv).max())
             if max_err <= vtol:
                 break
+            active = np.abs(rv) > vtol
+            with np.errstate(divide="ignore", invalid="ignore"):
+                kk = np.where(active, -rv / (inv_mu * bond2), 0.0)   # (M,)
+            dvi = (kk * inv_mi)[:, None] * bond               # (M,3)
+            dvj = (kk * inv_mj)[:, None] * bond               # (M,3)
+            # Jacobi scatter: all M velocity corrections applied simultaneously
+            np.add.at(v, ai,  dvi)
+            np.add.at(v, aj, -dvj)
+
+        # post-loop convergence guard
+        rv = np.einsum("ij,ij->i", v[ai] - v[aj], bond)
+        max_res = float(np.abs(rv).max())
+        if max_res > vtol:
+            raise RuntimeError(
+                f"RATTLE velocity projection (Jacobi) failed to converge: max "
+                f"|(v_i-v_j).r_ij| {max_res:.3e} > vtol {vtol:.3e} after "
+                f"{self.max_iter} iterations. Raise ConstraintManager max_iter.")
+        self.last_vel_iters = n_iter
         return v
 
 
