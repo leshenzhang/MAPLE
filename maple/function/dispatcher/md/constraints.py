@@ -289,18 +289,70 @@ class ConstraintManager:
             np.add.at(v,   ai, -di * vfac)
             np.add.at(v,   aj,  dj * vfac)
 
-        # post-loop convergence guard (Jacobi needs more sweeps than Gauss-Seidel)
+        # post-loop convergence guard. `not (max_res <= tol)` (NOT `> tol`) so a
+        # NaN residual triggers the guard: `nan > tol` is False and would silently
+        # return a NaN geometry (B-117 MED).
         rij = self._mic(pos[ai] - pos[aj])
         max_res = float(np.abs(np.sqrt(np.einsum("ij,ij->i", rij, rij)) - d0).max())
-        if max_res > tol:
-            raise RuntimeError(
-                f"RATTLE position projection (Jacobi) failed to converge: max bond "
-                f"residual {max_res:.3e} A > tol {tol:.3e} A after {self.max_iter} "
-                f"iterations. Raise ConstraintManager max_iter.")
+        if not (max_res <= tol):
+            # Jacobi is unstable for tightly-coupled 1-3 (h-angles) constraints
+            # (an atom shared by strongly-coupled constraints is over-corrected by
+            # the simultaneous scatter). Fall back to the unconditionally-stable
+            # serial Gauss-Seidel SHAKE sweep from the pre-projection state (B-117
+            # HIGH). Jacobi stays the fast path (20.7x) for bonds/h-bonds/rigid-water.
+            pos = atoms.get_positions()
+            v = velocities.copy()
+            max_res = self._gs_positions(pos, v, ref, vfac)
+            if not np.isfinite(max_res):
+                raise RuntimeError(
+                    f"RATTLE position projection non-finite (Jacobi + serial-GS "
+                    f"fallback both failed): max bond residual {max_res} A. "
+                    f"Constraint set is broken/incompatible.")
+            if max_res > tol:
+                import warnings
+                warnings.warn(
+                    f"RATTLE: serial-GS fallback stalled at max bond residual "
+                    f"{max_res:.3e} A > tol {tol:.3e} A after {self.max_iter} iters "
+                    f"(over-determined constraints, e.g. h-angles on a rigid ring); "
+                    f"using best-effort geometry (matches pre-B-94 serial-GS).",
+                    RuntimeWarning)
         self.last_pos_iters = n_iter
 
         atoms.set_positions(pos)
         return v
+
+    def _gs_positions(self, pos, v, ref, vfac):
+        """Serial Gauss-Seidel SHAKE fallback (modifies pos/v in place). Sequential
+        per-constraint update is unconditionally stable for coupled 1-3 (h-angles)
+        constraints. Returns the final max bond residual (A)."""
+        ai, aj = self.ai, self.aj
+        inv_mi, inv_mj, inv_mu = self.inv_mi, self.inv_mj, self.inv_mu
+        d0, d0sq, tol = self.d0, self.d0sq, self.tol
+        cell, cell_inv, pbc = self._cell, self._cell_inv, self.pbc
+        for _ in range(self.max_iter):
+            max_err = 0.0
+            for k in range(self.n_constraints):
+                i, j = ai[k], aj[k]
+                rij = pos[i] - pos[j]
+                if pbc:
+                    fr = rij @ cell_inv; fr -= np.round(fr); rij = fr @ cell
+                d2 = float(rij @ rij)
+                err = abs(np.sqrt(d2) - d0[k])
+                if err > max_err:
+                    max_err = err
+                if err <= tol:
+                    continue
+                s = ref[k]; denom = 2.0 * inv_mu[k] * float(rij @ s)
+                if denom == 0.0:
+                    continue
+                g = (d2 - d0sq[k]) / denom
+                di = (g * inv_mi[k]) * s; dj = (g * inv_mj[k]) * s
+                pos[i] -= di; pos[j] += dj
+                v[i] -= di * vfac; v[j] += dj * vfac
+            if max_err <= tol:
+                break
+        rij = self._mic(pos[ai] - pos[aj])
+        return float(np.abs(np.sqrt(np.einsum("ij,ij->i", rij, rij)) - d0).max())
 
     # -- RATTLE velocity stage ----------------------------------------------
     def project_velocities(self, atoms: Atoms, velocities: np.ndarray) -> np.ndarray:
@@ -342,16 +394,48 @@ class ConstraintManager:
             np.add.at(v, ai,  dvi)
             np.add.at(v, aj, -dvj)
 
-        # post-loop convergence guard
+        # post-loop convergence guard (NaN-safe, see project_positions)
         rv = np.einsum("ij,ij->i", v[ai] - v[aj], bond)
         max_res = float(np.abs(rv).max())
-        if max_res > vtol:
-            raise RuntimeError(
-                f"RATTLE velocity projection (Jacobi) failed to converge: max "
-                f"|(v_i-v_j).r_ij| {max_res:.3e} > vtol {vtol:.3e} after "
-                f"{self.max_iter} iterations. Raise ConstraintManager max_iter.")
+        if not (max_res <= vtol):
+            v = velocities.copy()
+            max_res = self._gs_velocities(v, bond, bond2)
+            if not np.isfinite(max_res):
+                raise RuntimeError(
+                    f"RATTLE velocity projection non-finite (Jacobi + serial-GS "
+                    f"fallback both failed): max |(v_i-v_j).r_ij| {max_res}.")
+            if max_res > vtol:
+                import warnings
+                warnings.warn(
+                    f"RATTLE: serial-GS velocity fallback stalled at {max_res:.3e} "
+                    f"> vtol {vtol:.3e} (over-determined constraints); best-effort.",
+                    RuntimeWarning)
         self.last_vel_iters = n_iter
         return v
+
+    def _gs_velocities(self, v, bond, bond2):
+        """Serial Gauss-Seidel RATTLE velocity fallback (modifies v in place).
+        Returns the final max residual |(v_i - v_j).r_ij|."""
+        ai, aj = self.ai, self.aj
+        inv_mi, inv_mj, inv_mu = self.inv_mi, self.inv_mj, self.inv_mu
+        vtol = self.vtol
+        for _ in range(self.max_iter):
+            max_err = 0.0
+            for k in range(self.n_constraints):
+                i, j = ai[k], aj[k]
+                rij = bond[k]
+                rv = float((v[i] - v[j]) @ rij)
+                if abs(rv) > max_err:
+                    max_err = abs(rv)
+                if abs(rv) <= vtol:
+                    continue
+                kk = -rv / (inv_mu[k] * bond2[k])
+                v[i] += (kk * inv_mi[k]) * rij
+                v[j] -= (kk * inv_mj[k]) * rij
+            if max_err <= vtol:
+                break
+        rv = np.einsum("ij,ij->i", v[ai] - v[aj], bond)
+        return float(np.abs(rv).max())
 
 
 def build_constraint_manager(atoms: Atoms, params):
