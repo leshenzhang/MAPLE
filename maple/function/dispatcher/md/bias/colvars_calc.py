@@ -7,17 +7,25 @@ folds the bias force into the MLIP force, so NVE/NVT/NPT all gain Colvars biases
 
 PLUMED is the *primary, validated* backend (broadest CV set, ASE-tested unit
 contract). Colvars is provided for its distinctive **eABF / multiple-walker
-ABF** support (roadmap P1.3). It requires the ``colvars`` Python bindings built
-from the Colvars repo; if they are absent this raises an actionable error
-pointing back to the PLUMED path.
+ABF** support (roadmap P1.3). It requires a ``colvars`` Python module exposing
+the generic (host-less) proxy object API used below; upstream currently ships
+no such pip/conda package (only a host-linked ctypes scripting shim), so a
+pybind wrapper around ``colvarproxy_stub`` must be built before this backend is
+usable. Absent that, ``_init_colvars`` raises an actionable error pointing back
+to the PLUMED path.
 
 Units
 -----
 MAPLE works in Hartree / Å / fs. Colvars has no Hartree+Å unit system (its
 "electron" system is Hartree+Bohr), so we run Colvars in its **"real"** system
 (kcal/mol, Å) and convert only energy/force at the seam — positions are already
-Å. HA_TO_KCAL converts the inner MLIP energy/force into Colvars units and the
-returned bias energy/force back into Hartree.
+Å. HA_TO_KCAL converts only the bias energy/force Colvars returns (kcal/mol,
+kcal/mol/Å) back to Hartree / Ha/Å. The inner MLIP energy/force stay in Hartree
+and are never pushed to Colvars: a position-space bias (harmonic restraint /
+metadynamics / eABF) needs only the atomic coordinates. (An ABF scheme that
+derives the CV total force from the system forces would additionally require
+pushing ``forces`` into Colvars — outside this backend's restraint/metaD/eABF
+target.)
 """
 
 import numpy as np
@@ -62,8 +70,11 @@ class ColvarsCalculator(Calculator):
         except Exception as exc:
             raise RuntimeError(
                 "Colvars bias requested but the `colvars` Python bindings are "
-                "not importable (%s). Build them from github.com/Colvars/colvars "
-                "(python/), or use the PLUMED backend (`plumed=...`), which is "
+                "not importable (%s). Upstream github.com/Colvars/colvars ships "
+                "no pip/conda `colvars` package exposing this Colvars() object "
+                "API (only a ctypes scripting shim linked into a host NAMD/VMD "
+                "executable); a pybind wrapper around colvarproxy_stub must be "
+                "built first. Until then use the PLUMED backend (`plumed=...`), "
                 "the primary validated enhanced-sampling path in MAPLE." % exc)
         # Generic ("Tcl-less") Colvars proxy. Method names are probed so a minor
         # binding-version drift surfaces as a clear error instead of silent zero.
@@ -73,6 +84,15 @@ class ColvarsCalculator(Calculator):
             if hasattr(proxy, setter):
                 getattr(proxy, setter)(arg)
                 break
+        # Push MD context (timestep fs, temperature K) BEFORE parsing config so
+        # extended-Lagrangian methods (eABF / extended-system metadynamics) can
+        # integrate their fictitious DOF + thermostat; a no-op for pure
+        # position-space biases (harmonic restraint / plain ABF / metaD). dt and
+        # T are unit-system independent in Colvars (always fs / K).
+        if hasattr(proxy, "set_timestep"):
+            proxy.set_timestep(self.timestep_fs)
+        if hasattr(proxy, "set_temperature"):
+            proxy.set_temperature(self.temperature)
         proxy.read_config_string(self._config) if hasattr(
             proxy, "read_config_string") else proxy.read_config(self._config)
         self._cv = proxy
