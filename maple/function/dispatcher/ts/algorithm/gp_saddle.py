@@ -24,16 +24,31 @@ primitive + streaming-pool/shrink pattern from ``BatchDimer`` / ``BatchPRFO``).
 
 EXACT-AT-CONVERGENCE. Convergence rests on the TRUE MLIP FORCE, never on the
 surrogate: a structure is declared converged only when the TRUE force at its
-latest evaluated point satisfies |F| < fmax (per-atom max & RMS). The
-first-order-saddle mode is confirmed either by the surrogate min-mode curvature
-(cheap default, with a ``curv_patience`` fallback that accepts on the exact force
-alone after K consecutive |F_true|<fmax rounds so a genuinely force-converged
-saddle is never spuriously ``max_iter``ed while the online curvature sign is
-still settling) OR, rigorously, by ONE TRUE FD-HVP forward at the candidate
-(``confirm_curv_true=True`` -> exact curvature, not surrogate). The GP only
+latest evaluated point satisfies |F| < fmax (per-atom max & RMS) AND it is a
+genuine FIRST-ORDER saddle. The saddle-type test is the number of NEGATIVE modes
+of the surrogate Hessian at the candidate (free finite differences of the GP
+gradient): a first-order saddle has EXACTLY ONE. This is the correct test --
+a single-axis "curvature < 0" is necessary but NOT sufficient (a |F|<fmax point
+can be a minimum whose perpendicular subspace still has negative modes, or a
+higher-order saddle; the index==1 test rejects both, so the search cannot
+false-converge to a non-TS). Optionally the single negative mode's sign is also
+confirmed by ONE TRUE FD-HVP forward (``confirm_curv_true=True``). The GP only
 CHOOSES where to sample and steers the min mode; the stop test reads the real
-forward. So the surrogate can be crude and the answer is still the real saddle to
-the force tolerance.
+forward, so the surrogate can be crude and the answer is still the real saddle.
+
+ROBUST ACQUISITION (so the search reaches the saddle on a stiff real PES instead
+of wandering to ``max_iter``). Three ingredients, all training-free: (1) each GP
+is WARM-STARTED with a few points sampled around the guess so the GEK has real
+curvature before the first surrogate proposal (a 1-2 point GP has no min mode ->
+garbage early steps); (2) each proposal is capped by a per-structure MODEL-QUALITY
+trust radius that grows when the GP predicted the true force well at the last
+proposal and shrinks when it mispredicted (Denzel-Kastner GP-TS), with the center
+always advancing (a min-mode climb legitimately raises |F|, so an |F|-monotone
+accept/reject would stall); (3) the kernel length scale is data-driven (see
+below). NOTE: a min-mode dimer can still converge to a DIFFERENT stationary point
+than intended from a poor start (inherent to min-mode search, not a bug); seeding
+the reaction-coordinate axis (``n_init``) or a better guess is the remedy, and the
+index==1 gate guarantees whatever is returned IS a true first-order saddle.
 
 The GP is a Gradient-Enhanced Kriging (GEK) model: it is fit on BOTH the energy
 and the gradient (= -force) that each true forward already returns for free, so
@@ -529,9 +544,17 @@ class GPSaddle:
         self.n = x0.shape[0]
         self.x_c = x0.copy()                      # current search center
         self.gp.add(x0, E0, F0)
-        # initial dimer axis
+        # initial dimer axis. "given" (n_given) lets the caller seed the reaction
+        # coordinate (e.g. P-R from a NEB/GSM band) so the min mode starts on the
+        # intended mode instead of wandering to another saddle; "force" seeds it
+        # from the guess force; "random" otherwise.
         rng = np.random.default_rng(int(p.seed))
-        if p.n_init == "force" and float(np.linalg.norm(F0)) > 1e-8:
+        if p.n_init == "given" and getattr(p, "n_given", None) is not None:
+            N = np.asarray(p.n_given, dtype=np.float64).reshape(-1)
+            if N.size != 3 * self.n:
+                raise ValueError(f"n_given size {N.size} != 3*n_atoms {3 * self.n}")
+            N = N.copy()
+        elif p.n_init == "force" and float(np.linalg.norm(F0)) > 1e-8:
             N = F0.reshape(-1).copy()
         else:
             N = rng.normal(size=3 * self.n)
@@ -613,6 +636,31 @@ class GPSaddle:
         self.curvature = C
         return x.reshape(-1, 3), C
 
+    def n_negative_surrogate_modes(self, x: np.ndarray, delta: float = 2.0e-3,
+                                   rel_tol: float = 1.0e-2) -> int:
+        """Number of NEGATIVE eigenvalues of the SURROGATE Hessian at ``x`` (the
+        Morse/saddle INDEX). Built free from central finite differences of the GP
+        predictive gradient over the 3n Cartesian basis (zero true forwards);
+        eigenvalues within ``rel_tol`` of the spectral scale are treated as zero
+        (excludes the rigid-body / soft modes -- for the invdist descriptor the
+        surrogate gradient is rototranslationally invariant so rigid modes are
+        exactly ~0). A FIRST-ORDER saddle has index == 1; this is the correct
+        saddle-TYPE test (curvature < 0 along ONE axis is necessary but NOT
+        sufficient -- it also accepts minima's perpendicular saddles / higher-order
+        saddles)."""
+        xf = np.asarray(x, dtype=np.float64).reshape(-1)
+        n3 = xf.size
+        H = np.zeros((n3, n3), dtype=np.float64)
+        for j in range(n3):
+            dp = xf.copy(); dp[j] += delta
+            dm = xf.copy(); dm[j] -= delta
+            H[:, j] = (self._grad(dp) - self._grad(dm)) / (2.0 * delta)
+        H = 0.5 * (H + H.T)
+        w = np.linalg.eigvalsh(H)
+        scale = float(np.max(np.abs(w))) if w.size else 1.0
+        tol = max(1e-8, rel_tol * scale)
+        return int(np.sum(w < -tol))
+
     def add_observation(self, x: np.ndarray, E: float, F: np.ndarray):
         """Add a TRUE (x, E, F) forward result to the GP (does NOT move the search
         center -- used for rejected trust-region proposals, still informative)."""
@@ -631,41 +679,41 @@ class GPSaddle:
         self.add_observation(x, E, F)
         self.set_center(x)
 
-    def check_converged(self, F_true: np.ndarray,
+    def check_converged(self, F_true: np.ndarray, n_neg: Optional[int] = None,
                         curvature: Optional[float] = None) -> bool:
         """EXACT-at-convergence gate. ``F_true`` is the TRUE MLIP force (never the
-        surrogate). ``curvature`` overrides the min-mode curvature used for the
-        first-order-saddle check -- pass a TRUE FD-HVP curvature for a fully exact
-        confirmation; otherwise the surrogate min-mode curvature is used as the
-        (cheap) saddle-type indicator. The FORCE test is always exact.
-
-        A structure that reaches |F_true|<fmax is ACCEPTED even if the surrogate
-        curvature has not yet turned negative, once the force has stayed below
-        threshold for ``curv_patience`` consecutive rounds (force is exact; this
-        only prevents spurious max_iter on a genuine, force-converged saddle when
-        the online surrogate's curvature sign is still settling)."""
+        surrogate) -- the convergence criterion is always the exact force. The
+        first-order-SADDLE type is checked, in order of rigour:
+          1. ``n_neg`` (surrogate-Hessian index): a first-order saddle has EXACTLY
+             ONE negative mode. This is the correct saddle-type test and rejects
+             minima / higher-order saddles that a single-axis curvature check would
+             wrongly accept (a |F|<fmax point can have >1 negative mode).
+          2. ``curvature`` (TRUE FD-HVP along the min mode < 0): necessary but not
+             sufficient; used as an extra confirmation when supplied.
+          3. surrogate min-mode curvature < 0, with a ``curv_patience`` fallback on
+             the exact force alone (only when neither of the above is supplied --
+             e.g. the simple analytic self-test driver)."""
         p = self.p
         F = np.asarray(F_true, dtype=np.float64).reshape(-1)
         force_ok = (_maxatom(F) <= p.f_max_th) and (_rmsatom(F) <= p.f_rms_th)
         self._lowforce_streak = (self._lowforce_streak + 1) if force_ok else 0
-        exact = curvature is not None                # true FD-HVP curvature supplied
-        C = self.curvature if curvature is None else float(curvature)
-        if exact:
+        if curvature is not None:
             self.curv_true = float(curvature)
         if not p.require_neg_curv:
             ok = bool(force_ok)
-        elif exact:
-            # EXACT curvature is authoritative: require a true negative mode.
-            # NO patience override -> cannot false-converge at a non-saddle
-            # (a shoulder/minimum with |F|<fmax but positive true curvature).
-            ok = bool(force_ok and (C < 0.0))
+        elif n_neg is not None:
+            # PRIMARY correct first-order-saddle test: exactly one negative mode
+            # (plus, if a true axis curvature was supplied, it must be negative).
+            saddle_ok = (int(n_neg) == 1)
+            if curvature is not None:
+                saddle_ok = saddle_ok and (curvature < 0.0)
+            ok = bool(force_ok and saddle_ok)
+        elif curvature is not None:
+            ok = bool(force_ok and (curvature < 0.0))   # exact axis curvature
         else:
-            # surrogate curvature only: prefer a negative surrogate mode, but
-            # fall back to the exact force after curv_patience low-force rounds so
-            # a genuinely force-converged saddle is never spuriously max_iter'ed
-            # while the online surrogate curvature sign settles.
+            # surrogate min-mode curvature only + patience fallback on exact force
             patience_ok = (self._lowforce_streak >= max(1, int(p.curv_patience)))
-            ok = bool(force_ok and ((C < 0.0) or patience_ok))
+            ok = bool(force_ok and ((self.curvature < 0.0) or patience_ok))
         self.converged = ok
         return ok
 
@@ -906,9 +954,17 @@ class BatchGPSaddle(JobABC):
             Es, Fs = self._ef_np(calc)
             prop_fmax = [_maxatom(Fs[b].reshape(-1)) for b in range(B)]
 
-            # (3a) RIGOROUS opt-in: when any structure meets the exact true-force
-            #      gate, confirm its first-order-saddle mode with ONE TRUE FD-HVP
-            #      forward at the candidate (true curvature, NOT the surrogate).
+            # (3a-i) first-order-SADDLE type test at any force-converged candidate:
+            #        count the SURROGATE-Hessian negative modes (free) -> a true TS
+            #        has exactly one. Rejects minima / higher-order saddles that a
+            #        single-axis curvature check would wrongly accept.
+            n_neg = [None] * B
+            for b in range(B):
+                if prop_fmax[b] <= p.f_max_th:
+                    n_neg[b] = states[b].n_negative_surrogate_modes(proposals[b])
+
+            # (3a-ii) RIGOROUS opt-in: also confirm the min mode with ONE TRUE
+            #         FD-HVP forward at the candidate (true curvature, NOT surrogate).
             C_true = [None] * B
             if p.confirm_curv_true and any(prop_fmax[b] <= p.f_max_th
                                            for b in range(B)):
@@ -929,7 +985,8 @@ class BatchGPSaddle(JobABC):
             conv_local = []
             for b in range(B):
                 states[b].add_observation(proposals[b], Es[b], Fs[b])
-                done = states[b].check_converged(Fs[b], curvature=C_true[b])
+                done = states[b].check_converged(Fs[b], n_neg=n_neg[b],
+                                                 curvature=C_true[b])
                 if done:
                     states[b].set_center(proposals[b])
                     x_cur[b] = proposals[b].copy(); center_fmax[b] = prop_fmax[b]
@@ -961,9 +1018,11 @@ class BatchGPSaddle(JobABC):
             #      trust radius, acquisition). Structure 0 tracked explicitly.
             if p.verbose and (it <= 8 or it % 5 == 0 or any(conv_local)):
                 c0 = C_true[0] if C_true[0] is not None else C_surr[0]
+                ix0 = "-" if n_neg[0] is None else str(n_neg[0])
                 msg = (f"[gp round {it:4d}] active={B}/{B0} "
                        f"|F|max(s0)={prop_fmax[0]:.4e} best|F|={min(prop_fmax):.4e} "
-                       f"curv(s0)={c0:+.3e} ls(s0)={states[0].gp.l2 ** 0.5:.3f} "
+                       f"curv(s0)={c0:+.3e} idx(s0)={ix0} "
+                       f"ls(s0)={states[0].gp.l2 ** 0.5:.3f} "
                        f"trust(s0)={trust[0]:.3f} conv={sum(conv_local)}/{B} "
                        f"true_fwd={self.true_forward_calls}")
                 print(msg)
