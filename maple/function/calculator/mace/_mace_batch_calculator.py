@@ -60,6 +60,12 @@ def _one_hot_node_attrs(Z: torch.Tensor, atomic_number_table: Sequence[int],
 class MACEBatchCalc:
     """Batched standard-MACE calculator (true multi-graph). See module docstring."""
 
+    # PBC (std-MACE Phase-1A): prepare() builds a per-replica minimum-image periodic
+    # radius graph when the replicas carry a cell (mirrors MaceOffBatchCalc). The 6-arg
+    # forward already consumes per-edge cartesian ``shifts``; pbc=False -> zero shifts
+    # -> the block-diagonal edge build is bit-identical to the pre-PBC path.
+    SUPPORTS_PBC = True
+
     def __init__(self,
                  device: str = "cuda",
                  model: str = "maceomol",
@@ -104,9 +110,15 @@ class MACEBatchCalc:
         self.nmax_dof = 0
         self.cand_i = None
         self.cand_j = None
+        self.cand_rep = None
         self._base = None
         self._n_b = None
         self._coord_backup = None
+        # PBC state (set in prepare(); None/False => non-periodic default path).
+        self._periodic = False
+        self._cell = None
+        self._cell_inv = None
+        self._shift_combos = None
 
         try:
             self._probe_batch_native()
@@ -162,14 +174,41 @@ class MACEBatchCalc:
         else:
             self._base = torch.zeros((0,), dtype=torch.int64, device=device)
 
-        ci, cj = [], []
+        ci, cj, rep_l = [], [], []
         for b in range(B):
             n = int(self._n_b[b].item()); off = int(s[b].item())
             if n >= 2:
                 iu, ju = torch.triu_indices(n, n, offset=1, device=device)
                 ci.append(iu + off); cj.append(ju + off)
+                rep_l.append(torch.full((iu.numel(),), b, dtype=torch.int64, device=device))
         self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
         self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
+        self.cand_rep = torch.cat(rep_l) if rep_l else torch.zeros((0,), dtype=torch.int64, device=device)
+
+        # PBC (std-MACE Phase-1A, mirrors MaceOffBatchCalc.prepare): detect periodicity
+        # ONCE from the replicas' pbc flags and cache the per-replica cell (B,3,3) +
+        # inverse + the 27 {-1,0,1}^3 image offsets. The MD loop never sees the cell
+        # (fixed for NVT); _build_edges_pbc reads it to emit minimum-image cartesian
+        # edge shifts. HOMOGENEOUS pbc required (all replicas periodic OR all isolated);
+        # heterogeneous CELL SHAPES are allowed (per-pair cell lookup via cand_rep).
+        pbc_flags = [bool(np.any(np.asarray(a.pbc))) for a in atoms_list]
+        self._periodic = bool(any(pbc_flags))
+        if self._periodic:
+            if not all(pbc_flags):
+                raise NotImplementedError(
+                    "MACEBatchCalc periodic batch requires a HOMOGENEOUS pbc state: "
+                    "either every replica periodic or every replica isolated. A mixed "
+                    "periodic/isolated batch is not supported (std-MACE Phase-1A).")
+            cells = np.stack([np.asarray(a.get_cell(), dtype=np.float64) for a in atoms_list])
+            self._cell = torch.tensor(cells, dtype=self.mdtype, device=device)      # (B,3,3)
+            self._cell_inv = torch.linalg.inv(self._cell)                            # (B,3,3)
+            self._shift_combos = torch.tensor(
+                [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
+                dtype=self.mdtype, device=device)                                    # (27,3)
+        else:
+            self._cell = None
+            self._cell_inv = None
+            self._shift_combos = None
 
         self._coord_backup = None
         self._prepared = True
@@ -212,11 +251,18 @@ class MACEBatchCalc:
     # =====================================================================
     def _build_edges(self, coord: torch.Tensor):
         """Block-diagonal radius graph from precomputed intra-mol candidate pairs.
-        EXACT squared distance (NOT cdist). Returns edge_index, shifts."""
+        EXACT squared distance (NOT cdist). Returns edge_index, shifts.
+
+        PBC (std-MACE Phase-1A): when the batch was prepared with periodic replicas
+        (``self._periodic``), dispatch to ``_build_edges_pbc`` (per-replica minimum-image
+        cartesian shifts). Non-periodic -> zero shifts, bit-identical to the pre-PBC path.
+        """
         device = self.device
         if self.cand_i.numel() == 0:
             return (torch.zeros((2, 0), dtype=torch.int64, device=device),
                     torch.zeros((0, 3), dtype=self.mdtype, device=device))
+        if getattr(self, "_periodic", False):
+            return self._build_edges_pbc(coord)
         rij = coord[self.cand_i] - coord[self.cand_j]
         d2 = (rij * rij).sum(dim=-1)
         keep = d2 <= (self.r_max + 1e-12) ** 2
@@ -224,6 +270,54 @@ class MACEBatchCalc:
         src = torch.cat([ci, cj], dim=0); dst = torch.cat([cj, ci], dim=0)
         edge_index = torch.stack([src, dst], dim=0)
         shifts = torch.zeros((edge_index.size(1), 3), dtype=self.mdtype, device=device)
+        return edge_index, shifts
+
+    def _build_edges_pbc(self, coord: torch.Tensor):
+        """Minimum-image periodic radius graph on the GPU (per-replica triclinic cell).
+
+        Block-diagonal ``radius_graph_pbc`` mirroring MaceOffBatchCalc._build_edges_pbc,
+        returning the 2-tuple ``(edge_index, shifts)`` this calc's 6-arg forward consumes
+        (``model(positions, node_attrs, edge_index, shifts, batch, ptr)``; ``shifts`` are
+        the CARTESIAN image offsets -- ``unit_shifts`` are a stress-path field not taken
+        by the 6-arg wrapper).
+
+        For each intra-replica candidate pair (i<j) the raw displacement ``r_j - r_i`` is
+        wrapped to its NEAREST periodic image via fractional coords (``n0 = round(rij0 @
+        cell^-1)``, robust to unwrapped drift); the 27 integer shifts ``{-1,0,1}^3`` AROUND
+        that cell are tested. Under the box guard (perpendicular width >= 2*r_max, enforced
+        by the MD loop gate) AT MOST ONE image per ORDERED pair lands within ``r_max``, so
+        the edge set equals the ASE/matscipy minimum-image set exactly (no double count).
+
+        mace edge convention: for a directed edge (sender i, receiver j) the model forms
+        ``vec = pos[j] - pos[i] + shift``; we emit forward (i->j, +shift) and reverse
+        (j->i, -shift) for every kept image. Cutoff = strict ``d < r_max`` (matscipy).
+        """
+        device = self.device
+        ci, cj, rep = self.cand_i, self.cand_j, self.cand_rep
+        cellp = self._cell[rep]                                     # (P,3,3)
+        invp = self._cell_inv[rep]                                  # (P,3,3)
+        rij0 = coord[cj] - coord[ci]                                # (P,3)  (r_j - r_i)
+        # nearest-image base cell in fractional space (handles unwrapped drift).
+        n0 = torch.round(torch.einsum("pc,pck->pk", rij0, invp))    # (P,3)
+        rmax2 = self.r_max * self.r_max
+        src_l, dst_l, sh_l = [], [], []
+        for S in self._shift_combos:                                # (3,)
+            sint = S.view(1, 3) - n0                                # (P,3) total int shift
+            scart = torch.einsum("pk,pkc->pc", sint, cellp)         # (P,3) cartesian shift
+            rij = rij0 + scart
+            d2 = (rij * rij).sum(dim=-1)
+            keep = d2 < rmax2                                       # matscipy strict-<
+            if bool(keep.any()):
+                kci, kcj = ci[keep], cj[keep]
+                ksh = scart[keep]
+                src_l.append(kci); dst_l.append(kcj); sh_l.append(ksh)      # i->j, +shift
+                src_l.append(kcj); dst_l.append(kci); sh_l.append(-ksh)     # j->i, -shift
+        if src_l:
+            edge_index = torch.stack([torch.cat(src_l), torch.cat(dst_l)], dim=0)
+            shifts = torch.cat(sh_l, dim=0)
+        else:
+            edge_index = torch.zeros((2, 0), dtype=torch.int64, device=device)
+            shifts = torch.zeros((0, 3), dtype=self.mdtype, device=device)
         return edge_index, shifts
 
     def _forward_ef_(self, coord: torch.Tensor, need_graph: bool):
