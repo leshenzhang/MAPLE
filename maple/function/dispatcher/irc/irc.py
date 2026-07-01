@@ -30,10 +30,20 @@ class IRC(JobABC):
                 irc = GS(self.atoms, output=self.output, paras=self.commandcontrol)
                 return irc.run()
             elif self.method == 'hpc':
+                from maple.function.utility import Molecules
+                # OPT-IN batched HPC-IRC for a list/Molecules of transition
+                # states; a single Atoms keeps the unchanged single HPC oracle.
+                if isinstance(self.atoms, (list, Molecules)):
+                    return self._run_batched_hpc()
                 from .algorithm import HPC
                 irc = HPC(self.atoms, output=self.output, paras=self.commandcontrol)
                 return irc.run()
             elif self.method == 'eulerpc':
+                from maple.function.utility import Molecules
+                # OPT-IN batched EulerPC-IRC for a list/Molecules of transition
+                # states; a single Atoms keeps the unchanged single EulerPC.
+                if isinstance(self.atoms, (list, Molecules)):
+                    return self._run_batched_eulerpc()
                 from .algorithm import EulerPC
                 irc = EulerPC(self.atoms, output=self.output, paras=self.commandcontrol)
                 return irc.run()
@@ -93,6 +103,52 @@ class IRC(JobABC):
         results = run_gs_irc(atoms_list, output=self.output,
                              paras=self.commandcontrol, calc=calc,
                              device=batch_device_str(self.commandcontrol))
+        self._write_batched_lqa(results, atoms_list)   # identical result schema
+        return results
+
+    # ==================================================================
+    # OPT-IN GPU-batched HPC-IRC (single HPC = oracle)
+    # ==================================================================
+    def _run_batched_hpc(self):
+        """Batched HPC-IRC over B transition states via run_hpc_irc (-> HPCBatch).
+        Single-Atoms HPC is the oracle and is left untouched."""
+        from ..dispatcher import resolve_batched_calc, batch_device_str
+        from .algorithm.hpc import run_hpc_irc
+        from maple.function.utility import Molecules
+
+        atoms_list = (self.atoms.multiatoms if isinstance(self.atoms, Molecules)
+                      else list(self.atoms))
+        if not atoms_list:
+            return None
+        attached = getattr(atoms_list[0], 'calc', None)
+        calc = resolve_batched_calc(self.commandcontrol, atoms_list,
+                                    attached_calc=attached)
+        results = run_hpc_irc(atoms_list, output=self.output,
+                              paras=self.commandcontrol, calc=calc,
+                              device=batch_device_str(self.commandcontrol))
+        self._write_batched_lqa(results, atoms_list)   # identical result schema
+        return results
+
+    # ==================================================================
+    # OPT-IN GPU-batched EulerPC-IRC (single EulerPC = oracle)
+    # ==================================================================
+    def _run_batched_eulerpc(self):
+        """Batched EulerPC-IRC over B transition states via run_eulerpc_irc
+        (-> EulerPCBatch). Single-Atoms EulerPC is the oracle, left untouched."""
+        from ..dispatcher import resolve_batched_calc, batch_device_str
+        from .algorithm.eulerpc import run_eulerpc_irc
+        from maple.function.utility import Molecules
+
+        atoms_list = (self.atoms.multiatoms if isinstance(self.atoms, Molecules)
+                      else list(self.atoms))
+        if not atoms_list:
+            return None
+        attached = getattr(atoms_list[0], 'calc', None)
+        calc = resolve_batched_calc(self.commandcontrol, atoms_list,
+                                    attached_calc=attached)
+        results = run_eulerpc_irc(atoms_list, output=self.output,
+                                  paras=self.commandcontrol, calc=calc,
+                                  device=batch_device_str(self.commandcontrol))
         self._write_batched_lqa(results, atoms_list)   # identical result schema
         return results
 

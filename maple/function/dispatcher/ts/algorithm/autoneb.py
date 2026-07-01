@@ -1208,3 +1208,754 @@ class AutoNEB(JobABC):
             f"  Energy range: {min(global_energies):.6f} to {max(global_energies):.6f} Eh\n",
             f"  Overall barrier: {(max(global_energies) - global_energies[0]) * kcal:.2f} kcal/mol\n",
         ], self.output)
+
+
+# =============================================================================
+# OPT-IN BATCHED AutoNEB  (additive; the single-reaction AutoNEB class above is
+# kept BYTE-IDENTICAL as the parity oracle).
+#
+# AutoNEBBatch runs N INDEPENDENT AutoNEB reactions and evaluates the band
+# forces of every LIVE image across ALL reactions in ONE batched GPU forward
+# (calc.prepare(atoms_list) + calc.get_ef_gpu()) per optimizer half-step. UMA's
+# per-atom mol_idx (and standard multi-graph MACE / ANI / decoupled AIMNet2)
+# keeps each reaction's graph block-diagonal, so the batched forward yields each
+# image's E/F independently -- identical to evaluating them one at a time
+# (CatTSunami / OCPNEB mechanic, Wander et al. arXiv:2405.02078,
+# ACS Catal. 2024, DOI 10.1021/acscatal.4c04272).
+#
+# KNOWN HARD PART -- adaptive image insertion diverges the batch width.
+# AutoNEB inserts a DIFFERENT number of images per reaction over time (and splits
+# paths at intermediate minima), so the number of live images per reaction --
+# hence the batch width -- changes as the run proceeds. We DO NOT lockstep the
+# outer control flow: the per-reaction image-insertion / path-splitting /
+# endpoint-update / convergence / DFS scheduling stays PER-ITEM (delegated
+# verbatim to a private _BatchReaction(AutoNEB) sub-object per reaction). ONLY
+# the band force-evaluation is batched: every global half-step re-packs the flat
+# image list from each reaction's CURRENT band (so a reaction that just inserted
+# an image or split a path simply contributes a different-length block next
+# step), and finished reactions are masked out of the batch. This is exactly the
+# NEB.run_multiband "image-as-batch over bands + per-band L-BFGS + re-pack on
+# membership change" pattern, extended with AutoNEB's adaptive re-pack.
+#
+# CEILING (documented, per project profiling the band force-eval is 95-99% of
+# wall): the batched speedup covers (a) the tree-phase per-iteration band force
+# eval and (b) the final global-refinement band force eval -- both cross-reaction
+# batched. The per-reaction CONTROL FLOW (which images to insert, where to split,
+# whether to trim an endpoint, DFS path selection) is intentionally serial numpy
+# (cheap, and diverges per reaction so it cannot be lockstepped). Reactions that
+# finish their tree at different global steps are simply dropped from the active
+# batch; the batch therefore shrinks toward the end of a campaign (the standard
+# straggler tail). Cross-reaction batching is only physically valid for
+# calculators whose co-batched molecules stay decoupled (see the backend gate).
+# =============================================================================
+
+
+class _BatchReaction(AutoNEB):
+    """One reaction inside an ``AutoNEBBatch`` campaign.
+
+    Identical to ``AutoNEB`` (all adaptive-insertion / path-split / endpoint /
+    DFS / merge / final-refine / output machinery inherited verbatim) EXCEPT the
+    energy-evaluation entry point ``_get_energies`` is redirected through the
+    shared batched calculator when one is bound. This keeps the per-reaction
+    control-flow energy re-computes (adaptive-insertion re-energize, endpoint
+    checks, final harvest) working for a batch-only calculator (UMA/MACE/etc.)
+    that has no per-atom ASE ``get_potential_energy``; when no batched evaluator
+    is bound it falls back to the parent per-atom behaviour (the oracle path)."""
+
+    def _bind_batch(self, batch_eval_fn):
+        # batch_eval_fn(images) -> (energies_list, raw_forces_list) via the shared
+        # AutoNEBBatch calculator (a single-reaction prepare()+get_ef_gpu()).
+        self._batch_eval_fn = batch_eval_fn
+
+    def _get_energies(self, images):
+        fn = getattr(self, "_batch_eval_fn", None)
+        if fn is not None:
+            return fn(images)[0]
+        return super()._get_energies(images)
+
+    def _batch_energy(self, atoms):
+        """Single-structure energy via the shared batched evaluator (falls back
+        to the parent per-atom ASE read when no batched evaluator is bound)."""
+        fn = getattr(self, "_batch_eval_fn", None)
+        if fn is not None:
+            return float(fn([atoms])[0][0])
+        return float(atoms.get_potential_energy(force_consistent=True))
+
+    def _sync_shared_endpoint(self, path_id, which_end, new_point):
+        """Override of ``AutoNEB._sync_shared_endpoint`` that routes the shared-
+        endpoint energy read through the batched evaluator instead of
+        ``Atoms.get_potential_energy`` (which a BATCH-ONLY calculator -- UMA /
+        MACE / ... -- does not provide). Without this, a path split followed by a
+        shared-endpoint trim would crash the whole batched campaign. Control-flow
+        logic is byte-identical to the parent; only the energy source changes."""
+        node = self.path_tree[path_id]
+        if not node.parent:
+            return
+        parent = self.path_tree[node.parent]
+        siblings = [c for c in parent.children if c != path_id]
+        for sib_id in siblings:
+            sib = self.path_tree[sib_id]
+            if which_end == 'start' and sib.end_is_shared:
+                # this path's start is the sibling's end
+                sib.images[-1] = self._copy_atoms_with_calc(new_point)
+                sib.energies[-1] = self._batch_energy(new_point)
+                sib.status = 'needs_reopt'
+                log_info([f"[Path {sib_id}] Marked for re-optimization "
+                          f"(shared endpoint updated)\n"], self.output)
+            elif which_end == 'end' and sib.start_is_shared:
+                # this path's end is the sibling's start
+                sib.images[0] = self._copy_atoms_with_calc(new_point)
+                sib.energies[0] = self._batch_energy(new_point)
+                sib.status = 'needs_reopt'
+                log_info([f"[Path {sib_id}] Marked for re-optimization "
+                          f"(shared endpoint updated)\n"], self.output)
+
+    def _write_outputs(self):
+        """Override of ``AutoNEB._write_outputs`` that sources the intermediates /
+        transition-state energies from the batched evaluator (``_batch_energy``)
+        instead of ``Atoms.get_potential_energy`` -- which a BATCH-ONLY calculator
+        (UMA / MACE / ...) does NOT implement. The parent version's two per-atom
+        reads (intermediates + TS list) would raise ``AttributeError`` on a batch-
+        only calc, get swallowed by ``run()``'s guard, and SILENTLY drop the TS-
+        list / intermediates / path-tree JSON / per-path MEP files while the global
+        MEP was already written. This override writes the FULL parent file set on
+        the batched path; every non-energy line is byte-for-byte the parent's.
+        Parent ``AutoNEB`` stays untouched."""
+        base, _ = os.path.splitext(self.output)
+
+        # Global MEP (use final refined images if available)
+        if hasattr(self, 'final_images') and self.final_images:
+            global_images = self.final_images
+            global_energies = self.final_energies
+        else:
+            global_images, global_energies = self._merge_global_mep()
+
+        mep_file = base + "_autoneb_global_mep.xyz"
+        write_xyz(mep_file, global_images, energies=global_energies)
+        log_info([f"\nWrote global MEP to: {mep_file}\n"], self.output)
+
+        # Intermediates (energies via batched evaluator, NOT Atoms.get_potential_energy)
+        if self.all_intermediates:
+            int_file = base + "_autoneb_intermediates.xyz"
+            int_energies = [self._batch_energy(at) for at in self.all_intermediates]
+            write_xyz(int_file, self.all_intermediates, energies=int_energies)
+            log_info([f"Wrote intermediates to: {int_file}\n"], self.output)
+
+        # Transition states (energies via batched evaluator)
+        self._collect_all_ts()
+        if self.all_ts:
+            ts_file = base + "_autoneb_ts_list.xyz"
+            ts_energies = [self._batch_energy(at) for at in self.all_ts]
+            write_xyz(ts_file, self.all_ts, energies=ts_energies)
+            log_info([f"Wrote transition states to: {ts_file}\n"], self.output)
+
+        # Path tree (JSON for debugging)
+        tree_file = base + "_autoneb_tree.json"
+        tree_data = {}
+        for pid, node in self.path_tree.items():
+            tree_data[pid] = {
+                'status': node.status,
+                'depth': node.depth,
+                'n_images': len(node.images),
+                'parent': node.parent,
+                'children': node.children,
+                'hei_idx': node.hei_idx,
+                'iteration': node.iteration,
+            }
+        with open(tree_file, 'w') as f:
+            json.dump(tree_data, f, indent=2)
+        log_info([f"Wrote path tree to: {tree_file}\n"], self.output)
+
+        # Individual path MEPs (energies from stored node.energies; no eval)
+        def write_path_meps(path_id):
+            node = self.path_tree[path_id]
+            if node.status == 'split':
+                for c in node.children:
+                    write_path_meps(c)
+            elif node.status == 'converged':
+                path_file = base + f"_autoneb_path_{path_id}_mep.xyz"
+                write_xyz(path_file, node.images, energies=node.energies)
+
+        write_path_meps(self.root_path_id)
+
+
+@dataclass
+class AutoNEBBatchParams(AutoNEBParams):
+    """AutoNEBBatch shares AutoNEBParams exactly (so a batched reaction follows
+    the byte-identical trajectory of the single-reaction oracle). Kept as a named
+    subclass purely for the ``('autonebbatch', ...)`` paras alias."""
+    pass
+
+
+class AutoNEBBatch(JobABC):
+    """OPT-IN batched AutoNEB over N independent reactions.
+
+    Parameters
+    ----------
+    output : str
+        Base output path; each reaction i logs to ``<base>_rxn{i}<ext>``.
+    reactions : List[Molecules | List[Atoms]]
+        N reaction inputs, each the reactant/product (or a pre-built band) for
+        one AutoNEB reaction. Same per-item form accepted by ``AutoNEB``.
+    calc : object, optional
+        The SHARED batched calculator exposing the batch contract
+        ``prepare(atoms_list, fixed_nmax) -> get_ef_gpu() -> (E(B,), F(B,M))``
+        [Hartree, Eh/Angstrom]. If ``None`` it is taken from the first
+        ``Molecules`` input that carries a ``.calc``.
+    paras : dict, optional
+        Same AutoNEB parameter dict; applied identically to every reaction.
+    outputs : List[str], optional
+        Explicit per-reaction output paths (overrides the ``<base>_rxn{i}``
+        default); must have length N.
+
+    Backend gate (``_is_batch_calc`` / ``_is_coupled_calc``):
+      * Batchable (UMA-local, standard MACE / MACE-OFF, decoupled AIMNet2, ANI):
+        graphs stay block-diagonal per molecule -> FULL cross-reaction batch.
+      * Coupled / polarizable (MACE-POL, global-charge-eq AIMNet2 / NSE): a
+        single molecular graph couples co-batched molecules (~1e-3 Ha/A leak,
+        above the 1e-4 parity gate) -> cross-reaction batching is physically
+        WRONG. ``run()`` raises a clear ``NotImplementedError`` (mirrors the
+        MACE-POL batch calculator's own ``coupling_mode='raise'`` default); run
+        the reactions individually via the single-reaction ``AutoNEB`` instead.
+      * Non-batch calculator (no prepare/get_ef_gpu): raises ``ValueError`` (use
+        the single-reaction ``AutoNEB``).
+    """
+
+    def __init__(self, output, reactions, calc=None, paras=None, outputs=None):
+        base_out = output if isinstance(output, str) else (outputs[0] if outputs else "autoneb_batch.out")
+        super().__init__(base_out)
+
+        if not isinstance(reactions, (list, tuple)) or len(reactions) < 1:
+            raise ValueError("AutoNEBBatch needs a non-empty list of reactions")
+
+        self.params = self._init_params(
+            AutoNEBBatchParams, paras, ("autonebbatch", "autoneb", "AutoNEB", "ts"))
+
+        # --- resolve the shared batched calculator ---
+        if calc is None:
+            for r in reactions:
+                if isinstance(r, Molecules) and getattr(r, "calc", None) is not None:
+                    calc = r.calc
+                    break
+        self._calc = calc
+        self._is_batch = self._is_batch_calc(calc)
+        self._coupled = self._is_coupled_calc(calc)
+
+        # --- diagnostics (batched-forward accounting) ---
+        self._forwards = 0            # # of calc.prepare()+get_ef_gpu() calls
+        self._image_evals = 0         # total image force-evals across all forwards
+
+        # --- build one _BatchReaction per reaction (control flow inherited) ---
+        base, ext = os.path.splitext(base_out)
+        if not ext:
+            ext = ".out"
+        self.reactions: List[_BatchReaction] = []
+        for i, r in enumerate(reactions):
+            out_i = (outputs[i] if (outputs and i < len(outputs))
+                     else f"{base}_rxn{i}{ext}")
+            rxn = _BatchReaction(out_i, r, paras)
+            rxn._bind_batch(self._batched_eval)
+            rxn._done = False
+            self.reactions.append(rxn)
+
+        self.results: List[dict] = []
+
+    # ------------------------------------------------------------------ gates
+    @staticmethod
+    def _is_batch_calc(calc) -> bool:
+        """A batch calculator exposes ``prepare(atoms_list)`` + ``get_ef_gpu()``
+        (UMABatchCalc / MACE*BatchCalc / AIMNet2*BatchCalc / ANIBatchCalc)."""
+        return (calc is not None
+                and hasattr(calc, "prepare")
+                and hasattr(calc, "get_ef_gpu"))
+
+    @staticmethod
+    def _is_coupled_calc(calc) -> bool:
+        """True for calculators whose co-batched molecules are COUPLED, so a
+        cross-reaction (or even intra-band) packed forward does NOT reproduce
+        isolated single-molecule physics: MACE-POL (long-range polarization,
+        ``coupling_mode`` attr) and the global-charge-equilibration AIMNet2
+        (``AIMNet2BatchCalc`` -- as opposed to ``AIMNet2DecoupledBatchCalc``) /
+        any NSE variant. Mirrors NEB's reliance on the calc's own coupling
+        guard, but detected up-front so a silently-wrong batch is refused."""
+        if calc is None:
+            return False
+        if hasattr(calc, "coupling_mode"):          # MACEPolBatchCalc
+            return True
+        name = type(calc).__name__
+        if "Pol" in name or "POL" in name:          # polarizable
+            return True
+        if name == "AIMNet2BatchCalc":              # global charge-eq (coupled)
+            return True
+        if "NSE" in name.upper():
+            return True
+        return False
+
+    # -------------------------------------------------------- batched forward
+    @staticmethod
+    def _to_np(x):
+        """Coerce E/F from get_ef_gpu to float64 numpy WITHOUT a hard torch
+        dependency (accepts numpy arrays or torch tensors)."""
+        if isinstance(x, np.ndarray):
+            return x.astype(np.float64, copy=False)
+        if hasattr(x, "detach"):                    # torch.Tensor duck-type
+            return x.detach().to("cpu").numpy().astype(np.float64, copy=False)
+        return np.asarray(x, dtype=np.float64)
+
+    def _batched_eval(self, flat_images: List[Atoms]):
+        """ONE ``calc.prepare()`` + ONE ``calc.get_ef_gpu()`` over an ARBITRARY
+        flat list of images. Returns ``(Es, Fs)`` aligned to ``flat_images``:
+        ``Es`` = list[float] (Hartree), ``Fs`` = list[(N_i,3) float64] (Eh/A).
+        Every reaction's band across the whole campaign is packed here."""
+        if not flat_images:
+            return [], []
+        calc = self._calc
+        calc.prepare(flat_images, fixed_nmax=None)
+        E_raw, F_raw = calc.get_ef_gpu()            # E (B,), F (B, nmax_dof)
+        E_np = self._to_np(E_raw)
+        F_np = self._to_np(F_raw)
+        self._forwards += 1
+        self._image_evals += len(flat_images)
+        Es, Fs = [], []
+        for i, at in enumerate(flat_images):
+            n_i = len(at)
+            Es.append(float(E_np[i]))
+            Fs.append(F_np[i, :3 * n_i].reshape(n_i, 3).astype(np.float64, copy=True))
+        return Es, Fs
+
+    def _batched_eval_groups(self, groups: List[List[Atoms]]):
+        """ONE batched forward over ALL images of ALL groups (each group = one
+        reaction's current band). Re-packs on every call, so a reaction whose
+        image count changed (adaptive insertion / path split / endpoint trim)
+        just contributes a different-length block. Returns (E_out, F_out) with
+        E_out[k]=list[float], F_out[k]=list[(n,3) f64] aligned to ``groups``."""
+        flat, counts = [], []
+        for g in groups:
+            counts.append(len(g))
+            flat.extend(g)
+        Es, Fs = self._batched_eval(flat)
+        E_out, F_out, pos = [], [], 0
+        for c in counts:
+            E_out.append(Es[pos:pos + c])
+            F_out.append(Fs[pos:pos + c])
+            pos += c
+        return E_out, F_out
+
+    def _ensure_driver(self, node):
+        """Lazy L-BFGS driver init + state restore -- verbatim mirror of
+        ``AutoNEB._run_single_path_iteration`` (so a batched reaction reproduces
+        the oracle's optimizer state exactly)."""
+        p = self.params
+        if not hasattr(node, "_driver") or node._driver is None:
+            node._driver = LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0)
+            if node.lbfgs_S:
+                node._driver.S = node.lbfgs_S
+                node._driver.Y = node.lbfgs_Y
+                node._driver.rhos = node.lbfgs_rhos
+
+    # ---------------------------------------------- batched tree-phase step
+    def _batched_path_step(self, active):
+        """Advance every ACTIVE reaction by ONE NEB path-iteration, batching the
+        two band force evaluations across ALL active reactions.
+
+        ``active`` : list of (rxn, node). Mirrors ``_run_single_path_iteration``
+        exactly per reaction, but the ``_get_energies`` + ``neb_forces`` reads at
+        each geometry are replaced by ONE cross-reaction batched forward:
+          EVAL-A : full band of every active reaction  -> converge-test / propose
+          EVAL-B : full band of every reaction that STEPPED -> L-BFGS curvature.
+        Returns a list[bool] (converged-this-step) aligned to ``active``."""
+        p = self.params
+        for _, node in active:
+            self._ensure_driver(node)
+
+        # ---- EVAL-A : ONE batched forward over every active band ----
+        E_A, F_A = self._batched_eval_groups([node.images for _, node in active])
+
+        converged = [False] * len(active)
+        stepped = []                                    # (slot, rxn, node)
+        for slot, (rxn, node) in enumerate(active):
+            images = node.images
+            energies = E_A[slot]
+            node.energies = energies
+            if p.use_dynamic_k:
+                k_springs = compute_dynamic_k(energies, p.k_min, p.k_max, p.k_decay)
+            else:
+                k_springs = [p.k_max] * len(images)
+            Fp_list, maxfp, hei_idx = neb_forces(
+                images, energies, k_spring=None, k_springs=k_springs,
+                use_dynamic_k=False, raw_forces=F_A[slot])
+            node.hei_idx = hei_idx
+            rmsfp = rms_force(Fp_list)
+            node._last_maxfp = maxfp
+            node._last_rmsfp = rmsfp
+
+            if maxfp < p.autoneb_f_max_th and rmsfp < p.autoneb_f_rms_th:
+                converged[slot] = True
+                continue
+
+            driver = node._driver
+            grads = [(-Fp_list[i]).reshape(-1) for i in range(1, len(images) - 1)]
+            g = np.concatenate(grads) if grads else np.zeros(0)
+            step = driver.two_loop(g)
+            step = driver.step_limit(step)
+            x = (np.concatenate([to_numpy_f64(images[i].get_positions()).reshape(-1)
+                                 for i in range(1, len(images) - 1)])
+                 if len(images) > 2 else np.zeros(0))
+            x_new = x + step
+            offset = 0
+            for i in range(1, len(images) - 1):
+                n = len(images[i]) * 3
+                images[i].set_positions(x_new[offset:offset + n].reshape(-1, 3))
+                offset += n
+            node._step_x = x
+            node._step_xnew = x_new
+            node._step_g = g
+            stepped.append((slot, rxn, node))
+
+        # ---- EVAL-B : ONE batched forward over every band that stepped ----
+        if stepped:
+            E_B, F_B = self._batched_eval_groups([node.images for _, _, node in stepped])
+            for k, (slot, rxn, node) in enumerate(stepped):
+                images = node.images
+                new_energies = E_B[k]
+                node.energies = new_energies
+                if p.use_dynamic_k:
+                    k_springs = compute_dynamic_k(new_energies, p.k_min, p.k_max, p.k_decay)
+                else:
+                    k_springs = [p.k_max] * len(images)
+                new_Fp_list, _, _ = neb_forces(
+                    images, new_energies, k_springs=k_springs, raw_forces=F_B[k])
+                new_grads = [(-new_Fp_list[i]).reshape(-1) for i in range(1, len(images) - 1)]
+                g_new = np.concatenate(new_grads) if new_grads else np.zeros(0)
+                driver = node._driver
+                g = node._step_g
+                if len(g) > 0:
+                    driver.update(node._step_xnew - node._step_x, g_new - g)
+                node.lbfgs_S = list(driver.S)
+                node.lbfgs_Y = list(driver.Y)
+                node.lbfgs_rhos = list(driver.rhos)
+                node.iteration += 1
+
+        return converged
+
+    def _post_iteration_control(self, rxn, path_id, node, converged):
+        """Per-reaction control flow AFTER one batched path-iteration -- a
+        verbatim mirror of ``AutoNEB.run()``'s post-iteration block (adaptive
+        insertion / local-minima split / endpoint update / max-iter), kept
+        PER-ITEM (it diverges per reaction and must not be lockstepped). The only
+        change vs the oracle is that periodic logging reuses the force metrics
+        already computed in the batched step (no extra per-reaction forward)."""
+        p = self.params
+
+        if node.iteration % 10 == 0 and node.iteration > 0:
+            energies = node.energies
+            hei = node.hei_idx if node.hei_idx > 0 else 1
+            dE = energies[hei] - energies[0]
+            log_info([
+                f"[{rxn.output}] Iter {node.iteration:4d}  HEI={hei}  dE={dE:.6f}  "
+                f"max|Fp|={getattr(node, '_last_maxfp', 0.0):.6f}  "
+                f"RMS(Fp)={getattr(node, '_last_rmsfp', 0.0):.6f}\n"
+            ], self.output)
+
+        if converged:
+            node.status = 'converged'
+            log_info([f"\n[{rxn.output}][Path {path_id}] Converged after "
+                      f"{node.iteration} iterations.\n"], self.output)
+            rxn._print_path_summary(path_id)
+            return
+
+        # adaptive insertion (changes image count -> batch re-packs next step)
+        if node.iteration % p.ang_iter == 0 and node.iteration > 0:
+            rxn._check_adaptive_insertion(path_id)
+
+        # local-minima detection + path split (per-item divergence)
+        if node.iteration % p.path_iter == 0 and node.iteration > 0:
+            minima = rxn._detect_local_minima(path_id)
+            if minima:
+                rxn._split_path(path_id, minima[0])
+                return
+
+        # endpoint updates
+        if node.iteration % p.ep_iter == 0 and node.iteration > 0:
+            new_start, new_end = rxn._check_endpoint_updates(path_id)
+            if new_start is not None:
+                rxn._update_endpoint(path_id, 'start', new_start)
+            if new_end is not None:
+                rxn._update_endpoint(path_id, 'end', new_end)
+
+        # per-path max-iter cap
+        if node.iteration >= p.max_iter:
+            log_info([f"\n[{rxn.output}][Path {path_id}] Reached max iterations "
+                      f"({p.max_iter}).\n"], self.output)
+            node.status = 'converged'
+            rxn._print_path_summary(path_id)
+
+    # ------------------------------------------ batched final refinement
+    def _batched_final_refine(self):
+        """Cross-reaction batched final global MEP refinement.
+
+        Each reaction's merged MEP is refined with the SAME looser-threshold
+        endpoint-optimizing NEB as ``AutoNEB._run_final_refinement`` (byte-for-
+        byte per reaction), but the two per-iteration band force evals are
+        batched across all still-refining reactions. Endpoint trimming changes a
+        reaction's image count -> the flat batch is re-packed each half-step;
+        reactions that converge / hit ``final_refine_max_iter`` are masked out.
+        Reactions whose MEP is <=3 images (or do_final_refine off) skip refine
+        and keep the merged MEP directly."""
+        p = self.params
+        states = []
+        for rxn in self.reactions:
+            gi, ge = rxn._merge_global_mep()
+            if not (p.do_final_refine and len(gi) > 3):
+                rxn.final_images = gi
+                rxn.final_energies = rxn._get_energies(gi) if gi else []
+                continue
+            ref_images = [rxn._copy_atoms_with_calc(img) for img in gi]
+            states.append(dict(
+                rxn=rxn, images=ref_images,
+                driver=LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0),
+                f_max_th=p.autoneb_f_max_th * p.final_refine_factor,
+                f_rms_th=p.autoneb_f_rms_th * p.final_refine_factor,
+                it=0, done=False,
+            ))
+        if not states:
+            return
+
+        max_it = p.final_refine_max_iter
+        while any(not s["done"] for s in states):
+            active = [s for s in states if not s["done"]]
+
+            # ---- EVAL-A ----
+            E_A, F_A = self._batched_eval_groups([s["images"] for s in active])
+            stepped = []
+            for k, s in enumerate(active):
+                imgs = s["images"]
+                n = len(imgs)
+                energies = E_A[k]
+                if p.use_dynamic_k:
+                    k_springs = compute_dynamic_k(energies, p.k_min, p.k_max, p.k_decay)
+                else:
+                    k_springs = [p.k_max] * n
+                Fp_list, maxfp, _hei = neb_forces(
+                    imgs, energies, k_springs=k_springs,
+                    use_dynamic_k=False, raw_forces=F_A[k])
+                rmsfp = rms_force(Fp_list)
+                if maxfp < s["f_max_th"] and rmsfp < s["f_rms_th"]:
+                    s["done"] = True
+                    continue
+                drv = s["driver"]
+                grads = [(-Fp_list[i]).reshape(-1) for i in range(1, n - 1)]
+                g = np.concatenate(grads) if grads else np.zeros(0)
+                step = drv.step_limit(drv.two_loop(g))
+                x = (np.concatenate([to_numpy_f64(imgs[i].get_positions()).reshape(-1)
+                                     for i in range(1, n - 1)]) if n > 2 else np.zeros(0))
+                x_new = x + step
+                off = 0
+                for i in range(1, n - 1):
+                    m = len(imgs[i]) * 3
+                    imgs[i].set_positions(x_new[off:off + m].reshape(-1, 3))
+                    off += m
+                s["_x"] = x
+                s["_xnew"] = x_new
+                s["_g"] = g
+                stepped.append(s)
+
+            # ---- EVAL-B ----
+            if stepped:
+                E_B, F_B = self._batched_eval_groups([s["images"] for s in stepped])
+                for k, s in enumerate(stepped):
+                    imgs = s["images"]
+                    n = len(imgs)
+                    new_energies = E_B[k]
+                    if p.use_dynamic_k:
+                        k_springs = compute_dynamic_k(new_energies, p.k_min, p.k_max, p.k_decay)
+                    else:
+                        k_springs = [p.k_max] * n
+                    new_Fp_list = neb_forces(
+                        imgs, new_energies, k_springs=k_springs, raw_forces=F_B[k])[0]
+                    new_grads = [(-new_Fp_list[i]).reshape(-1) for i in range(1, n - 1)]
+                    g_new = np.concatenate(new_grads) if new_grads else np.zeros(0)
+                    if len(s["_g"]) > 0:
+                        s["driver"].update(s["_xnew"] - s["_x"], g_new - s["_g"])
+                    s["it"] += 1
+
+                    # endpoint updates (byte-for-byte mirror of the oracle's
+                    # _run_final_refinement, incl. its index-after-front-slice
+                    # ordering) -- image count changes -> re-pack next half-step.
+                    if s["it"] % p.final_refine_ep_iter == 0:
+                        ns, ne = s["rxn"]._check_endpoint_updates_global(imgs, new_energies)
+                        if ns is not None:
+                            s["images"] = s["images"][ns:]
+                            s["driver"] = LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0)
+                            imgs = s["images"]
+                        if ne is not None:
+                            s["images"] = imgs[:ne + 1]
+                            s["driver"] = LBFGSDriver(m=p.lbfgs_m, curvature=70.0, maxstep=p.step0)
+
+                    if s["it"] >= max_it:
+                        s["done"] = True
+
+        for s in states:
+            rxn = s["rxn"]
+            rxn.final_images = s["images"]
+            rxn.final_energies = rxn._get_energies(s["images"])
+
+    # -------------------------------------------------------------- driver
+    def _reaction_result(self, rxn) -> dict:
+        imgs = getattr(rxn, "final_images", None) or []
+        ens = list(getattr(rxn, "final_energies", None) or [])
+        if len(ens) >= 3:
+            hei = max(range(1, len(ens) - 1), key=lambda i: ens[i])
+        elif len(ens) >= 1:
+            hei = len(ens) - 1
+        else:
+            hei = 0
+        return dict(
+            output=rxn.output,
+            n_images=len(imgs),
+            energies=ens,
+            hei=hei,
+            ts_image=(imgs[hei] if imgs else None),
+            barrier_Eh=(ens[hei] - ens[0]) if ens else 0.0,
+            reaction_energy_Eh=(ens[-1] - ens[0]) if ens else 0.0,
+        )
+
+    def run(self):
+        """Batched multi-reaction AutoNEB driver.
+
+        Tree phase: every global half-step re-selects each reaction's active path
+        (DFS) and advances it by ONE batched path-iteration (all live images of
+        all reactions in one forward); per-reaction control flow (insertion /
+        split / endpoint / convergence) runs per-item. Then a cross-reaction
+        batched final refinement. Returns one result dict per reaction."""
+        if not self._is_batch:
+            raise ValueError(
+                "AutoNEBBatch requires a batched calculator exposing "
+                "prepare(atoms_list) + get_ef_gpu(); none was supplied. "
+                "Use the single-reaction AutoNEB for a serial ASE calculator.")
+        if self._coupled:
+            raise NotImplementedError(
+                f"AutoNEBBatch cannot cross-reaction batch a COUPLED calculator "
+                f"({type(self._calc).__name__}): co-batched molecules are "
+                f"physically coupled (MACE-POL long-range polarization / global "
+                f"charge-equilibration AIMNet2), so a packed forward does not "
+                f"reproduce isolated single-molecule physics. Run each reaction "
+                f"with the single-reaction AutoNEB, or use a decoupled backend "
+                f"(UMA-local / standard MACE / MACE-OFF / decoupled AIMNet2 / ANI).")
+
+        log_info([
+            "\n" + "=" * 70 + "\n",
+            f"Starting AutoNEBBatch  (N={len(self.reactions)} reactions, "
+            f"calc={type(self._calc).__name__})\n",
+            "Cross-reaction batched band force eval; per-reaction adaptive "
+            "insertion / split / endpoint control flow kept per-item.\n",
+            "=" * 70 + "\n",
+        ], self.output)
+
+        # init every reaction's root path (energies via the batched evaluator)
+        for rxn in self.reactions:
+            rxn._init_root_path()
+
+        p = self.params
+        max_global = p.max_iter * p.max_paths
+        # global safety bound: each half-step advances >=1 reaction by >=1 of its
+        # own path-iters, and every reaction leaves at <= max_global own-iters.
+        hard_cap = max_global * len(self.reactions) + 32
+        gstep = 0
+        self._aborted = False
+        while gstep < hard_cap:
+            gstep += 1
+            active = []
+            for rxn in self.reactions:
+                if rxn._done:
+                    continue
+                if rxn.global_iteration >= max_global or rxn._all_leaves_converged():
+                    rxn._done = True
+                    continue
+                path_id = rxn._select_next_path()
+                if path_id is None:
+                    rxn._done = True
+                    continue
+                node = rxn.path_tree[path_id]
+                rxn.global_iteration += 1
+                if node.status in ('pending', 'needs_reopt'):
+                    node.status = 'running'
+                    log_info([
+                        f"\n[{rxn.output}] Optimizing path: {path_id} "
+                        f"(depth={node.depth}, images={len(node.images)})\n"
+                    ], self.output)
+                active.append((rxn, path_id, node))
+
+            if not active:
+                break
+
+            # N1/N2 graceful abort: a batched forward can fail on OOM / NaN /
+            # calculator error; catch it, stop the tree phase, and emit partial
+            # output (below) rather than crashing the whole campaign with none.
+            try:
+                converged = self._batched_path_step(
+                    [(rxn, node) for rxn, _pid, node in active])
+            except Exception as _err:                    # noqa: BLE001
+                log_info([
+                    f"\nAutoNEBBatch: batched forward FAILED at global step "
+                    f"{gstep}: {_err!r}\n"
+                    "Aborting the tree phase; emitting partial output.\n"
+                ], self.output)
+                self._aborted = True
+                break
+            for (rxn, path_id, node), conv in zip(active, converged):
+                self._post_iteration_control(rxn, path_id, node, conv)
+
+        log_info([
+            "\n" + "=" * 70 + "\n",
+            "AutoNEBBatch tree phase complete\n",
+            f"  global half-steps: {gstep}\n",
+            f"  batched forwards:  {self._forwards}\n",
+            f"  image-evals:       {self._image_evals}\n",
+            "=" * 70 + "\n",
+        ], self.output)
+
+        # cross-reaction batched final global refinement (also a batched forward
+        # -> guarded the same way; on failure fall back to the unrefined MEP).
+        if not getattr(self, "_aborted", False):
+            try:
+                self._batched_final_refine()
+            except Exception as _err:                    # noqa: BLE001
+                log_info([f"\nAutoNEBBatch: batched final refinement FAILED: "
+                          f"{_err!r}\nEmitting partial (unrefined) merged MEP.\n"],
+                         self.output)
+                self._aborted = True
+
+        # partial output: fill any reaction still missing a final MEP from its
+        # last-good stored node energies (_merge_global_mep issues NO calc call).
+        if getattr(self, "_aborted", False):
+            for rxn in self.reactions:
+                if not getattr(rxn, "final_images", None):
+                    gi, ge = rxn._merge_global_mep()
+                    rxn.final_images = gi
+                    rxn.final_energies = ge
+
+        # per-reaction outputs (best-effort; output energy reads use the calc's
+        # per-atom ASE interface where present -- see ceiling note above)
+        for rxn in self.reactions:
+            try:
+                rxn._write_outputs()
+            except Exception as _e:                 # noqa: BLE001 (output only)
+                log_info([f"[{rxn.output}] _write_outputs skipped: {_e}\n"], self.output)
+
+        self.results = [self._reaction_result(rxn) for rxn in self.reactions]
+
+        kcal = 627.509
+        for r in self.results:
+            ens = r["energies"]
+            if ens:
+                log_info([
+                    f"\n[{r['output']}] final MEP: images={r['n_images']}  "
+                    f"HEI={r['hei']}  barrier={r['barrier_Eh'] * kcal:.3f} kcal/mol  "
+                    f"dErxn={r['reaction_energy_Eh'] * kcal:.3f} kcal/mol\n"
+                ], self.output)
+        log_info([
+            f"\nAutoNEBBatch done: {self._forwards} batched forwards, "
+            f"{self._image_evals} image-evals over {len(self.reactions)} reactions.\n"
+        ], self.output)
+        return self.results

@@ -957,3 +957,545 @@ class EulerPC:
             ],
             self.output,
         )
+
+
+# ======================================================================== #
+#                          BATCHED EulerPC-IRC                              #
+# ======================================================================== #
+# Batched IRC over B transition-state structures sharing ONE *batch* calculator
+# (prepare / get_ef_gpu [+ get_efh_gpu] / set_coords_). All B independent paths
+# are propagated in LOCKSTEP: the per-path EulerPC control flow (predictor-Euler,
+# DWI + mBS corrector, BFGS/Bofill Hessian history, per-path convergence) stays
+# BYTE-for-BYTE the single-structure oracle's numpy -- ONLY the force / Hessian
+# EVALUATION is batched. Per the project profiling the MLIP forward is 95-99% of
+# wall time, so co-batching every path's force call into ONE GPU forward per
+# rendezvous is the entire win.
+#
+# Mechanism (single-threaded, deterministic, no locks): each path runs as a
+# Python generator that mirrors EulerPC.run/_one_side/_micro_step but replaces
+#   E, F = self._energy_forces_from_mw(q_mw)    ->   E, F = yield ('ef', cart)
+#   H    = self._get_hessian_cart()             ->   H    = yield ('h',  cart)
+# The driver collects every live generator's pending request, packs all cartesian
+# coords into the calc's (N,3) buffer, and fires ONE batched get_ef_gpu() -- forces
+# ALWAYS come from this pure forward (exactly like the single oracle) -- plus, only
+# on ticks where some path needs a Hessian, ONE get_efh_gpu() whose H alone is used
+# (its E,F discarded, since a backend's FD-Hessian center force can differ from the
+# standalone get_ef_gpu forward). Each path is then `.send()`ed its own slice.
+# Because every path executes the identical oracle numpy given its own get_ef_gpu
+# forces, the batched paths reproduce the single-structure EulerPC oracle to the
+# calculator's B=1-vs-B=N determinism (the fp32 batching-noise floor).
+#
+# Units identical to single-structure EulerPC: positions Angstrom, forces Eh/A,
+# Hessian Eh/A^2, energy Eh, MW coords sqrt(amu)*A with q_mw = q_cart / D,
+# H_mw = D (x) D * H, g_mw = D * g_cart  (D = 1/sqrt(m)).
+import warnings as _warnings
+import torch as _torch
+
+
+# Coupled / globally-polarizable batch calculators: co-batching independent
+# molecules into ONE graph makes MACE-POL do a global total-charge-constrained
+# charge equilibration + long-range Coulomb, and AIMNet2-NSE a global charge
+# equilibration, that transfer charge BETWEEN molecules -> a multi-structure
+# batch is PHYSICALLY WRONG. These fall back to a sequential B=1 loop (correct
+# single-molecule IRC, no batch speedup). Decoupled variants are safe.
+_COUPLED_BATCH_CALC_NAMES = {"MACEPolBatchCalc", "AIMNet2BatchCalc"}
+
+
+def _is_batch_calc(calc) -> bool:
+    """Duck-typed test mirroring dispatcher._is_batch_calc: a batched calculator
+    exposes prepare() + get_ef_gpu()."""
+    return (calc is not None
+            and callable(getattr(calc, "prepare", None))
+            and callable(getattr(calc, "get_ef_gpu", None)))
+
+
+def _is_coupled_calc(calc) -> bool:
+    """True for globally-coupled / polarizable batch calcs (MACE-POL, AIMNet2-NSE)
+    whose multi-structure batch couples molecules. Decoupled variants -> False."""
+    name = type(calc).__name__
+    if "decoupled" in name.lower():
+        return False
+    if getattr(calc, "batch_decoupled", False) is True:
+        return False
+    if name in _COUPLED_BATCH_CALC_NAMES:
+        return True
+    if hasattr(calc, "coupling_mode"):          # MACE-POL exposes this
+        return True
+    if getattr(calc, "couples_molecules", False) is True:
+        return True
+    return False
+
+
+def _apply_paras_eulerpc(p: "EulerPCParams", paras):
+    """Apply a {'EulerPC'|'irc': {...}} or flat dict of overrides onto an
+    EulerPCParams. Same alias table as EulerPC.__init__ (kept separate so the
+    batch path reuses it without touching the single-structure constructor)."""
+    if not isinstance(paras, dict):
+        return p
+    low = {k.lower(): v for k, v in paras.items()}
+    sub = None
+    for key in ("eulerpc", "irc"):
+        if key in low and isinstance(low[key], dict):
+            sub = low[key]
+            break
+    if sub is None:
+        sub = low
+    sub_low = {k.lower(): v for k, v in sub.items()}
+    aliases = {
+        "sd_len_bohr": "step_length_bohr",
+        "steplength_bohr": "step_length_bohr",
+        "max_points": "max_steps",
+        "max_pred_steps": "max_pred_steps",
+        "loose_cycles": "loose_cycles",
+        "hessian_update": "hessian_update",
+        "dwi_n": "dwi_n",
+        "mbs_max_k": "mbs_max_k",
+        "mbs_points": "mbs_points",
+        "mbs_tol": "mbs_tol",
+        "hessian_recalc": "hessian_recalc",
+        "target_mode": "target_mode",
+        "f_max_th": "f_max_th",
+        "f_rms_th": "f_rms_th",
+        "tol_maxf": "f_max_th",
+        "tol_rmsf": "f_rms_th",
+        "print_each": "print_each",
+        "write_traj": "write_traj",
+    }
+    for k, v in sub_low.items():
+        if k in aliases:
+            setattr(p, aliases[k], v)
+        elif hasattr(p, k):
+            setattr(p, k, v)
+    return p
+
+
+class EulerPCBatch:
+    """Batched EulerPC-IRC integrator over B transition-state structures.
+
+    OPT-IN: the single-structure ``EulerPC`` above is untouched and remains the
+    parity oracle. ``EulerPCBatch`` runs N independent IRC paths in lockstep and
+    batches every force / Hessian evaluation into ONE GPU forward per rendezvous.
+
+    Consumes the *batch* calculator API (NOT a per-atoms ASE calculator):
+        calc.prepare(atoms_list, fixed_nmax)
+        calc.get_ef_gpu()  -> (E (B,), F (B, nmax_dof))            [Hartree, Eh/A]
+        calc.get_efh_gpu() -> (E (B,), F (B,M), H (B,M,M), P (B,)) [+ Eh/A^2]
+        calc.set_coords_(coord (N,3))    # packed Cartesian, calc atom order
+
+    Parameters mirror ``EulerPCParams`` (same defaults / ``paras`` overrides). The
+    per-path algorithm is IDENTICAL to the single-structure oracle (predictor-Euler
+    + DWI/mBS corrector + BFGS/Bofill Hessian history + per-path convergence); only
+    the force evaluation is co-batched. Backend gate: a batchable calc runs the full
+    N-path batch; a globally-coupled / polarizable calc (MACE-POL, AIMNet2-NSE)
+    falls back to a sequential B=1 loop (correct single-molecule physics).
+    """
+
+    def __init__(self, atoms_list, calc, output: str = "eulerpc_batch.out",
+                 params=None, paras=None, device=None):
+        self.atoms_list = list(atoms_list)
+        self.calc = calc
+        self.output = output
+        # Resolve to a concrete torch.device so the packed coord buffer lives on
+        # the same device the batched calc consumes (mirrors LQABatch).
+        self.device = (_torch.device(device) if device is not None
+                       else _torch.device("cuda" if _torch.cuda.is_available() else "cpu"))
+        self.p = params if params is not None else EulerPCParams()
+        _apply_paras_eulerpc(self.p, paras)
+
+        self.B = len(self.atoms_list)
+        if self.B == 0:
+            raise ValueError("EulerPCBatch: empty atoms_list")
+
+        if not _is_batch_calc(calc):
+            raise NotImplementedError(
+                "EulerPCBatch requires a batched calculator exposing "
+                "prepare()+get_ef_gpu() (UMA / standard MACE / MACE-OFF / "
+                "AIMNet2-decoupled / ANI). Got "
+                f"{type(calc).__name__}; use the single-structure EulerPC for a "
+                "per-Atoms ASE calculator.")
+        if not callable(getattr(calc, "get_efh_gpu", None)):
+            raise NotImplementedError(
+                "EulerPCBatch needs get_efh_gpu() for the TS Hessian / negative-"
+                f"mode selection; {type(calc).__name__} does not provide it.")
+
+        # diagnostics (mirror LQABatch._efh_calls / _ef_calls)
+        self._ef_calls = 0        # cheap get_ef_gpu forwards (the 95-99% hot path)
+        self._efh_calls = 0       # exact get_efh_gpu Hessian forwards (setup)
+
+        # coupled/polarizable backends -> a multi-structure batch is physically
+        # wrong (see module note). Fall back to a sequential B=1 loop.
+        self._coupled = _is_coupled_calc(calc)
+        self._sequential = bool(self._coupled and self.B > 1)
+        if self._sequential:
+            _warnings.warn(
+                f"EulerPCBatch: {type(calc).__name__} globally couples molecules "
+                "(MACE-POL / AIMNet2-NSE class); a multi-structure batch would be "
+                "physically wrong. Falling back to a sequential B=1 loop (correct "
+                "single-molecule IRC, no GPU-batch speedup).", RuntimeWarning)
+
+    # ------------------------------- run ----------------------------------
+    def run(self):
+        """Run batched forward+backward EulerPC-IRC for all B structures.
+
+        Returns a list (len B) of per-structure result dicts (schema mirrors
+        LQABatch so the central IRC writer consumes both):
+            {"index": i, "valid": bool, "neg_eigval": float, "n_strong_neg": int,
+             "E_ts": float, "forward": {"records": {E,maxG,rmsG,x}},
+             "backward": {"records": {E,maxG,rmsG,x}}}
+        Invalid structures (no clean negative TS mode) get valid=False + empty
+        forward/backward paths (flagged, not propagated) instead of raising.
+        """
+        if self._sequential:
+            results = []
+            for i, at in enumerate(self.atoms_list):
+                results.extend(self._run_group([(i, at)]))
+            return results
+        return self._run_group([(i, at) for i, at in enumerate(self.atoms_list)])
+
+    # ------------------------------------------------------------ one group
+    def _run_group(self, items):
+        """Prepare the calc for `items` (list of (global_index, Atoms)) and drive
+        all their paths in lockstep. B == len(items) here (B=1 in the sequential
+        fallback, B=N in the batched path)."""
+        atoms_sub = [at for _, at in items]
+        nmax_dof = 3 * max(len(at) for at in atoms_sub)
+        self.calc.prepare(atoms_sub, fixed_nmax=nmax_dof)
+
+        pcs = [EulerPC(at, self.output, params=self.p) for _, at in items]
+        gens = [self._path_gen(pc) for pc in pcs]
+        local = self._drive(items, gens)
+
+        out = []
+        for (gidx, _), r in zip(items, local):
+            r = dict(r)
+            r["index"] = gidx
+            out.append(r)
+        return out
+
+    # -------------------------------- driver ------------------------------
+    def _drive(self, items, gens):
+        """Lockstep coroutine driver: rendezvous every live generator's pending
+        force/Hessian request into ONE batched forward per tick."""
+        B = len(items)
+        n_atoms = [len(at) for _, at in items]
+        row0 = [0]
+        for n in n_atoms:
+            row0.append(row0[-1] + n)
+        N = row0[-1]
+        dev = self.device
+
+        # packed Cartesian buffer (N,3) on the batch device, atom order ==
+        # concat(atoms_sub) (== the calc's own coord layout after prepare()).
+        pack = _torch.zeros((N, 3), dtype=_torch.float64, device=dev)
+        for k, (_, at) in enumerate(items):
+            pack[row0[k]:row0[k + 1]] = _torch.as_tensor(
+                np.asarray(at.get_positions(), dtype=np.float64), device=dev)
+
+        results = [None] * B
+        pending = {}
+        for k, g in enumerate(gens):
+            try:
+                pending[k] = next(g)
+            except StopIteration as e:
+                results[k] = e.value
+
+        while pending:
+            need_h = any(req[0] == 'h' for req in pending.values())
+            for k, (_typ, cart) in pending.items():
+                nk = n_atoms[k]
+                pack[row0[k]:row0[k + 1]] = _torch.as_tensor(
+                    np.asarray(cart, dtype=np.float64).reshape(nk, 3), device=dev)
+            self.calc.set_coords_(pack)
+
+            # FORCES ALWAYS come from a PURE get_ef_gpu() -- the single EulerPC
+            # oracle's forces do too. A backend's get_efh_gpu() returns a center
+            # force that can differ from get_ef_gpu() (e.g. UMA's FD-Hessian center
+            # vs the standalone forward), so an 'ef'-requesting path must never be
+            # served forces out of the Hessian forward, or its first/every step
+            # walks a slightly different trajectory than the oracle. When any path
+            # needs a Hessian this tick, ALSO fire get_efh_gpu() but use ONLY its
+            # H (its E,F are discarded).
+            E, F = self.calc.get_ef_gpu()
+            self._ef_calls += 1
+            if need_h:
+                _E2, _F2, H, _P = self.calc.get_efh_gpu()
+                self._efh_calls += 1
+            else:
+                H = None
+
+            E_cpu = E.detach().cpu()
+            F_cpu = F.detach().cpu()
+            H_cpu = H.detach().cpu() if H is not None else None
+
+            new_pending = {}
+            for k, (typ, _cart) in pending.items():
+                nk = n_atoms[k]
+                if typ == 'h':
+                    send_val = H_cpu[k, :3 * nk, :3 * nk].numpy().astype(np.float64)
+                else:
+                    Ek = float(E_cpu[k])
+                    Fk = F_cpu[k, :3 * nk].numpy().astype(np.float64)  # (3nk,) flat
+                    send_val = (Ek, Fk)
+                try:
+                    new_pending[k] = gens[k].send(send_val)
+                except StopIteration as e:
+                    results[k] = e.value
+            pending = new_pending
+
+        return results
+
+    # ---------------------------- record helper ---------------------------
+    @staticmethod
+    def _append_record(records, E, maxG, rmsG, cart_flat, natoms):
+        records["E"].append(float(E))
+        records["maxG"].append(float(maxG))
+        records["rmsG"].append(float(rmsG))
+        records["x"].append(
+            np.asarray(cart_flat, dtype=np.float64).reshape(natoms, 3).copy())
+
+    # ------------------------- per-path generators ------------------------
+    # These mirror EulerPC.run / _one_side / _micro_step VERBATIM in numpy,
+    # reusing the oracle instance `pc` for every pure (force-free) helper (DWI,
+    # BFGS/Bofill, predictor, DWI+mBS corrector, MW<->Cartesian conversions), and
+    # replacing each force/Hessian evaluation with a `yield`. Per-path logging is
+    # suppressed (numerically inert side effect) to avoid interleaved file writes;
+    # the batched summary is written centrally by the IRC dispatcher.
+
+    def _path_gen(self, pc):
+        """Full EulerPC run for one path (mirror of EulerPC.run)."""
+        pc._D = masses_D(pc.atoms)
+        pc._step_len_mw = float(pc.p.step_length_bohr * BOHR_TO_ANG)
+        pc._step_len_umw = float(pc.p.step_length_bohr * BOHR_TO_ANG)
+
+        R_ts_cart = pc.atoms.get_positions().copy().reshape(-1)
+
+        # Hessian at TS (batched) -> negative mode
+        H_cart_ts = to_f64((yield ('h', R_ts_cart)))
+        H_mw_ts = (pc._D[:, None] * H_cart_ts) * pc._D[None, :]
+        w, V = np.linalg.eigh(H_mw_ts)
+        neg_idx = np.where(w < 0.0)[0]
+        n_strong_neg = int(np.sum(w < -1e-4))
+
+        # Reference TS energy (mirror oracle order: after mode diagonalization)
+        E_ts_val, _F = yield ('ef', R_ts_cart)
+        E_ts = float(E_ts_val)
+
+        empty = {"E": [], "maxG": [], "rmsG": [], "x": []}
+        if len(neg_idx) == 0 or len(neg_idx) < pc.p.target_mode:
+            didx = min(pc.p.target_mode - 1, len(w) - 1)
+            return {"index": None, "valid": False,
+                    "neg_eigval": float(w[didx]), "n_strong_neg": n_strong_neg,
+                    "E_ts": E_ts,
+                    "forward": {"records": dict(empty)},
+                    "backward": {"records": dict(empty)}}
+
+        sorted_neg = neg_idx[np.argsort(w[neg_idx])]     # most negative first
+        idx = sorted_neg[pc.p.target_mode - 1]
+        eigval = float(w[idx])
+        # Use the RAW np.linalg.eigh eigenvector -- BYTE-IDENTICAL to the single
+        # EulerPC oracle's neg-mode selection (which does not canonicalize the
+        # sign). Given the same TS Hessian, batch and oracle then pick the SAME
+        # eigenvector with the SAME LAPACK sign, so batch(B=1) reproduces the
+        # oracle exactly (no reliance on downstream side-matching to undo a sign).
+        # [Earlier a canonical-phase flip was applied here; it made batch's
+        # forward/backward *labeling* deviate from the oracle -- removed.]
+        v_neg_mw = V[:, idx].copy()
+
+        forward_records = yield from self._one_side_gen(pc, +1.0, R_ts_cart, v_neg_mw, E_ts)
+        backward_records = yield from self._one_side_gen(pc, -1.0, R_ts_cart, v_neg_mw, E_ts)
+
+        return {"index": None, "valid": True,
+                "neg_eigval": eigval, "n_strong_neg": n_strong_neg, "E_ts": E_ts,
+                "neg_eigvec_mw": v_neg_mw.copy(),   # diagnostic: MW neg-mode eigenvector
+                "forward": {"records": forward_records},
+                "backward": {"records": backward_records}}
+
+    def _one_side_gen(self, pc, sign, q_ts_cart, v_neg_mw, E_ts):
+        """One-sided EulerPC integration (mirror of EulerPC._one_side)."""
+        p = pc.p
+        natoms = len(pc.atoms)
+
+        q_ts_mw = pc._mw_from_cart(q_ts_cart)
+        v_dir = _unit(v_neg_mw) * sign
+        q0_mw = q_ts_mw + pc._scale_mw_step(v_dir, 0.5 * pc._step_len_mw)
+
+        # Gradient at TS
+        _E, F_ts_cart = yield ('ef', pc._cart_from_mw(q_ts_mw))
+        g_ts_mw = pc._gradient_mw_from_forces(to_f64(F_ts_cart))
+
+        # Initial Hessian at TS (MW)
+        H_ts_cart = to_f64((yield ('h', pc._cart_from_mw(q_ts_mw))))
+        H0_mw = (pc._D[:, None] * H_ts_cart) * pc._D[None, :]
+
+        # Energy / forces at displaced start point
+        E0, F0_cart = yield ('ef', pc._cart_from_mw(q0_mw))
+        E0 = float(E0)
+        F0_cart = to_f64(F0_cart)
+        g0_mw = pc._gradient_mw_from_forces(F0_cart)
+        maxF0 = float(np.max(np.abs(F0_cart)))
+        rmsF0 = float(np.sqrt(np.mean(F0_cart ** 2)))
+
+        # Hessian update TS -> displaced point
+        if str(p.hessian_update).lower() == "bofill":
+            H0_mw = pc._bofill_update(H0_mw, q0_mw - q_ts_mw, g0_mw - g_ts_mw)
+        else:
+            H0_mw = pc._bfgs_update(H0_mw, q0_mw - q_ts_mw, g0_mw - g_ts_mw)
+
+        # Initialize EulerPC state
+        pc.mw_coords = q0_mw.copy()
+        pc.mw_hessian = H0_mw.copy()
+        pc.prev_coords = None
+        pc.prev_grad = None
+        pc.micro_counter = 0
+        pc._dwi = DWI(n=p.dwi_n, maxlen=2)
+        pc._dwi.update(q0_mw.copy(), E0, g0_mw, pc.mw_hessian.copy())
+
+        records = {"E": [], "maxG": [], "rmsG": [], "x": []}
+        self._append_record(records, E0, maxF0, rmsF0, pc._cart_from_mw(q0_mw), natoms)
+
+        for it in range(1, p.max_steps + 1):
+            pc.cur_cycle = it - 1
+            pc._early_converged = False
+            dx, _g = yield from self._micro_step_gen(pc)
+            if _norm(dx) <= 1e-12:
+                break
+
+            if pc._early_converged:
+                E_new, F_new = yield ('ef', pc._cart_from_mw(pc.mw_coords))
+                E_new = float(E_new)
+                F_new = to_f64(F_new)
+                maxF = float(np.max(np.abs(F_new)))
+                rmsF = float(np.sqrt(np.mean(F_new ** 2)))
+                self._append_record(records, E_new, maxF, rmsF,
+                                     pc._cart_from_mw(pc.mw_coords), natoms)
+                break
+
+            E_new, F_new = yield ('ef', pc._cart_from_mw(pc.mw_coords))
+            E_new = float(E_new)
+            F_new = to_f64(F_new)
+            maxF = float(np.max(np.abs(F_new)))
+            rmsF = float(np.sqrt(np.mean(F_new ** 2)))
+            self._append_record(records, E_new, maxF, rmsF,
+                                 pc._cart_from_mw(pc.mw_coords), natoms)
+
+            if (maxF <= p.f_max_th) and (rmsF <= p.f_rms_th):
+                break
+
+        return records
+
+    def _micro_step_gen(self, pc):
+        """One EulerPC predictor-corrector micro step (mirror of
+        EulerPC._micro_step). Yields for the current-point and predicted-point
+        force evals (and optional Hessian recalc); predictor + corrector are pure
+        numpy (no force eval)."""
+        p = pc.p
+        init_mw = pc.mw_coords.copy()
+
+        # Current energy / gradient
+        e_curr, F_cart = yield ('ef', pc._cart_from_mw(init_mw))
+        e_curr = float(e_curr)
+        g_curr = pc._gradient_mw_from_forces(to_f64(F_cart))
+        if _norm(g_curr) < 1e-12:
+            return np.zeros_like(g_curr), g_curr
+
+        # Update Hessian (or optionally recalc)
+        recalc = (
+            p.hessian_recalc is not None
+            and p.hessian_recalc > 0
+            and (pc.micro_counter % p.hessian_recalc == 0)
+        )
+        if recalc and pc.micro_counter > 0:
+            H_cart = to_f64((yield ('h', pc._cart_from_mw(init_mw))))
+            pc.mw_hessian = (pc._D[:, None] * H_cart) * pc._D[None, :]
+        elif (pc.prev_coords is not None) and (pc.prev_grad is not None):
+            gradient_diff = g_curr - pc.prev_grad
+            coords_diff = init_mw - pc.prev_coords
+            if str(p.hessian_update).lower() == "bofill":
+                pc.mw_hessian = pc._bofill_update(pc.mw_hessian, coords_diff, gradient_diff)
+            else:
+                pc.mw_hessian = pc._bfgs_update(pc.mw_hessian, coords_diff, gradient_diff)
+
+        pc.prev_coords = init_mw
+        pc.prev_grad = g_curr
+
+        if pc._dwi is not None and pc.micro_counter > 0:
+            pc._dwi.update(init_mw.copy(), e_curr, g_curr, pc.mw_hessian.copy())
+
+        # Predictor: Euler integration with Hessian-based gradient model (no eval)
+        conv_fact = pc._get_conv_fact(g_curr)
+        euler_step_len = pc._step_len_mw / (float(p.max_pred_steps) / conv_fact)
+
+        euler_mw = init_mw.copy()
+        euler_grad = g_curr.copy()
+        pred_converged = False
+        for _ in range(int(p.max_pred_steps)):
+            if pc._unweight_len(euler_mw - init_mw) >= pc._step_len_umw:
+                pred_converged = True
+                break
+            grad_norm = _norm(euler_grad)
+            if grad_norm < 1e-12:
+                break
+            step = euler_step_len * (-euler_grad) / grad_norm
+            euler_mw = euler_mw + step
+            euler_step = euler_mw - init_mw
+            euler_grad = g_curr + pc.mw_hessian.dot(euler_step)
+
+        pred_mw = euler_mw
+
+        if not pred_converged:
+            euler_grad_cart = pc._unweight_grad(euler_grad)
+            rms_grad = float(np.sqrt(np.mean(euler_grad_cart ** 2)))
+            if pc.cur_cycle < int(p.loose_cycles):
+                pass  # loose-cycle mode (log suppressed in batch)
+            elif rms_grad <= float(p.f_rms_th):
+                pc._early_converged = True
+                pc.mw_coords = pred_mw
+                dx = pc.mw_coords - init_mw
+                return dx, euler_grad
+            else:
+                pass  # continue with corrector (log suppressed in batch)
+
+        # Evaluate predicted point and update Hessian
+        E_pred, F_pred = yield ('ef', pc._cart_from_mw(pred_mw))
+        E_pred = float(E_pred)
+        g_pred = pc._gradient_mw_from_forces(to_f64(F_pred))
+
+        dx_pred = pred_mw - init_mw
+        dg_pred = g_pred - g_curr
+        if str(p.hessian_update).lower() == "bofill":
+            pc.mw_hessian = pc._bofill_update(pc.mw_hessian, dx_pred, dg_pred)
+        else:
+            pc.mw_hessian = pc._bfgs_update(pc.mw_hessian, dx_pred, dg_pred)
+
+        if pc._dwi is not None:
+            pc._dwi.update(pred_mw.copy(), E_pred, g_pred, pc.mw_hessian.copy())
+
+        # Corrector: mBS integration on DWI surface (no eval)
+        if pc._dwi is not None:
+            corr_mw = pc._corrector_step(init_mw, pc._step_len_umw, pc._dwi)
+        else:
+            corr_mw = pred_mw
+
+        pc.mw_coords = corr_mw
+        pc.micro_counter += 1
+
+        dx = pc.mw_coords - init_mw
+        return dx, g_pred
+
+
+def run_eulerpc_irc(atoms_or_list, output: str = "eulerpc.out", paras=None,
+                    calc=None, params=None, device=None):
+    """Unified EulerPC-IRC entry point (single-structure backward compatible).
+
+    - Single ASE ``Atoms`` with an attached ASE calculator -> the original
+      single-structure ``EulerPC`` oracle (unchanged behaviour / units / outputs).
+    - list / tuple of ``Atoms`` -> the batched ``EulerPCBatch``, consuming the
+      supplied batch calculator ``calc`` (prepare / get_ef_gpu[/get_efh_gpu] API).
+    """
+    if isinstance(atoms_or_list, (list, tuple)):
+        if calc is None:
+            raise ValueError("run_eulerpc_irc(batch): a batch calculator `calc` is required")
+        return EulerPCBatch(list(atoms_or_list), calc, output=output,
+                            params=params, paras=paras, device=device).run()
+    eulerpc = EulerPC(atoms_or_list, output=output, params=params, paras=paras)
+    return eulerpc.run()

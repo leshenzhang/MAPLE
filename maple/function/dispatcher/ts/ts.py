@@ -64,6 +64,12 @@ class TransitionState(JobABC):
                     raise ValueError('For NEB method, you should provide a Molecules object or a list of at least two structures.')
                     
             elif self.method == 'string':
+                # OPT-IN batched GSM: a list of [R,P] reactions (each element a
+                # pair/list/Molecules) routes to GSMBatch; a flat [R,P] keeps the
+                # unchanged single GSM oracle.
+                if (isinstance(self.atoms, list) and self.atoms
+                        and isinstance(self.atoms[0], (list, tuple, Molecules))):
+                    return self._run_batched_gsm()
                 # TODO: Update String/GSM to accept Molecules object instead of list
                 if not isinstance(self.atoms, list):
                     raise ValueError('For String method, you should provide at least two structures (initial and final states).')
@@ -93,6 +99,12 @@ class TransitionState(JobABC):
                     dimer.run()
 
             elif self.method == 'autoneb':
+                # OPT-IN batched AutoNEB: a list of reactions (each element a
+                # pair/list/Molecules) routes to AutoNEBBatch; a single Molecules
+                # or flat structure list keeps the unchanged single AutoNEB oracle.
+                if (isinstance(self.atoms, list) and self.atoms
+                        and isinstance(self.atoms[0], (list, tuple, Molecules))):
+                    return self._run_batched_autoneb()
                 # AutoNEB: automated multi-step reaction pathway exploration
                 if isinstance(self.atoms, Molecules):
                     from .algorithm import AutoNEB
@@ -212,3 +224,33 @@ class TransitionState(JobABC):
             paras=self.params,
         )
         bdimer.run(mols)
+
+    def _run_batched_gsm(self):
+        """Batched GSM over B reactions (run_gsm -> GSMBatch). Each reaction is a
+        [R,P] pair / Molecules; the single-reaction GSM stays the oracle."""
+        from ..dispatcher import resolve_batched_calc, batch_device_str
+        from .algorithm.string import run_gsm
+        reactions = list(self.atoms)
+        if not reactions:
+            return None
+        flat = [a for rxn in reactions
+                for a in (rxn.multiatoms if isinstance(rxn, Molecules) else rxn)]
+        attached = getattr(flat[0], 'calc', None) if flat else None
+        calc = resolve_batched_calc(self.params, flat, attached_calc=attached)
+        return run_gsm(reactions, output=self.output, paras=self.params,
+                       calc=calc, device=batch_device_str(self.params))
+
+    def _run_batched_autoneb(self):
+        """Batched AutoNEB over B reactions (AutoNEBBatch). Each reaction is a
+        [R,P] pair / Molecules; the single-reaction AutoNEB stays the oracle."""
+        from ..dispatcher import resolve_batched_calc, batch_device_str
+        from .algorithm.autoneb import AutoNEBBatch
+        reactions = list(self.atoms)
+        if not reactions:
+            return None
+        flat = [a for rxn in reactions
+                for a in (rxn.multiatoms if isinstance(rxn, Molecules) else rxn)]
+        attached = getattr(flat[0], 'calc', None) if flat else None
+        calc = resolve_batched_calc(self.params, flat, attached_calc=attached)
+        return AutoNEBBatch(self.output, reactions, calc=calc,
+                            paras=self.params).run()

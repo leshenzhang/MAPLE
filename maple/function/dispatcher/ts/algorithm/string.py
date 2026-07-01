@@ -945,3 +945,627 @@ class GSM(JobABC):
         # --- Direct TS refinement via PRFO/RFO on HEI (no CI-STRING / no full relax)
         self.restart_run(images, hei, base)
 
+
+# =============================================================================
+# ==========================  OPT-IN BATCHED GSM  =============================
+# =============================================================================
+# GSMBatch: run N INDEPENDENT GSM reactions while collapsing the band
+# force-evaluations of ALL still-live reactions into ONE batched GPU forward
+# (``calc.prepare(...)`` + ``calc.get_ef_gpu()``) per force-call tick.  The
+# single-structure ``GSM`` class above is left BYTE-IDENTICAL (the parity
+# oracle); everything below is additive + opt-in.
+#
+# WHY A THREAD-BARRIER BROKER (and NOT a lockstepped outer loop) -------------
+#   Single-structure GSM growth is a deeply-nested, data-dependent control flow:
+#   a per-node adaptive predictor with step backtracking, an inner projected
+#   L-BFGS mini-relax whose iteration count depends on the local PES, the growth
+#   policy (pause side / forced connector pull / monotonic-guard retries), and a
+#   final PRFO TS refinement.  The number of force calls per outer growth
+#   iteration therefore DIVERGES per reaction -- the SAME ceiling documented for
+#   the IRC ``GSBatch`` ("the GS micro-counter diverges per structure",
+#   irc/algorithm/gs.py ~line 794).  Lockstepping the OUTER control flow across
+#   reactions would be numerically WRONG (it couples independent reactions'
+#   step/backtrack/HEI decisions).
+#
+#   Instead, each reaction runs the *unchanged* single ``GSM`` algorithm on its
+#   own worker thread; its ASE calculator is swapped for a ``_BrokerCalc`` that,
+#   on every force request, hands its single node to a barrier broker and
+#   BLOCKS.  The coordinator (driver) thread waits until every STILL-LIVE
+#   reaction has posted its next single-node request, evaluates them ALL in ONE
+#   ``get_ef_gpu()`` forward, scatters (E, F) back, and releases the workers.
+#   A reaction that converges / errors / finishes simply leaves the live set, so
+#   the batch transparently SHRINKS to the remaining reactions (this is the
+#   per-item divergence masking).  Because each worker runs GSM byte-for-byte,
+#   every reaction's trajectory equals the single-GSM oracle up to the batch
+#   calculator's own block-diagonal reproducibility floor (perturb-one
+#   byte-isolation, ~1e-6 Ha; verified inside each Batch calc).
+#
+# CROSS-REACTION ISOLATION (mirrors NEB._eval_flat_batched / GSBatch) --------
+#   Each reaction's node enters the flat ``atoms_list`` as its OWN entry, so the
+#   Batch calc assigns it a distinct ``mol_idx`` block -> the packed forward is
+#   block-diagonal and one reaction cannot leak into another.  This is ONLY true
+#   for LOCAL potentials; a globally COUPLED / polarizable calc (MACE-POL,
+#   AIMNet2 charge-equilibration / NSE) is gated out (see
+#   ``_gsm_calc_cross_batch_safe``).
+#
+# HESSIAN (optional P-RFO TS-refinement, GSM.restart_run -> PRFO) -------------
+#   PRFO calls ``atoms.calc.get_hessian(atoms)``; the broker calc proxies it as
+#   an ``efh`` request through the SAME barrier.  The driver partitions each
+#   tick's submissions by kind -> one ``get_ef_gpu`` forward for the ``ef``
+#   (force) group AND one ``get_efh_gpu`` forward for the ``efh`` (Hessian)
+#   group, so Hessians of the reactions whose P-RFO steps aligned on a Hessian
+#   recalc this tick are ALSO batched.  ``get_efh_gpu`` is block-diagonal
+#   (H (B,M,M), each structure's (3n,3n) block independent), so the packing is
+#   exact.  ALL calc access stays on the single driver thread -> no state race.
+#
+# CEILING / LIMITATIONS (by design; documented) -----------------------------
+#   * Only FORCE + HESSIAN EVALUATION are batched (95-99% of wall time per
+#     profiling).  The per-reaction growth/convergence CONTROL FLOW stays
+#     per-item (its own thread) and is NOT vectorized.  Achieved speedup ~
+#     (# reactions simultaneously waiting at a force/Hessian barrier); it
+#     DEGRADES as reactions diverge / finish and the live batch shrinks, and
+#     there is NO batching WITHIN one reaction's sequential (data-dependent)
+#     calls.  A lone reaction still in P-RFO gets an unbatched B=1 get_efh_gpu.
+#   * The Hessian proxy needs ``calc.get_efh_gpu`` (all Batch calcs expose it);
+#     absent it, batched TS-refinement raises a clear NotImplementedError while
+#     the (already-written, pre-PRFO) MEP string is unaffected.
+#   * Requires a LOCAL / block-diagonal Batch calc (UMA-omol, standard MACE,
+#     MACE-OFF, AIMNet2-decoupled, ANI).  Coupled/polarizable calcs -> raise (or
+#     opt-in sequential single-oracle fallback).
+#   * ``threading`` (not multiprocessing): the heavy GPU forward is issued ONLY
+#     by the driver thread; workers do lightweight numpy control flow while the
+#     driver is idle, so the GIL is not the bottleneck (the batched forward is).
+# =============================================================================
+
+try:  # ASE calculator protocol (ase is already a hard dep via ``from ase import Atoms``)
+    from ase.calculators.calculator import Calculator as _ASECalculator, all_changes as _ALL_CHANGES
+except Exception:  # pragma: no cover - defensive only
+    _ASECalculator = object
+    _ALL_CHANGES = ["positions", "numbers", "cell", "pbc"]
+
+
+# ------------------------------------------------------------------ gates ----
+def _gsm_is_batch_calc(calc) -> bool:
+    """A Batch calculator exposes ``prepare(atoms_list, fixed_nmax)`` +
+    ``get_ef_gpu()`` (UMABatchCalc / AIMNet2*BatchCalc / MACE*BatchCalc /
+    ANIBatchCalc contract).  Mirrors NEB._is_batch_calc / irc gs.py."""
+    return (calc is not None
+            and callable(getattr(calc, "prepare", None))
+            and callable(getattr(calc, "get_ef_gpu", None)))
+
+
+def _gsm_calc_cross_batch_safe(calc) -> Tuple[bool, str]:
+    """Decide whether INDEPENDENT reactions may share ONE block-diagonal batched
+    forward without physically coupling.  Returns ``(safe, reason)``.
+
+    SAFE   -- local / block-diagonal potentials (UMA-omol, standard MACE,
+              MACE-OFF, AIMNet2-decoupled, ANI): each reaction is its own
+              ``mol_idx`` block and cannot leak into another (the calculators'
+              perturb-one byte-isolation gate).
+    UNSAFE -- globally coupled / polarizable potentials:
+                * MACE-POL          exposes a ``coupling_mode`` attribute; the
+                                    global dipole field couples molecules
+                                    (~1e-3 Ha/A leak > the 1e-4 Ha/A parity gate).
+                * AIMNet2 charge-eq ``AIMNet2BatchCalc`` (NSE) redistributes
+                                    charge globally; only
+                                    ``AIMNet2DecoupledBatchCalc`` is safe.
+    Honours an explicit author override if present:
+        ``calc.cross_batch_safe`` (bool) or ``calc.couples_across_batch`` (bool).
+    """
+    ov = getattr(calc, "cross_batch_safe", None)
+    if isinstance(ov, bool):
+        return ov, ("calc.cross_batch_safe=True override" if ov
+                    else "calc.cross_batch_safe=False override")
+    cpl = getattr(calc, "couples_across_batch", None)
+    if isinstance(cpl, bool):
+        return (not cpl), (f"calc.couples_across_batch={cpl} override")
+    # MACE-POL family: presence of coupling_mode marks the polarizable calc.
+    cm = getattr(calc, "coupling_mode", None)
+    if cm is not None:
+        return False, (f"polarizable/coupled calc (coupling_mode={cm!r}); the "
+                       "global dipole field couples independent reactions")
+    name = type(calc).__name__
+    low = name.lower()
+    if ("pol" in low) or ("polar" in low):
+        return False, f"polarizable calc ({name})"
+    if ("aimnet" in low) and ("decoupl" not in low):
+        return False, (f"AIMNet2 charge-equilibration/NSE calc ({name}); global "
+                       "charge redistribution couples independent reactions "
+                       "(use AIMNet2DecoupledBatchCalc for the batched path)")
+    return True, f"local/block-diagonal calc ({name})"
+
+
+def _gsm_eval_flat(calc, atoms_list):
+    """ONE ``prepare()`` + ONE ``get_ef_gpu()`` over a flat list of INDEPENDENT
+    nodes.  Returns ``(Es: list[float], Fs: list[(n_i,3) np.float64])`` in
+    Hartree / Eh-per-Angstrom.  Mirrors NEB._eval_flat_batched: each node is its
+    own ``mol_idx`` block so the packed forward yields each node's E/F
+    independently.  Units (Ha == Eh) match the single GSM (Eh, Eh/A)."""
+    calc.prepare(atoms_list, fixed_nmax=None)
+    E_Ha, F_Ha = calc.get_ef_gpu()
+    try:
+        import torch as _t
+        if isinstance(E_Ha, _t.Tensor):
+            E_np = E_Ha.detach().to("cpu", _t.float64).numpy()
+        else:
+            E_np = np.asarray(E_Ha, dtype=np.float64)
+        if isinstance(F_Ha, _t.Tensor):
+            F_np = F_Ha.detach().to("cpu", _t.float64).numpy()
+        else:
+            F_np = np.asarray(F_Ha, dtype=np.float64)
+    except ImportError:  # pragma: no cover - torch always present on batch path
+        E_np = np.asarray(E_Ha, dtype=np.float64)
+        F_np = np.asarray(F_Ha, dtype=np.float64)
+    Es, Fs = [], []
+    for i, at in enumerate(atoms_list):
+        n_i = len(at)
+        Es.append(float(E_np[i]))
+        Fs.append(F_np[i, :3 * n_i].reshape(n_i, 3).astype(np.float64, copy=True))
+    return Es, Fs
+
+
+def _gsm_eval_flat_hess(calc, atoms_list):
+    """ONE ``prepare()`` + ONE ``get_efh_gpu()`` over a flat list of INDEPENDENT
+    nodes -> per-structure Cartesian Hessian list ``[(3n_i, 3n_i) np.float64]``
+    (Eh/A^2).  This is the batched twin of ``_gsm_eval_flat`` for the P-RFO
+    TS-refinement Hessian (``calc.get_hessian`` contract, PRFO.calculate_Hessian).
+    Same block-diagonal isolation: ``get_efh_gpu`` returns ``H (B, M, M)`` with
+    each structure's ``(3n_i, 3n_i)`` block filled independently, so packing
+    independent reactions' Hessian requests into one forward is exact."""
+    if not callable(getattr(calc, "get_efh_gpu", None)):
+        raise NotImplementedError(
+            "batched GSM TS-refinement needs calc.get_efh_gpu() for the Hessian; "
+            f"{type(calc).__name__} exposes no batched Hessian primitive")
+    calc.prepare(atoms_list, fixed_nmax=None)
+    out = calc.get_efh_gpu()                 # (E, F, H (B,M,M), P)
+    H_all = out[2]
+    try:
+        import torch as _t
+        if isinstance(H_all, _t.Tensor):
+            H_np = H_all.detach().to("cpu", _t.float64).numpy()
+        else:
+            H_np = np.asarray(H_all, dtype=np.float64)
+    except ImportError:  # pragma: no cover - torch always present on batch path
+        H_np = np.asarray(H_all, dtype=np.float64)
+    Hs = []
+    for i, at in enumerate(atoms_list):
+        m = 3 * len(at)
+        Hs.append(H_np[i, :m, :m].astype(np.float64, copy=True))
+    return Hs
+
+
+def _gsm_parse_xyz(path):
+    """Parse a MAPLE multi-frame XYZ (``write_xyz`` format above) into a list of
+    frames ``[{'symbols', 'positions': (N,3) f64, 'energy': float|None}, ...]``.
+    Returns ``[]`` when the file is absent/empty (e.g. PRFO not reached)."""
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    frames = []
+    i, n = 0, len(lines)
+    while i < n:
+        head = lines[i].strip()
+        if not head:
+            i += 1
+            continue
+        try:
+            nat = int(head.split()[0])
+        except (ValueError, IndexError):
+            i += 1
+            continue
+        comment = lines[i + 1] if (i + 1) < n else ""
+        energy = None
+        if "Energy" in comment:
+            try:
+                energy = float(comment.split("Energy")[1].split("=")[1].split()[0])
+            except Exception:
+                energy = None
+        if i + 2 + nat > n:
+            break
+        syms, pos = [], []
+        ok = True
+        for k in range(nat):
+            parts = lines[i + 2 + k].split()
+            if len(parts) < 4:
+                ok = False
+                break
+            syms.append(parts[0])
+            pos.append([float(parts[1]), float(parts[2]), float(parts[3])])
+        if ok:
+            frames.append({"symbols": syms,
+                           "positions": np.asarray(pos, dtype=np.float64),
+                           "energy": energy})
+        i += 2 + nat
+    return frames
+
+
+# ------------------------------------------------- ASE calculator adapters ---
+class _BatchToASEShim(_ASECalculator):
+    """ASE single-structure calculator backed by a MAPLE Batch calculator.
+
+    Every force call issues a B=1 ``prepare()`` + ``get_ef_gpu()`` on the Batch
+    calc, so the single-GSM oracle runs on the SAME model / units (Hartree,
+    Eh/A) as the batched path -- parity is measured against the *identical*
+    potential.  Used for (a) the single-reaction / coupled-calc / plain-ASE-free
+    sequential fallback and (b) the parity oracle in
+    tests_campaign/test_gsm_batch.py."""
+    implemented_properties = ["energy", "free_energy", "forces"]
+
+    def __init__(self, batch_calc, **kw):
+        super().__init__(**kw)
+        self._bc = batch_calc
+
+    # GSM.restart_run does copy.deepcopy(atoms); never deepcopy the torch/CUDA
+    # Batch calc -- return the shared instance instead.
+    def __deepcopy__(self, memo):
+        return self
+
+    def __copy__(self):
+        return self
+
+    def calculate(self, atoms=None, properties=("energy",),
+                  system_changes=_ALL_CHANGES):
+        super().calculate(atoms, properties, system_changes)
+        Es, Fs = _gsm_eval_flat(self._bc, [atoms])
+        self.results = {"energy": Es[0], "free_energy": Es[0], "forces": Fs[0]}
+
+    def get_hessian(self, atoms, *args, **kwargs):
+        """(3N, 3N) Cartesian Hessian (Eh/A^2) via the Batch calc's B=1
+        ``get_efh_gpu`` -- enables P-RFO TS-refinement on the single-oracle /
+        sequential-fallback path (PRFO.calculate_Hessian -> calc.get_hessian)."""
+        return _gsm_eval_flat_hess(self._bc, [atoms])[0]
+
+
+class _BrokerCalc(_ASECalculator):
+    """ASE single-structure calculator that routes every force request of ONE
+    reaction (worker thread ``wid``) through the batch broker, so it is
+    evaluated together with all other still-live reactions in ONE batched
+    forward."""
+    implemented_properties = ["energy", "free_energy", "forces"]
+
+    def __init__(self, broker, wid, **kw):
+        super().__init__(**kw)
+        self._broker = broker
+        self._wid = wid
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __copy__(self):
+        return self
+
+    def calculate(self, atoms=None, properties=("energy",),
+                  system_changes=_ALL_CHANGES):
+        super().calculate(atoms, properties, system_changes)
+        # snapshot the geometry (the worker blocks in request(), but copy keeps
+        # the broker's node stable + calc-free for prepare()).
+        E, F = self._broker.request(self._wid, atoms.copy(), kind="ef")
+        self.results = {"energy": E, "free_energy": E, "forces": F}
+
+    def get_hessian(self, atoms, *args, **kwargs):
+        """Route the P-RFO TS-refinement Hessian through the broker so it is
+        batched with the OTHER still-live reactions' Hessian requests at the
+        SAME barrier (one driver-thread ``get_efh_gpu`` forward over all aligned
+        ``efh`` requests).  Returns the (3N, 3N) Cartesian Hessian (Eh/A^2)."""
+        return self._broker.request(self._wid, atoms.copy(), kind="efh")
+
+
+# --------------------------------------------------------- the broker core ---
+class _GSMBatchBroker:
+    """Barrier-synchronized force-request broker (see the GSMBatch section
+    header).  Worker threads submit ONE node each and block; the driver batches
+    every LIVE worker's pending node into one ``get_ef_gpu()`` forward, scatters
+    results, and releases the workers.  Finished workers leave ``_alive`` so the
+    batch shrinks to only the still-live reactions (per-item divergence
+    masking)."""
+
+    def __init__(self, calc):
+        import threading
+        self._calc = calc
+        self._cv = threading.Condition()
+        self._alive = set()          # wids of running workers
+        self._submitted = {}         # wid -> (kind, Atoms) awaiting eval
+        self._answers = {}           # wid -> (E, F)  [kind 'ef'] | H  [kind 'efh']
+        self._error = None           # first fatal forward error (aborts all)
+        self.n_forwards = 0          # diagnostics: batched get_ef_gpu forwards
+        self.n_node_evals = 0        #              packed force nodes
+        self.n_hess_forwards = 0     #              batched get_efh_gpu forwards
+        self.n_hess_evals = 0        #              packed Hessian nodes
+
+    def register(self, wid):
+        with self._cv:
+            self._alive.add(wid)
+
+    def request(self, wid, atoms, kind="ef"):
+        """Called from a worker thread; blocks until the driver returns the
+        result for this request.  ``kind='ef'`` -> ``(E, F)`` (force call);
+        ``kind='efh'`` -> the (3N, 3N) Cartesian Hessian (P-RFO TS-refine)."""
+        with self._cv:
+            self._submitted[wid] = (kind, atoms)
+            self._cv.notify_all()
+            while wid not in self._answers:
+                if self._error is not None:
+                    raise self._error
+                self._cv.wait()
+            return self._answers.pop(wid)
+
+    def finish(self, wid):
+        """Called from a worker thread when its reaction is done (or errored)."""
+        with self._cv:
+            self._alive.discard(wid)
+            self._submitted.pop(wid, None)
+            self._cv.notify_all()
+
+    def drive(self):
+        """Coordinator loop (runs on the caller thread); returns when no worker
+        remains alive."""
+        while True:
+            with self._cv:
+                if self._error is not None:
+                    # abort mode: wake everyone; drain until all workers leave.
+                    self._cv.notify_all()
+                    while self._alive:
+                        self._cv.wait()
+                    return
+                # wait until EVERY still-live reaction has posted its next node
+                # (this is what makes "all live nodes in ONE forward" hold).
+                while (self._alive
+                       and not (self._alive <= set(self._submitted))
+                       and self._error is None):
+                    self._cv.wait()
+                if self._error is not None:
+                    continue
+                if not self._alive:
+                    return
+                batch = list(self._submitted.items())   # [(wid,(kind,atoms)),...]
+                self._submitted.clear()
+            # heavy batched forward(s) OUTSIDE the lock, on THIS (driver) thread
+            # ONLY -- all workers are blocked waiting for their answers, so the
+            # underlying calc is never touched concurrently (no state race).
+            # Partition by request kind: all 'ef' -> ONE get_ef_gpu forward, all
+            # 'efh' -> ONE get_efh_gpu forward (Hessians batched across the
+            # reactions whose P-RFO steps aligned on a Hessian recalc this tick).
+            ef = [(w, a) for w, (k, a) in batch if k == "ef"]
+            efh = [(w, a) for w, (k, a) in batch if k == "efh"]
+            try:
+                answers = {}
+                if ef:
+                    Es, Fs = _gsm_eval_flat(self._calc, [a for _, a in ef])
+                    for (w, _), e, f in zip(ef, Es, Fs):
+                        answers[w] = (e, f)
+                    self.n_forwards += 1
+                    self.n_node_evals += len(ef)
+                if efh:
+                    Hs = _gsm_eval_flat_hess(self._calc, [a for _, a in efh])
+                    for (w, _), h in zip(efh, Hs):
+                        answers[w] = h
+                    self.n_hess_forwards += 1
+                    self.n_hess_evals += len(efh)
+            except BaseException as e:  # NaN / OOM / calc failure -> abort all
+                with self._cv:
+                    self._error = e
+                    self._cv.notify_all()
+                continue
+            with self._cv:
+                self._answers.update(answers)
+                self._cv.notify_all()
+
+
+# ------------------------------------------------------------- GSMBatch ------
+class GSMBatch:
+    """OPT-IN batched Growing String Method over N INDEPENDENT reactions.
+
+    Runs N single-structure GSM reactions concurrently, collapsing the band
+    force calls of ALL still-live reactions into ONE batched GPU forward
+    (``calc.prepare`` + ``calc.get_ef_gpu``) per force-call tick.  The
+    single-structure ``GSM`` class is UNCHANGED and is the parity oracle;
+    ``GSMBatch`` is additive.
+
+    Parameters
+    ----------
+    reactions : list of (atoms_R, atoms_P)
+        N reactant/product endpoint pairs (one GSM per pair).
+    calc : Batch calculator
+        Exposes ``prepare(atoms_list, fixed_nmax)`` + ``get_ef_gpu() ->
+        (E (B,) Ha, F (B, nmax_dof) Eh/A)``.  MUST be a LOCAL / block-diagonal
+        potential for cross-reaction batching (see ``_gsm_calc_cross_batch_safe``);
+        a coupled / polarizable calc is gated out.  A plain ASE calc (no batch
+        contract) degrades to a serial single-GSM-per-reaction run.
+    output : str
+        Base log path; per-reaction logs/artifacts get a ``_rxn{i}`` suffix.
+    paras / params : GSM parameter overrides (same semantics as ``GSM``).
+    coupled_mode : {'raise', 'sequential'}
+        Behaviour when ``calc`` is a coupled/polarizable potential: raise a clear
+        ``NotImplementedError`` (default) or fall back to the per-reaction single
+        oracle.
+
+    ``run()`` returns a list (len N, original order) of per-reaction dicts:
+        {'index', 'output', 'error': None|str, 'mep': [frames]|[],
+         'ts': [frame]|[], 'hei_index': int|None, 'hei': frame|None}
+    where a ``frame`` is ``{'symbols', 'positions': (N,3) f64, 'energy'}``.
+    Diagnostics: ``self.n_forwards`` / ``self.n_node_evals`` count the batched
+    ``get_ef_gpu`` forwards and packed force node-evals; ``self.n_hess_forwards``
+    / ``self.n_hess_evals`` count the batched ``get_efh_gpu`` forwards and packed
+    Hessian node-evals (P-RFO TS-refinement).
+    """
+
+    def __init__(self, reactions, calc, output="gsm_batch.out",
+                 paras=None, params=None, device=None, coupled_mode="raise"):
+        self.reactions = [tuple(r) for r in reactions]
+        for r in self.reactions:
+            if len(r) != 2:
+                raise ValueError("each reaction must be a (atoms_R, atoms_P) pair")
+        self.calc = calc
+        self.output = output
+        self.paras = paras
+        self.params = params
+        self.device = device
+        if coupled_mode not in ("raise", "sequential"):
+            raise ValueError("coupled_mode must be 'raise' or 'sequential'")
+        self.coupled_mode = coupled_mode
+        self.B = len(self.reactions)
+        if self.B == 0:
+            raise ValueError("GSMBatch: empty reactions list")
+        self.n_forwards = 0
+        self.n_node_evals = 0
+        self.n_hess_forwards = 0
+        self.n_hess_evals = 0
+
+    # per-reaction output path (independent logs / xyz artifacts)
+    def _rxn_output(self, i):
+        base, ext = os.path.splitext(self.output)
+        return f"{base}_rxn{i}{ext or '.out'}"
+
+    def _blank_record(self, i, err=None):
+        return {"index": i, "output": self._rxn_output(i), "error": err,
+                "mep": [], "ts": [], "hei_index": None, "hei": None}
+
+    def _harvest(self, rec):
+        """Fill a record's parsed MEP/TS/HEI from the artifacts GSM wrote.  The
+        equal-arc MEP is written BEFORE the PRFO TS step, so the deterministic
+        string survives even a PRFO hiccup."""
+        base_i, _ = os.path.splitext(rec["output"])
+        rec["mep"] = _gsm_parse_xyz(base_i + "_gsm_mep.xyz")
+        rec["ts"] = _gsm_parse_xyz(base_i + "_stringts_ts.xyz")
+        Es = [f["energy"] for f in rec["mep"]]
+        if len(Es) > 2 and all(e is not None for e in Es):
+            hei = max(range(1, len(Es) - 1), key=lambda k: Es[k])
+            rec["hei_index"], rec["hei"] = hei, rec["mep"][hei]
+        return rec
+
+    def _run_one(self, i, calc_i):
+        """Run reaction ``i``'s UNCHANGED single ``GSM`` with calculator
+        ``calc_i`` (either a broker calc or a single-shim calc)."""
+        rec = self._blank_record(i)
+        aR, aP = self.reactions[i]
+        R = aR.copy(); R.calc = calc_i
+        P = aP.copy(); P.calc = calc_i
+        try:
+            gsm = GSM(rec["output"], R, P, paras=self.paras)
+            if self.params is not None:
+                gsm.params = self.params
+            gsm.run()
+        except BaseException as e:      # PRFO/growth hiccup: keep the MEP we wrote
+            rec["error"] = repr(e)
+        return self._harvest(rec)
+
+    def _run_serial(self, use_shim, note):
+        """Single-oracle path (plain-ASE-free / coupled / B==1): each reaction's
+        GSM runs one after another (no cross-reaction batching)."""
+        log_info([f"\nGSMBatch: {note}\n"], self.output)
+        results = [None] * self.B
+        for i in range(self.B):
+            calc_i = _BatchToASEShim(self.calc) if use_shim else self.calc
+            results[i] = self._run_one(i, calc_i)
+        return results
+
+    def _run_batched(self):
+        """Threaded broker path: one worker thread per reaction runs GSM
+        unchanged; the driver batches all live reactions' force calls."""
+        import threading
+        import time
+        broker = _GSMBatchBroker(self.calc)
+        results = [None] * self.B
+        for i in range(self.B):
+            broker.register(i)
+
+        def worker(i):
+            try:
+                results[i] = self._run_one(i, _BrokerCalc(broker, i))
+            except BaseException as e:      # defensive: never leave a hung slot
+                rec = self._blank_record(i, err=repr(e))
+                results[i] = self._harvest(rec)
+            finally:
+                broker.finish(i)
+
+        threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+                   for i in range(self.B)]
+        log_info([
+            f"\n{'=' * 70}\n",
+            f"Batched GSM: B={self.B} independent reactions; ONE batched forward "
+            f"over ALL still-live reactions' nodes per force-call tick.\n",
+            "Per-reaction growth/convergence control-flow stays per-item "
+            "(divergence masked by shrinking the live batch).\n",
+            f"{'=' * 70}\n",
+        ], self.output)
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        broker.drive()                       # coordinator runs on this thread
+        for t in threads:
+            t.join()
+        self.n_forwards = broker.n_forwards
+        self.n_node_evals = broker.n_node_evals
+        self.n_hess_forwards = broker.n_hess_forwards
+        self.n_hess_evals = broker.n_hess_evals
+        wall = time.time() - t0
+        if broker._error is not None:
+            log_info([f"\nGSMBatch: batched forward FAILED, aborted all "
+                      f"reactions: {broker._error!r}\n"], self.output)
+        log_info([
+            f"\nBatched GSM done: {broker.n_forwards} batched get_ef_gpu forwards "
+            f"({broker.n_node_evals} force node-evals), {broker.n_hess_forwards} "
+            f"batched get_efh_gpu forwards ({broker.n_hess_evals} Hessian "
+            f"node-evals; P-RFO TS-refine), wall={wall:.2f}s, B={self.B}\n"
+        ], self.output)
+        return results
+
+    def run(self):
+        # -------- backend gate --------
+        if not _gsm_is_batch_calc(self.calc):
+            # plain ASE calc (or None): no batched-forward primitive -> serial.
+            return self._run_serial(
+                use_shim=False,
+                note=("calc has no prepare()/get_ef_gpu() batch contract -> "
+                      "serial single-GSM per reaction (no batching)"))
+        safe, reason = _gsm_calc_cross_batch_safe(self.calc)
+        if not safe:
+            msg = (f"GSMBatch cannot cross-reaction batch a coupled calculator: "
+                   f"{reason}. Packing independent reactions into one forward "
+                   f"would let them leak into each other (physically wrong).")
+            if self.coupled_mode == "sequential":
+                return self._run_serial(
+                    use_shim=True,
+                    note=(msg + " -> sequential single-oracle fallback "
+                          "(coupled_mode='sequential')"))
+            raise NotImplementedError(
+                msg + " Use a local/block-diagonal calc (UMA-omol / standard "
+                "MACE / MACE-OFF / AIMNet2-decoupled / ANI), or pass "
+                "coupled_mode='sequential' for the (unbatched) single oracle.")
+        if self.B == 1:
+            return self._run_serial(
+                use_shim=True,
+                note="single reaction -> single oracle (nothing to cross-batch)")
+        return self._run_batched()
+
+
+def run_gsm(reactions_or_single, output="gsm.out", paras=None, calc=None,
+            params=None, device=None, coupled_mode="raise"):
+    """Unified GSM entry point (single-structure backward compatible).
+
+    - a single ``(atoms_R, atoms_P)`` pair (ASE calc attached, or passed via
+      ``calc=``) -> the ORIGINAL single ``GSM`` (unchanged oracle).
+    - a list of ``(atoms_R, atoms_P)`` pairs -> batched ``GSMBatch`` consuming
+      the MAPLE Batch calc (ONE forward over all live reactions per force tick).
+    """
+    def _is_pair(x):
+        return (isinstance(x, (list, tuple)) and len(x) == 2
+                and isinstance(x[0], Atoms) and isinstance(x[1], Atoms))
+
+    if isinstance(reactions_or_single, (list, tuple)) and not _is_pair(reactions_or_single):
+        return GSMBatch(list(reactions_or_single), calc, output=output,
+                        paras=paras, params=params, device=device,
+                        coupled_mode=coupled_mode).run()
+    aR, aP = reactions_or_single
+    if calc is not None:
+        aR.calc = calc
+        aP.calc = calc
+    gsm = GSM(output, aR, aP, paras=paras)
+    if params is not None:
+        gsm.params = params
+    return gsm.run()
+

@@ -912,3 +912,524 @@ class HPC:
             ],
             self.output,
         )
+
+
+# ======================================================================== #
+#                            BATCHED HPC-IRC                                #
+# ======================================================================== #
+# Batched Hessian-based Predictor-Corrector IRC over B transition-state
+# structures sharing ONE GPU *batch* calculator (prepare / get_ef_gpu /
+# get_efh_gpu / set_coords_). All B paths are advanced in lockstep; the
+# per-step force (and, at the TS anchor / optional recalc, Hessian) evaluations
+# for every structure are fused into ONE batched GPU forward. Per the project
+# profiling the MLIP forward is 95-99% of wall, so batching those calls is the
+# win -- the per-path CONTROL FLOW (LQA predictor, DWI/mBS corrector, Bofill/
+# BFGS Hessian updates) stays per-item numpy, IDENTICAL to the single-structure
+# ``HPC`` (parity oracle). Mirrors ``LQABatch`` / ``GSBatch``.
+#
+# Design (why per-item numpy + batched forward, NOT full torch vectorization):
+# HPC's DWI-fitted mBS (modified Bulirsch-Stoer) corrector runs a per-structure
+# variable-length Richardson-extrapolation loop and two Bofill updates per micro
+# step -- these do not vectorize cleanly across B without diverging from the
+# byte-exact single-structure math. Instead each structure runs the EXACT single
+# ``HPC`` numpy (reusing ``HPC``'s own helpers/static methods), expressed as a
+# generator that ``yield``s an evaluation request at every point the serial code
+# would touch the calculator. A driver ``_pump`` collects the B still-active
+# requests at each phase (they stay phase-aligned by construction: identical,
+# data-independent call sequence per structure) and fulfils them with ONE
+# batched ``get_ef_gpu`` / ``get_efh_gpu``. This makes the batch trajectory of
+# structure i bit-equivalent (to fp32 forward noise) to running ``HPC`` on i
+# alone, because the block-diagonal batch calc returns each structure's forces
+# independent of its batch mates (the perturb-one byte-isolation the sibling
+# batched optimizers rely on).
+#
+# Units are identical to the single-structure HPC: positions Angstrom, forces
+# Eh/Angstrom, Hessian Eh/Angstrom^2, energy Eh, MW coords sqrt(amu)*Angstrom
+# with q_mw = q_cart / D, H_mw = D (x) D * H, g_mw = D * g_cart  (D = 1/sqrt(m)).
+import torch as _torch
+
+
+def _is_batch_calc_hpc(calc) -> bool:
+    """Duck-typed test: a batched calculator exposes prepare() + get_ef_gpu()
+    (mirrors dispatcher._is_batch_calc)."""
+    return (calc is not None
+            and callable(getattr(calc, "prepare", None))
+            and callable(getattr(calc, "get_ef_gpu", None)))
+
+
+def _is_coupled_batch_calc(calc) -> bool:
+    """True for globally-coupled / polarizable batch calcs (MACE-POL, AIMNet2-NSE)
+    where a block-diagonal multi-structure batch is PHYSICALLY WRONG (molecules
+    share charge / polarization globally). Duck-typed, no imports:
+
+      * ``coupling_mode`` present and != 'sequential' -> MACEPolBatchCalc (its
+        'raise'/'approx' modes globally couple; only 'sequential' is per-molecule
+        correct).
+      * class name or model tag carries 'pol' / 'nse'.
+    """
+    cm = getattr(calc, "coupling_mode", None)
+    if cm is not None and str(cm).lower() != "sequential":
+        return True
+    name = type(calc).__name__.lower()
+    if "pol" in name or "nse" in name:
+        return True
+    mn = str(getattr(calc, "_model_name", None)
+             or getattr(calc, "model_name", None) or "").lower()
+    if "pol" in mn or "nse" in mn:
+        return True
+    return False
+
+
+def _apply_paras_hpc(p: "HPCParams", paras):
+    """Apply a {'hpc'|'irc': {...}} or flat dict of overrides onto an HPCParams.
+
+    Same alias table as HPC.__init__ (kept separate so the batch path reuses it
+    without touching the single-structure constructor)."""
+    if not isinstance(paras, dict):
+        return p
+    low = {k.lower(): v for k, v in paras.items()}
+    sub = None
+    for key in ("hpc", "irc"):
+        if key in low and isinstance(low[key], dict):
+            sub = low[key]
+            break
+    if sub is None:
+        sub = low
+    sub_low = {k.lower(): v for k, v in sub.items()}
+    aliases = {
+        "sd_len_bohr": "step_length_bohr",
+        "steplength_bohr": "step_length_bohr",
+        "max_points": "max_steps",
+        "euler_n": "euler_n",
+        "hessian_update": "hessian_update",
+        "dwi_n": "dwi_n",
+        "mbs_max_k": "mbs_max_k",
+        "mbs_points": "mbs_points",
+        "mbs_tol": "mbs_tol",
+        "hessian_recalc": "hessian_recalc",
+        "target_mode": "target_mode",
+        "f_max_th": "f_max_th",
+        "f_rms_th": "f_rms_th",
+        "tol_maxf": "f_max_th",
+        "tol_rmsf": "f_rms_th",
+        "print_each": "print_each",
+        "write_traj": "write_traj",
+    }
+    for k, v in sub_low.items():
+        if k in aliases:
+            setattr(p, aliases[k], v)
+        elif hasattr(p, k):
+            setattr(p, k, v)
+    return p
+
+
+class HPCBatch:
+    """Batched HPC-IRC integrator over B transition-state structures.
+
+    Consumes a GPU *batch* calculator (NOT a per-atoms ASE calculator):
+        calc.prepare(atoms_list, fixed_nmax)
+        calc.set_coords_(coord (N,3))                 # packed Cartesian, calc order
+        calc.get_ef_gpu()  -> (E (B,), F (B,M))       [Hartree, Eh/A]
+        calc.get_efh_gpu() -> (E (B,), F (B,M), H (B,M,M), P (B,))  [Hartree]
+
+    Every macro step's per-structure force evaluations (and the TS-anchor / opt-in
+    periodic-recalc Hessians) are fused into ONE batched forward via ``_pump``.
+    The per-path algorithm is the EXACT single-structure ``HPC`` numpy (LQA
+    predictor + DWI/mBS corrector + Bofill/BFGS-updated MW Hessian), so a batch
+    path is numerically identical (to fp32 forward noise) to the serial ``HPC``
+    oracle on the same structure.
+
+    Backend gate (REQUIRED, ai-maple-gpu 各势函数适配):
+      * Batchable (UMA-local / standard MACE / MACE-OFF / AIMNet2-decoupled / ANI):
+        full N-path batch.
+      * Coupled/polarizable (MACE-POL, AIMNet2-NSE): molecules couple globally, so
+        a multi-structure block-diagonal batch is physically WRONG -> raises a
+        clear NotImplementedError when B > 1 (B == 1 is allowed: one structure has
+        no cross-coupling; use a 'sequential' calc or the serial ``HPC`` oracle).
+    """
+
+    def __init__(self, atoms_list, calc, output: str = "hpc_batch.out",
+                 params=None, paras=None, device=None):
+        self.atoms_list = [a.copy() for a in atoms_list]
+        self.calc = calc
+        self.output = output
+        self.B = len(self.atoms_list)
+        if self.B == 0:
+            raise ValueError("HPCBatch: empty atoms_list")
+
+        # --- backend gate ------------------------------------------------------
+        if not _is_batch_calc_hpc(calc):
+            raise ValueError(
+                "HPCBatch requires a batched calculator implementing "
+                "prepare()+get_ef_gpu() (got a non-batch calc). Use the "
+                "single-structure HPC for a per-Atoms ASE calculator.")
+        if not callable(getattr(calc, "get_efh_gpu", None)):
+            raise NotImplementedError(
+                "HPCBatch is Hessian-based and needs calc.get_efh_gpu() for the "
+                "TS-anchor Hessian; this batch calc exposes only get_ef_gpu().")
+        if _is_coupled_batch_calc(calc) and self.B > 1:
+            raise NotImplementedError(
+                "HPCBatch: this calculator globally couples molecules "
+                "(MACE-POL / AIMNet2-NSE); a multi-structure block-diagonal batch "
+                "is physically WRONG (charge/polarization would redistribute "
+                "across structures). Run the paths one-at-a-time with the serial "
+                "HPC oracle, or use a per-molecule 'sequential' calculator.")
+
+        # --- params (shared, read-only during run) -----------------------------
+        self.p = params if params is not None else HPCParams()
+        _apply_paras_hpc(self.p, paras)
+
+        self.device = (device if device is not None
+                       else getattr(calc, "device", None)
+                       or _torch.device("cpu"))
+
+        # --- per-structure serial HPC "engines" (reuse EXACT single-HPC numpy) --
+        # We never call engine.run()/engine.atoms.calc; the engines only lend their
+        # byte-identical helpers (_gradient_mw_from_forces, _scale_mw_step,
+        # _corrector_step, _mw_from_cart, static Bofill/BFGS, DWI) + hold per-path
+        # state. Force/Hessian touches are intercepted by the generator's yields.
+        self._engs = []
+        self._n = []
+        self._ts_cart = []          # (n_i, 3) float64 TS Cartesian per structure
+        for a in self.atoms_list:
+            eng = HPC(a, output, params=self.p)     # paras=None -> no re-aliasing
+            eng._D = masses_D(a)
+            self._engs.append(eng)
+            ni = len(a)
+            self._n.append(ni)
+            self._ts_cart.append(
+                np.asarray(a.get_positions(), dtype=np.float64).reshape(ni, 3))
+        self.nmax_dof = 3 * max(self._n)
+
+        # last Cartesian placed per structure (finished paths keep their last point
+        # so the always-B batched forward has valid coords for every row).
+        self._last_cart = [c.copy() for c in self._ts_cart]
+
+        # diagnostics: batched-forward call counts (the whole point of batching)
+        self._ef_calls = 0          # batched get_ef_gpu calls
+        self._efh_calls = 0         # batched get_efh_gpu calls
+
+    # ----------------------------- batched forward ------------------------------
+    def _pack_coords(self):
+        """Concatenate current per-structure Cartesian into the calc's packed
+        (N, 3) order (== concat of atoms_list)."""
+        rows = np.concatenate([c.reshape(-1, 3) for c in self._last_cart], axis=0)
+        return _torch.as_tensor(rows, dtype=_torch.float64, device=self.device)
+
+    def _batched_eval(self, requests):
+        """Fulfil a phase of per-structure eval requests with ONE batched forward.
+
+        ``requests``: {i: (kind, q_mw)} with kind in {'ef','efh'}. Places every
+        requesting structure's Cartesian (finished ones keep last), then returns
+        {i: (E_i, F_cart_i)} for 'ef' and {i: H_cart_i} for 'efh' (Hartree / Eh/A /
+        Eh/A^2, unpadded to the structure's real DOFs).
+
+        Force sourcing (reproducibility contract): 'ef' paths ALWAYS take their
+        (E, F) from a pure ``get_ef_gpu`` forward, and ``get_efh_gpu`` is called
+        ONLY to supply the Hessian ``H`` to 'efh' paths (its center E/F are
+        discarded). The two are SEPARATE forwards over the same coord buffer, so a
+        path's forces never depend on whether a sibling happened to need a Hessian
+        this tick -> batch-composition-independent and bit-consistent with the
+        single-HPC oracle (which always evaluates forces via get_ef_gpu). In the
+        lockstep pump the two kinds never actually co-occur in one call, but the
+        split keeps the contract robust regardless."""
+        for i, (kind, q_mw) in requests.items():
+            self._last_cart[i] = (q_mw * self._engs[i]._D).reshape(self._n[i], 3)
+        self.calc.set_coords_(self._pack_coords())
+        ef_idx = [i for i, (k, _q) in requests.items() if k == "ef"]
+        efh_idx = [i for i, (k, _q) in requests.items() if k == "efh"]
+        out = {}
+        if ef_idx:
+            E, F = self.calc.get_ef_gpu()
+            self._ef_calls += 1
+            for i in ef_idx:
+                d3 = 3 * self._n[i]
+                out[i] = (float(E[i].item()), to_f64(F[i, :d3]).reshape(-1))
+        if efh_idx:
+            _E, _F, H, _P = self.calc.get_efh_gpu()   # H only; center E/F discarded
+            self._efh_calls += 1
+            for i in efh_idx:
+                d3 = 3 * self._n[i]
+                out[i] = to_f64(H[i, :d3, :d3])
+        return out
+
+    def _ts_setup(self):
+        """One batched get_efh_gpu at the TS geometries -> per-structure mode
+        selection, mirroring HPC.run() but flagging (not raising) invalid TSs.
+
+        Returns lists over B: E_ts, H_ts_cart, v_neg (or None), eigval, valid,
+        n_strong_neg."""
+        for i in range(self.B):
+            self._last_cart[i] = self._ts_cart[i].copy()
+        self.calc.set_coords_(self._pack_coords())
+        E, F, H, _P = self.calc.get_efh_gpu()
+        self._efh_calls += 1
+
+        E_ts, H_ts, v_negs, eigvals, valids, nstrong = [], [], [], [], [], []
+        k = int(self.p.target_mode)
+        for i in range(self.B):
+            d3 = 3 * self._n[i]
+            D = self._engs[i]._D
+            H_cart = to_f64(H[i, :d3, :d3])
+            H_mw = (D[:, None] * H_cart) * D[None, :]
+            w, V = np.linalg.eigh(H_mw)
+            neg_idx = np.where(w < 0.0)[0]
+            n_strong = int(np.sum(w < -1e-4))
+            if len(neg_idx) == 0 or len(neg_idx) < k:
+                E_ts.append(float(E[i].item())); H_ts.append(H_cart)
+                v_negs.append(None); eigvals.append(float("nan"))
+                valids.append(False); nstrong.append(n_strong)
+                continue
+            sorted_neg = neg_idx[np.argsort(w[neg_idx])]   # most negative first
+            idx = sorted_neg[k - 1]
+            E_ts.append(float(E[i].item()))
+            H_ts.append(H_cart)
+            v_negs.append(V[:, idx].copy())
+            eigvals.append(float(w[idx]))
+            valids.append(True)
+            nstrong.append(n_strong)
+        return E_ts, H_ts, v_negs, eigvals, valids, nstrong
+
+    # ------------------------------ generators ----------------------------------
+    # Literal transcriptions of HPC._micro_step / HPC._one_side with the two
+    # calculator touches replaced by ``x = yield (kind, q_mw)``. Everything else
+    # delegates to the per-structure engine's byte-identical numpy helpers.
+    def _micro_step_gen(self, eng):
+        """One HPC micro step for engine ``eng``; ``yield`` fetches (E,F)/H from the
+        batched driver. Returns the MW displacement ``dx`` (StopIteration value)."""
+        p = eng.p
+        init_mw = eng.mw_coords.copy()
+
+        e_curr, F_cart = yield ("ef", init_mw)
+        g_curr = eng._gradient_mw_from_forces(F_cart)
+        if _norm(g_curr) < 1e-12:
+            return np.zeros_like(g_curr)
+
+        recalc = (
+            p.hessian_recalc is not None
+            and p.hessian_recalc > 0
+            and (eng.micro_counter % p.hessian_recalc == 0)
+        )
+        if recalc and eng.micro_counter > 0:
+            H_cart = yield ("efh", init_mw)
+            eng.mw_hessian = (eng._D[:, None] * H_cart) * eng._D[None, :]
+        elif (eng.prev_coords is not None) and (eng.prev_grad is not None):
+            gradient_diff = g_curr - eng.prev_grad
+            coords_diff = init_mw - eng.prev_coords
+            if str(p.hessian_update).lower() == "bofill":
+                eng.mw_hessian = HPC._bofill_update(eng.mw_hessian, coords_diff, gradient_diff)
+            else:
+                eng.mw_hessian = HPC._bfgs_update(eng.mw_hessian, coords_diff, gradient_diff)
+
+        eng.prev_coords = init_mw
+        eng.prev_grad = g_curr
+
+        if eng._dwi is not None and eng.micro_counter > 0:
+            eng._dwi.update(init_mw.copy(), e_curr, g_curr, eng.mw_hessian.copy())
+
+        eigvals, eigvecs = np.linalg.eigh(eng.mw_hessian)
+        mask = np.abs(eigvals) > 1e-8
+        if not np.any(mask):
+            return np.zeros_like(g_curr)
+        eigvals = eigvals[mask]
+        eigvecs = eigvecs[:, mask]
+
+        g_star = eigvecs.T.dot(g_curr)
+        g_norm = _norm(g_curr)
+        if g_norm < 1e-12:
+            return np.zeros_like(g_curr)
+
+        dt = eng._step_len_mw / (float(p.euler_n) * g_norm)
+        t = dt
+        cur_length = 0.0
+        for _ in range(int(p.euler_n)):
+            dsdt = np.sqrt(np.sum((g_star ** 2) * np.exp(-2.0 * eigvals * t)))
+            cur_length += dsdt * dt
+            if cur_length >= eng._step_len_mw:
+                break
+            t += dt
+
+        alphas = (np.exp(-eigvals * t) - 1.0) / eigvals
+        dx_pred = eigvecs.dot(alphas * g_star)
+        pred_mw = init_mw + dx_pred
+
+        E_pred, F_pred = yield ("ef", pred_mw)
+        g_pred = eng._gradient_mw_from_forces(F_pred)
+
+        dg_pred = g_pred - g_curr
+        if str(p.hessian_update).lower() == "bofill":
+            eng.mw_hessian = HPC._bofill_update(eng.mw_hessian, dx_pred, dg_pred)
+        else:
+            eng.mw_hessian = HPC._bfgs_update(eng.mw_hessian, dx_pred, dg_pred)
+
+        if eng._dwi is not None:
+            eng._dwi.update(pred_mw.copy(), E_pred, g_pred, eng.mw_hessian.copy())
+
+        if eng._dwi is not None:
+            corr_mw = eng._corrector_step(init_mw, eng._step_len_umw, eng._dwi)
+        else:
+            corr_mw = pred_mw
+
+        eng.mw_coords = corr_mw
+        eng.micro_counter += 1
+        return eng.mw_coords - init_mw
+
+    def _one_side_gen(self, eng, sign, ts_cart, v_neg_mw, E_ts, H_ts_cart):
+        """One-sided HPC-IRC path for engine ``eng`` (transcription of
+        HPC._one_side). Returns the per-side records as a DICT-OF-LISTS
+        ``{"E":[...], "maxG":[...], "rmsG":[...], "x":[...]}`` -- the SAME schema
+        LQABatch / EulerPCBatch return so the shared consumer
+        ``irc/irc.py::_write_batched_lqa`` (which does ``records.get('x')``) treats
+        every batched IRC integrator uniformly (StopIteration value)."""
+        p = eng.p
+        D = eng._D
+        title = "FORWARD HPC-IRC" if sign > 0 else "BACKWARD HPC-IRC"
+
+        q_ts_mw = eng._mw_from_cart(ts_cart)
+        v_dir = _unit(v_neg_mw) * sign
+        q0_mw = q_ts_mw + eng._scale_mw_step(v_dir, 0.5 * eng._step_len_mw)
+
+        # gradient at TS (for the initial Hessian update)
+        _e_ts, F_ts_cart = yield ("ef", q_ts_mw)
+        g_ts_mw = eng._gradient_mw_from_forces(F_ts_cart)
+
+        # initial Hessian at TS (MW) -- reuse the TS-anchor Hessian (same geometry
+        # / deterministic FD as HPC._one_side's own get_hessian recompute).
+        H0_mw = (D[:, None] * H_ts_cart) * D[None, :]
+
+        # energy / forces / gradient at the displaced start point
+        E0, F0_cart = yield ("ef", q0_mw)
+        g0_mw = eng._gradient_mw_from_forces(F0_cart)
+        maxF0 = float(np.max(np.abs(F0_cart)))
+        rmsF0 = float(np.sqrt(np.mean(F0_cart ** 2)))
+
+        if str(p.hessian_update).lower() == "bofill":
+            H0_mw = HPC._bofill_update(H0_mw, q0_mw - q_ts_mw, g0_mw - g_ts_mw)
+        else:
+            H0_mw = HPC._bfgs_update(H0_mw, q0_mw - q_ts_mw, g0_mw - g_ts_mw)
+
+        eng.mw_coords = q0_mw.copy()
+        eng.mw_hessian = H0_mw.copy()
+        eng.prev_coords = None
+        eng.prev_grad = None
+        eng.micro_counter = 0
+        eng._dwi = DWI(n=p.dwi_n, maxlen=2)
+        eng._dwi.update(q0_mw.copy(), E0, g0_mw, eng.mw_hessian.copy())
+
+        ni = self._n_of(eng)
+        rec = {"E": [], "maxG": [], "rmsG": [], "x": []}   # dict-of-lists (canonical)
+        rec["E"].append(E0)
+        rec["maxG"].append(maxF0)
+        rec["rmsG"].append(rmsF0)
+        rec["x"].append((q0_mw * D).reshape(ni, 3).copy())
+
+        for _it in range(1, p.max_steps + 1):
+            dx = yield from self._micro_step_gen(eng)
+            if _norm(dx) <= 1e-12:
+                break
+            E_new, F_new = yield ("ef", eng.mw_coords)
+            maxF = float(np.max(np.abs(F_new)))
+            rmsF = float(np.sqrt(np.mean(F_new ** 2)))
+            rec["E"].append(E_new)
+            rec["maxG"].append(maxF)
+            rec["rmsG"].append(rmsF)
+            rec["x"].append((eng.mw_coords * D).reshape(ni, 3).copy())
+            if (maxF <= p.f_max_th) and (rmsF <= p.f_rms_th):
+                break
+
+        return rec
+
+    def _n_of(self, eng):
+        return len(eng.atoms)
+
+    # -------------------------------- pump --------------------------------------
+    def _pump(self, gens):
+        """Drive a list of B side-generators (None = skipped/invalid) in lockstep,
+        fusing each phase's per-structure eval requests into ONE batched forward.
+        Returns a list of each generator's StopIteration value (or None)."""
+        results = [None] * self.B
+        pending = {}
+        for i, g in enumerate(gens):
+            if g is None:
+                continue
+            try:
+                pending[i] = next(g)
+            except StopIteration as e:
+                results[i] = e.value
+                gens[i] = None
+        while pending:
+            out = self._batched_eval(pending)
+            nxt = {}
+            for i in pending:
+                try:
+                    nxt[i] = gens[i].send(out[i])
+                except StopIteration as e:
+                    results[i] = e.value
+                    gens[i] = None
+            pending = nxt
+        return results
+
+    # -------------------------------- run ---------------------------------------
+    def run(self):
+        """Run batched forward+backward HPC-IRC for all B structures.
+
+        Returns a list (len B) of per-structure result dicts -- schema IDENTICAL to
+        LQABatch / EulerPCBatch so ``irc/irc.py::_write_batched_lqa`` consumes all
+        three uniformly:
+            {"index": i, "valid": bool, "neg_eigval": float, "n_strong_neg": int,
+             "E_ts": float,
+             "forward":  {"records": {"E":[...],"maxG":[...],"rmsG":[...],"x":[...]}},
+             "backward": {"records": {"E":[...],"maxG":[...],"rmsG":[...],"x":[...]}}}
+        Invalid structures (no clean negative TS mode) get valid=False and empty
+        forward/backward record lists (flagged, not propagated)."""
+        self.calc.prepare(self.atoms_list, fixed_nmax=self.nmax_dof)
+
+        E_ts, H_ts, v_negs, eigvals, valids, nstrong = self._ts_setup()
+
+        # forward (+1) then backward (-1); each side is a full lockstep pump.
+        fwd_gens = [
+            self._one_side_gen(self._engs[i], +1.0, self._ts_cart[i].reshape(-1),
+                               v_negs[i], E_ts[i], H_ts[i]) if valids[i] else None
+            for i in range(self.B)
+        ]
+        fwd = self._pump(fwd_gens)
+
+        bwd_gens = [
+            self._one_side_gen(self._engs[i], -1.0, self._ts_cart[i].reshape(-1),
+                               v_negs[i], E_ts[i], H_ts[i]) if valids[i] else None
+            for i in range(self.B)
+        ]
+        bwd = self._pump(bwd_gens)
+
+        results = []
+        for i in range(self.B):
+            results.append({
+                "index": i,
+                "valid": bool(valids[i]),
+                "neg_eigval": float(eigvals[i]),
+                "n_strong_neg": int(nstrong[i]),
+                "E_ts": float(E_ts[i]),
+                "forward": {"records": fwd[i]} if fwd[i] is not None
+                           else {"records": {"E": [], "maxG": [], "rmsG": [], "x": []}},
+                "backward": {"records": bwd[i]} if bwd[i] is not None
+                            else {"records": {"E": [], "maxG": [], "rmsG": [], "x": []}},
+            })
+        return results
+
+
+def run_hpc_irc(atoms_or_list, output: str = "hpc.out", paras=None,
+                calc=None, params=None, device=None):
+    """Unified HPC-IRC entry point (single-structure backward compatible).
+
+    - Single ASE ``Atoms`` (with an attached ``atoms.calc``): dispatch to the
+      original single-structure ``HPC`` (unchanged behaviour / units / outputs).
+    - list/tuple of ``Atoms``: dispatch to the batched ``HPCBatch``, consuming the
+      supplied GPU batch calculator ``calc`` (prepare/get_ef_gpu/get_efh_gpu API).
+    """
+    if isinstance(atoms_or_list, (list, tuple)):
+        if calc is None:
+            raise ValueError("run_hpc_irc(batch): a batch calculator `calc` is required")
+        return HPCBatch(list(atoms_or_list), calc, output=output,
+                        params=params, paras=paras, device=device).run()
+    hpc = HPC(atoms_or_list, output=output, params=params, paras=paras)
+    return hpc.run()
