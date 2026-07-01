@@ -1,0 +1,167 @@
+=== JOBB node gpu108-16-l Wed Jul  1 09:28:59 +03 2026 ===
+NVIDIA A100-SXM4-80GB
+torch 2.6.0+cu124 cuda True
+
+########## BEGIN REST2 ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+torch 2.6.0+cu124 cuda True dev NVIDIA A100-SXM4-80GB
+
+########################################################################
+[G1] LAMBDA=1 IDENTITY (E_m==E_full, F_m==F_full, traj==BatchedNVT)
+########################################################################
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+[G1a] max|E_m - E_full| = 0.000e+00 Ha   max|F_m - F_full| = 2.776e-16 Ha/A   (solute node sum S=[-154.95649264 -154.95649264])
+[G1b] all-lambda=1 REST2 vs BatchedNVT: steps=80 N=4 seed=43  max|dpos|=2.498e-15 A  max|dvel|=3.816e-17 au
+[G1] PASS  (identity=True, trajectory=True)
+
+########################################################################
+[G2] FD CONSERVATIVE FORCE at lambda!=1 (rejects force-rescale scheme)
+########################################################################
+[G2] central-diff h=0.0001 A, replica 0 (lambda=0.5), 15 atoms
+     max|F_m - F_FD|        all=2.784e-08  solute=1.333e-08  solvent=2.784e-08  Ha/A
+     max|F_naive - F_FD|    all=1.333e-01  solvent=1.333e-01  Ha/A  (naive force-rescale)
+[G2] PASS  (true-force FD<1e-6=True; naive scheme rejected=True, ratio=4.8e+06x worse)
+
+########################################################################
+[G3] EQUAL-LAMBDA EXCHANGE ACCEPTANCE == 1 (Delta==0)
+########################################################################
+[G3i] max|Delta(lambda_a==lambda_b)| over 16 (lambda,S) cases = 0.000e+00
+[G3ii] real _attempt_swaps equal-lambda[0.8,0.8]: attempts=2500 accepts=2500 rate=1.000000
+[G3] PASS  (Delta==0 exact=True, accept-rate==1=True)
+
+########################################################################
+[G4a] DETAILED BALANCE -- toy exact-Gibbs + REAL _attempt_swaps (flat histogram)
+########################################################################
+[G4a] sweeps=200000 M=4 ladder=[1.  0.7 0.5 0.3]
+      tag-0 lambda occupancy = [0.249  0.2499 0.2499 0.2512]  (uniform=1/4=0.2500)
+      flatness max|occ-1/M| = 0.0012   per-boundary accept rate = [0.889 0.887 0.833]
+[G4a] PASS  (flat<0.02=True, all boundaries mixing=True)
+
+########################################################################
+[G4b] DETAILED BALANCE -- real REST2 MD (permutation-invariant + roaming)
+########################################################################
+[G4b] ladder=[1.     0.7368 0.5429 0.4   ]  steps=4000  exchange_every=20
+      per-boundary accept rate = [0.47, 0.545, 0.58]
+      lambda-set == ladder every recorded step: True
+      tag-0 residency = {1.0: 0.2, 0.737: 0.225, 0.543: 0.35, 0.4: 0.225} -> rungs visited = 4/4
+      tag-0 flatness dev = 0.100   cross-replica isolation leak = 0.00e+00 Ha
+[G4b] PASS  (perm=True, all-boundaries-accept=True, roams>=2 rungs=True, isolated=True)
+
+========================================================================
+REST2 GATE SUMMARY
+  G1: PASS
+  G2: PASS
+  G3: PASS
+  G4a: PASS
+  G4b: PASS
+========================================================================
+[REST2 RESULT] ALL GATES PASS
+@@ REST2 EXIT=0
+########## END REST2 ##########
+
+########## BEGIN METAD ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+torch 2.6.0+cu124 cuda=True dev=NVIDIA A100-SXM4-80GB
+SEED=20260630
+
+===== GATE 1: FD (analytic bias force vs finite difference) =====
+  geom xi=2.5000  max|F_an - F_fd| = 1.101e-11
+  geom xi=2.3152  max|F_an - F_fd| = 4.068e-11
+  [GATE 1] worst FD residual = 4.068e-11  (tol 1e-10)  PASS
+
+===== GATE 2: well-tempered asymptote FES = -(g/(g-1)) V =====
+  sampled CV in [-1.53,1.53] (kT units)  n_hills=12800
+  central barrier U(0)=5.00 kT   over sampled region: U range=8.94 kT  bias-recovered range=8.92 kT
+  [GATE 2] max|FES_bias - U| (const-aligned) = 0.249 kT  (tol 1.0)  PASS
+
+===== GATE 3: multi-walker == pooled single-walker (Raiteri) =====
+  region [-1.42,1.42] kT  n_hills(mw)=12800 n_hills(each sw)~16
+  max|FES_mw - FES_pooled| = 0.511 kT
+  max|FES_mw     - U|      = 0.191 kT
+  max|FES_pooled - U|      = 0.441 kT
+  [GATE 3] PASS  (tol 1.0 kT)
+
+===== GATE 4: OPES (Z bounded; FES matches metaD) =====
+  Z in [4.2917e-01, 6.9647e-01]  ratio=1.62  (800 updates)  eps=3.299e-03
+  bias V_min=-5.000 kT  (bounded below by -dE=-5.0)
+  max|FES_OPES - FES_metaD| = 0.361 kT
+  max|FES_OPES - U|         = 0.308 kT
+  [GATE 4] PASS  (Z bounded + FES match, tol 1.0 kT)
+
+===== GATE 5: GPU integration (WT metaD rides MACE-OFF batched) =====
+  propane terminal-C CV = distance(atom 1, atom 2); d0=2.534 A
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+  walkers=8  steps=4000  n_hills=328  sum(hill heights)=21.467 kcal/mol
+  CV sampled [2.214,2.947] A  mean=2.556  span=0.733 A
+  FES range=11.508 kcal/mol  all-finite=True
+  [GATE 5] PASS  (deposits + explores + finite)
+
+============================================================
+          BATCHED METADYNAMICS / OPES GATE SUMMARY          
+============================================================
+  gate1_FD               PASS   metric=4.068e-11
+  gate2_WTasymptote      PASS   metric=0.2492
+  gate3_multiwalker      PASS   metric=0.5113
+  gate4_OPES             PASS   metric=0.3613
+  gate5_GPU              PASS   metric=11.51
+============================================================
+[RESULT] ALL GATES PASS
+@@ METAD EXIT=0
+########## END METAD ##########
+
+########## BEGIN PLUMED ##########
+cwd=/tmp/plumed_gates_xxaf87bp  torch 2.6.0+cu124  cuda=True
+plumed kernel OK (/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/plumed.cpython-311-x86_64-linux-gnu.so)
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+[PASS] A restraint-force vs analytic: max|Δf|=2.60e-18 Ha/Å (tol 1e-8); |Σf|=0.00e+00; |f|=0.006312 Ha/Å
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+[PASS] B bias-energy Ha round-trip: PLUMED=0.0011902496 Ha, analytic=0.0011902496 Ha, |Δ|=6.51e-19 (tol 1e-9)
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+[PASS] C1 advance==N, cache no-advance: after 50 moves _istep=50 (want 50); after 3 cache-fetches _istep=50 (want 50)
+/ibex/user/xiaox/zls/ai-maple-md/MAPLE/worktrees/integ2/maple/function/dispatcher/md/bias/_test_plumed.py:191: DeprecationWarning: Use thermalize_momenta
+  MaxwellBoltzmannDistribution(at2, temperature_K=TEMP)
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+[PASS] C2 integrator once-per-step: 50 VV steps ⇒ _istep=51, inner.n_calc=51 (want equal, in [50,51]; not ~100)
+/ibex/user/xiaox/zls/ai-maple-md/MAPLE/worktrees/integ2/maple/function/dispatcher/md/bias/_test_plumed.py:210: DeprecationWarning: Use thermalize_momenta
+  MaxwellBoltzmannDistribution(at, temperature_K=TEMP)
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/ase/md/langevin.py:102: FutureWarning: The implementation of `fixcm=True` in `Langevin` does not strictly sample the correct NVT distributions. The deviations are typically small for large systems but can be more pronounced for small systems. Use `fixcm=False` together with `ase.constraints.FixCom`. `fixcm` is deprecated since ASE 3.28.0 and will be removed in a future release.
+  warnings.warn(msg, FutureWarning)
+/ibex/user/xiaox/zls/ai-maple-md/MAPLE/worktrees/integ2/maple/function/dispatcher/md/bias/_test_plumed.py:265: DeprecationWarning: Use thermalize_momenta
+  MaxwellBoltzmannDistribution(at, temperature_K=TEMP)
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+[PASS] D WT-METAD FES vs plain-MD (parity): n_hills=6000, n_samp=100001, bins=44, RMSD=1.26 kT (tol 1.5, metad-converge band), max|ΔFES|=2.14 kT (tol 3.0, edge guard)
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/mace/calculators/mace.py:226: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  torch.load(f=model_path, map_location=device)
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+[PASS] E cross-backend [mace-off]: |Δ(bias−analytic)|=7.37e-18 Ha/Å (tol 1e-6); |f_bias|=0.003428 Ha/Å
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/mace/calculators/mace.py:226: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  torch.load(f=model_path, map_location=device)
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+[PASS] E cross-backend [mace-mp-0]: |Δ(bias−analytic)|=7.37e-18 Ha/Å (tol 1e-6); |f_bias|=0.003428 Ha/Å
+[PASS] E cross-backend (≥2 backends force-correct): backends passed: ['mace-off', 'mace-mp-0']
+
+==================== GATE SUMMARY ====================
+  PASS  A restraint-force vs analytic
+  PASS  B bias-energy Ha round-trip
+  PASS  C1 advance==N, cache no-advance
+  PASS  C2 integrator once-per-step
+  PASS  D WT-METAD FES vs plain-MD (parity)
+  PASS  E cross-backend [mace-off]
+  PASS  E cross-backend [mace-mp-0]
+  PASS  E cross-backend (≥2 backends force-correct)
+===================== 8/8 PASS =====================
+@@ PLUMED EXIT=0
+########## END PLUMED ##########
+DONE_JOBB Wed Jul  1 09:41:57 +03 2026

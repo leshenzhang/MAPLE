@@ -1,0 +1,54 @@
+=== JOBC node gpu108-02-l Wed Jul  1 09:28:59 +03 2026 ===
+NVIDIA A100-SXM4-80GB
+torch 2.6.0+cu124 cuda True
+
+########## BEGIN NVE ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+torch 2.6.0+cu124 cuda True dev NVIDIA A100-SXM4-80GB
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+
+  ┌─ NVT PRE-EQUILIBRATION ADVISORY ──────────────────────────────────────┐
+  │  Starting NVE from an optimised (0 K) structure without prior NVT     │
+  │  equilibration is known to cause:                                      │
+  │    • A large initial TE drop (~5–10 kcal/mol) in the first ~20 steps  │
+  │    • Actual mean temperature well below the target value               │
+  │    • Inflated σ(TE) that cannot be reduced by decreasing dt            │
+  │                                                                        │
+  │  Recommended workflow (GROMACS Manual 2024 §3.4.2; AMBER 2023 §3.1): │
+  │    opt → NVT (≥ 10 ps, Langevin) → NVE (production)                  │
+  │                                                                        │
+  │  To suppress: set restart=true (assumes prior NVT was completed).     │
+  └────────────────────────────────────────────────────────────────────────┘
+
+NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,
+  not an on/off pair. Initialization removes COM + rigid-body rotation once,
+  but runtime angular motion will not be projected out during the run.
+[NVE-ECONS] steps=4000 dt=0.5fs span=1.899ps n_atoms=9  secular_drift=7.301e-04 meV/atom/ps  std(H)=3.956e-02 meV/atom  (aspiration drift ~1e-3)
+[NVE-ECONS] PASS
+NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,
+  not an on/off pair. Initialization removes COM + rigid-body rotation once,
+  but runtime angular motion will not be projected out during the run.
+[NVE-REVERS] N=50 dt=0.5fs  forward_disp D=3.516e-01 A  return max|dr|=4.441e-16 A  max|dv|=6.803e-18 au  ratio dr/D=1.26e-15
+[NVE-REVERS] PASS
+
+[NVE RESULT] econs_drift=7.301e-04meV/atom/ps std=3.956e-02meV/atom  revers_dr=4.441e-16A dv=6.803e-18au (D=3.516e-01A)
+[NVE RESULT] ALL NVE GATES PASS
+@@ NVE EXIT=0
+########## END NVE ##########
+
+########## BEGIN NVT ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+torch 2.6.0+cu124 cuda True dev NVIDIA A100-SXM4-80GB
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+[NVT-CANON] steps=20000 T=300.0K tau_t=50.0fs N_dof=24  <T>report=294.82K
+[NVT-CANON] <K>/target=0.9827  Var(K)/target=0.9659  (both -> 1 for canonical)
+[NVT-CANON] KS(2K/kT vs chi2(24)): D=0.0374 p=1.184e-01 (n_eff=1000, stride=18)
+[NVT-CANON] PASS
+
+[NVT-CANON RESULT] mean_ratio=0.9827 var_ratio=0.9659 KS_D=0.0374
+[NVT-CANON RESULT] CANONICAL KE GATE PASS
+@@ NVT EXIT=0
+########## END NVT ##########
+DONE_JOBC Wed Jul  1 09:37:28 +03 2026
