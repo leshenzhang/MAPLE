@@ -1480,14 +1480,18 @@ class AutoNEBBatch(JobABC):
         guard, but detected up-front so a silently-wrong batch is refused."""
         if calc is None:
             return False
+        name = type(calc).__name__.lower()
+        if "decoupl" in name or getattr(calc, "batch_decoupled", False) is True:
+            return False                            # decoupled variants are safe
         if hasattr(calc, "coupling_mode"):          # MACEPolBatchCalc
             return True
-        name = type(calc).__name__
-        if "Pol" in name or "POL" in name:          # polarizable
+        if "pol" in name or "nse" in name:          # polarizable / global charge-eq
             return True
-        if name == "AIMNet2BatchCalc":              # global charge-eq (coupled)
+        if name == "aimnet2batchcalc":              # global charge-eq (coupled)
             return True
-        if "NSE" in name.upper():
+        mn = str(getattr(calc, "_model_name", None)
+                 or getattr(calc, "model_name", None) or "").lower()
+        if "pol" in mn or "nse" in mn:
             return True
         return False
 

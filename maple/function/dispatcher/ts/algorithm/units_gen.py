@@ -31,27 +31,34 @@ _DEFAULT_MODEL_DIR = os.environ.get(
 _MODEL_CACHE: dict = {}
 
 
-def _install_torch_shims():
-    """torch>=2.6 defaults weights_only=True; e3nn constants.pt + the CUDA-saved HiEGNN
-    checkpoint are trusted local assets. Restore weights_only=False + map_location for
-    CPU nodes. Idempotent."""
-    import torch
-    try:
-        torch.serialization.add_safe_globals([slice])
-    except Exception:
-        pass
-    if getattr(torch.load, "_unitsgen_patched", False):
-        return
-    _orig = torch.load
+class _trusted_torch_load:
+    """SCOPED torch.load shim: weights_only=False (+ CPU map_location) for the trusted
+    bundled UniTS/e3nn checkpoints (torch>=2.6 defaults weights_only=True). Restores
+    torch.load on exit so the permissive default does NOT leak process-globally to
+    unrelated loads (MACE/UMA/e3nn) elsewhere. Reentrant (saves/restores the current
+    torch.load), so nesting is safe."""
 
-    def _patched(*a, **k):
-        k.setdefault("weights_only", False)
-        if not torch.cuda.is_available():
-            k.setdefault("map_location", torch.device("cpu"))
-        return _orig(*a, **k)
+    def __enter__(self):
+        import torch
+        self._torch = torch
+        try:
+            torch.serialization.add_safe_globals([slice])
+        except Exception:
+            pass
+        self._orig = torch.load
 
-    _patched._unitsgen_patched = True
-    torch.load = _patched
+        def _patched(*a, **k):
+            k.setdefault("weights_only", False)
+            if not torch.cuda.is_available():
+                k.setdefault("map_location", torch.device("cpu"))
+            return self._orig(*a, **k)
+
+        torch.load = _patched
+        return self
+
+    def __exit__(self, *exc):
+        self._torch.load = self._orig
+        return False
 
 
 def _ensure_vendor_on_path():
@@ -63,8 +70,9 @@ def _get_model(model_dir, device):
     key = (model_dir, str(device))
     if key not in _MODEL_CACHE:
         _ensure_vendor_on_path()
-        from units.generate import load_model
-        _MODEL_CACHE[key] = load_model(model_dir, ckpt_file="best_full_model.pth", device=device)
+        with _trusted_torch_load():          # scoped: e3nn constants.pt + HiEGNN ckpt
+            from units.generate import load_model
+            _MODEL_CACHE[key] = load_model(model_dir, ckpt_file="best_full_model.pth", device=device)
     return _MODEL_CACHE[key]
 
 
@@ -89,8 +97,7 @@ def generate_ts_guesses(smiles: str, reactive_atom_idx, charge: int = 0, multi: 
                         jump_len: int = 2) -> List[Atoms]:
     """Reaction SMILES + 0-based reactive atom indices -> list[ase.Atoms] TS guesses
     (length n_samples). Pretrained-inference only (no training)."""
-    _install_torch_shims()
-    import torch
+    import torch  # torch.load shim is now scoped inside _get_model (_trusted_torch_load)
     _ensure_vendor_on_path()
     device = torch.device(device) if device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu")

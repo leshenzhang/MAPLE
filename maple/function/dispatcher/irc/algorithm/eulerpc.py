@@ -1023,6 +1023,13 @@ def _is_coupled_calc(calc) -> bool:
         return True
     if getattr(calc, "couples_molecules", False) is True:
         return True
+    nl = name.lower()                           # class-name tag (matches hpc gate)
+    if "pol" in nl or "nse" in nl:
+        return True
+    mn = str(getattr(calc, "_model_name", None)
+             or getattr(calc, "model_name", None) or "").lower()
+    if "pol" in mn or "nse" in mn:
+        return True
     return False
 
 
@@ -1198,6 +1205,10 @@ class EulerPCBatch:
                 pending[k] = next(g)
             except StopIteration as e:
                 results[k] = e.value
+            except Exception as exc:  # per-path failure must NOT poison the batch
+                log_error([f"[eulerpc-batch] path {k} raised at init ({exc!r}); "
+                           f"marked invalid, batch continues\n"], self.output)
+                results[k] = None
 
         while pending:
             need_h = any(req[0] == 'h' for req in pending.values())
@@ -1240,6 +1251,10 @@ class EulerPCBatch:
                     new_pending[k] = gens[k].send(send_val)
                 except StopIteration as e:
                     results[k] = e.value
+                except Exception as exc:  # isolate a diverged path; keep the batch
+                    log_error([f"[eulerpc-batch] path {k} raised mid-run ({exc!r}); "
+                               f"marked invalid, batch continues\n"], self.output)
+                    results[k] = None
             pending = new_pending
 
         return results

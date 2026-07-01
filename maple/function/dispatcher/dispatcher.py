@@ -202,11 +202,12 @@ class Dispatcher():
 
             method = commandcontrol.params.get('method')
             if isinstance(atoms, (list, Molecules)):
-                # OPT-IN batched IRC: 'lqa' (LQABatch) and 'gs' (GSBatch, the
-                # default IRC integrator). Single-Atoms path UNCHANGED.
-                if method not in ('lqa', 'gs'):
+                # OPT-IN batched IRC: 'lqa' (LQABatch), 'gs' (GSBatch, the default
+                # IRC integrator), 'hpc' (HPCBatch), 'eulerpc' (EulerPCBatch).
+                # Single-Atoms path UNCHANGED.
+                if method not in ('lqa', 'gs', 'hpc', 'eulerpc'):
                     raise NotImplementedError(
-                        f"Batched IRC (list/Molecules) supports methods 'lqa'/'gs' only; got {method!r}.")
+                        f"Batched IRC (list/Molecules) supports 'lqa'/'gs'/'hpc'/'eulerpc' only; got {method!r}.")
                 irc = IRC(output=output, atoms=atoms, method=method, params=commandcontrol.params)
                 irc.run()
             else:

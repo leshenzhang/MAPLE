@@ -1357,6 +1357,11 @@ class HPCBatch:
             except StopIteration as e:
                 results[i] = e.value
                 gens[i] = None
+            except Exception as exc:  # per-path failure must NOT poison the batch
+                log_error([f"[hpc-batch] path {i} raised at init ({exc!r}); "
+                           f"marked invalid, batch continues\n"], self.output)
+                results[i] = None
+                gens[i] = None
         while pending:
             out = self._batched_eval(pending)
             nxt = {}
@@ -1365,6 +1370,11 @@ class HPCBatch:
                     nxt[i] = gens[i].send(out[i])
                 except StopIteration as e:
                     results[i] = e.value
+                    gens[i] = None
+                except Exception as exc:  # isolate a diverged path; keep the batch
+                    log_error([f"[hpc-batch] path {i} raised mid-run ({exc!r}); "
+                               f"marked invalid, batch continues\n"], self.output)
+                    results[i] = None
                     gens[i] = None
             pending = nxt
         return results
