@@ -67,7 +67,7 @@ class JobABC(ABC):
         Args:
             error_message: The error message to log.
         """
-        with open(self.output, 'a') as file:
+        with open(self.output, 'a', encoding='utf-8') as file:
             file.write(f"ERROR: {error_message}\n")
 
     def log_info(self, info_message: list) -> None:
@@ -77,6 +77,6 @@ class JobABC(ABC):
         Args:
             info_message: The info message to log.
         """
-        with open(self.output, 'a') as file:
+        with open(self.output, 'a', encoding='utf-8') as file:
             for info in info_message:   
                 file.write(f"{info}")
