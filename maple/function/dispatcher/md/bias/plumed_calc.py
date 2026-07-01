@@ -97,6 +97,15 @@ class PlumedCalculator(Calculator):
         # Mirror the inner backend's PBC / stress capability so the NPT gate and
         # any periodic CV see the wrapper as equivalent to the raw backend.
         self.SUPPORTS_PBC = getattr(inner, 'SUPPORTS_PBC', False)
+        # Advertise `stress` only when the inner backend actually produces it, so
+        # the NPT capability gate reads the truth (mirrors GenericASECalculator).
+        # Also drives the "always publish the full property set" contract below.
+        self._inner_has_stress = 'stress' in tuple(
+            getattr(inner, 'implemented_properties', ()) or ())
+        props = ['energy', 'free_energy', 'forces']
+        if self._inner_has_stress:
+            props.append('stress')
+        self.implemented_properties = props
         if atoms is not None:
             self.atoms = atoms.copy()
         atexit.register(self.finalize)
@@ -139,7 +148,13 @@ class PlumedCalculator(Calculator):
         atoms = self.atoms                      # the copy ASE just stored
 
         # 1) Pure MLIP energy + forces (+ stress) from the inner backend.
-        self.inner.calculate(atoms, list(properties), system_changes)
+        #    PLUMED needs `forces` on EVERY step (setForces buffer), so always
+        #    request energy+forces regardless of what the caller asked — else an
+        #    `('energy',)`-only call would miss forces and KeyError here.
+        inner_props = ['energy', 'forces']
+        if self._inner_has_stress:
+            inner_props.append('stress')
+        self.inner.calculate(atoms, inner_props, system_changes)
         energy = float(self.inner.results['energy'])                       # Ha
         forces = np.ascontiguousarray(
             self.inner.results['forces'], dtype=np.float64)                # Ha/Å
@@ -169,12 +184,17 @@ class PlumedCalculator(Calculator):
         self._istep += 1
 
         # 2) Publish MLIP + bias. forces was modified in place by PLUMED.
+        #    ALWAYS publish the full property set (energy/free_energy/forces, and
+        #    stress when the inner backend has it), independent of `properties`.
+        #    This keeps `self.results` complete so ASE never re-enters calculate()
+        #    for a "missing" property at unchanged positions — which would advance
+        #    the PLUMED step counter a SECOND time within one MD step.
         self.results = {
             'energy': energy + float(bias[0]),          # Ha
             'free_energy': energy + float(bias[0]),
             'forces': forces,                           # Ha/Å (MLIP + bias)
         }
-        if 'stress' in self.inner.results:
+        if self._inner_has_stress and 'stress' in self.inner.results:
             # ponytail: bias contribution to the stress is NOT folded in, so an
             # NPT barostat run under a bias couples to the bare MLIP stress only.
             # Fine for the usual NVT umbrella/metaD use; upgrade by reading the
