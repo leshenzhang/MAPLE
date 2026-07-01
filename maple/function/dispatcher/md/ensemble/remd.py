@@ -222,13 +222,15 @@ class REMD(BatchedNVT):
         if langevin:                                             # std -> carried at t=0
             v = v - 0.5 * F / self.mass * self.dt_au
         ex = self.exchange_every
+        le = max(1, int(self.params.log_every or 1))  # match parent _record cadence
         self._hist_temps = []
         for step in range(1, self.params.steps + 1):
             if langevin:
                 v, E, F = self._step_langevin(v, F, step)
             else:
                 v, E, F = self._step_vrescale(v, F, step)
-            self._hist_temps.append(self.temps.copy())           # label DURING this step
+            if (step % le == 0) or (step == self.params.steps):   # BUGFIX B-96: align to parent _hist_T log_every cadence (was every-step -> IndexError in _finalize_remd)
+                self._hist_temps.append(self.temps.copy())           # label DURING this recorded step
             if ex and ex > 0 and step % ex == 0 and step < self.params.steps:
                 v = self._attempt_swaps(v, F, E, langevin)
         self.v = v
