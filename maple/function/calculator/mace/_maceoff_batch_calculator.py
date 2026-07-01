@@ -61,6 +61,11 @@ class MaceOffBatchCalc:
     # (>= 2*r_max) is enforced by the batched MD loop gate, so the box_guard helper
     # reads this flag + r_max.
     SUPPORTS_PBC = True
+    # Phase-2C: batched configurational virial/stress is implemented (get_stress_gpu /
+    # get_efs_gpu) by reusing mace's OWN per-graph virial autograd (compute_stress=True),
+    # so BatchedNPT (barostat/pressure) can gate on this the same way the single-system
+    # NPT gates on an ASE calculator's ``implemented_properties`` containing "stress".
+    implemented_properties = ("energy", "forces", "stress")
 
     def __init__(self,
                  model_path: str = _DEFAULT_MODEL,
@@ -160,6 +165,12 @@ class MaceOffBatchCalc:
             for a in range(int(n)):
                 base.append(i * self.nmax_dof + 3 * a)
         self._base = torch.tensor(base, dtype=torch.long, device=self.device)
+        # per-REAL-atom replica index (N_atoms,) -- lets the isotropic barostat scale
+        # each replica's atoms about the cell origin (Phase-2C rescale_isotropic_).
+        atom_rep = np.concatenate(
+            [np.full(int(n), i, dtype=int) for i, n in enumerate(self.n_b)]
+        ) if self.B else np.zeros(0, dtype=int)
+        self._atom_rep = torch.tensor(atom_rep, dtype=torch.long, device=self.device)
         self._coord_backup = None
         self._prepared = True
 
@@ -317,9 +328,15 @@ class MaceOffBatchCalc:
         mace edge convention: for a directed edge (sender i, receiver j) the model
         forms ``vec = pos[j] - pos[i] + shift`` with ``shift`` the CARTESIAN image
         offset (``unit_shift @ cell``). We emit the forward edge (i->j, +shift) and the
-        reverse (j->i, -shift) for every kept image. ``unit_shifts`` is returned as
-        zeros: the energy/force forward (``compute_force=True``, no virials) consumes
-        only the cartesian ``shifts``; integer unit shifts are a stress-path field.
+        reverse (j->i, -shift) for every kept image, together with the INTEGER
+        ``unit_shifts`` (+sint / -sint). The energy/force forward (``compute_force=True``,
+        no virials) consumes only the cartesian ``shifts`` and ignores ``unit_shifts``;
+        the STRESS forward (``compute_stress=True``, Phase-2C) does the opposite -- mace's
+        ``get_symmetric_displacement`` RECOMPUTES the cartesian shift as
+        ``unit_shifts @ (displaced cell)`` and autogrades the energy w.r.t. the symmetric
+        strain, so a CORRECT integer ``unit_shifts`` is what makes the virial cell-aware.
+        Emitting the real integers here (not zeros) leaves the E/F path byte-unchanged
+        while unlocking the stress path.
         """
         device = self.device
         ci, cj, rep = self._cand_i, self._cand_j, self._cand_rep
@@ -329,7 +346,7 @@ class MaceOffBatchCalc:
         # nearest-image base cell in fractional space (handles unwrapped drift).
         n0 = torch.round(torch.einsum("pc,pck->pk", rij0, invp))     # (P,3)
         rmax2 = self.r_max * self.r_max
-        src_l, dst_l, sh_l = [], [], []
+        src_l, dst_l, sh_l, us_l = [], [], [], []
         for S in self._shift_combos:                                 # (3,)
             sint = S.view(1, 3) - n0                                 # (P,3) total int shift
             scart = torch.einsum("pk,pkc->pc", sint, cellp)          # (P,3) cartesian shift
@@ -339,15 +356,17 @@ class MaceOffBatchCalc:
             if bool(keep.any()):
                 kci, kcj = ci[keep], cj[keep]
                 ksh = scart[keep]
-                src_l.append(kci); dst_l.append(kcj); sh_l.append(ksh)      # i->j, +shift
-                src_l.append(kcj); dst_l.append(kci); sh_l.append(-ksh)     # j->i, -shift
+                kus = sint[keep]
+                src_l.append(kci); dst_l.append(kcj); sh_l.append(ksh);  us_l.append(kus)   # i->j, +shift
+                src_l.append(kcj); dst_l.append(kci); sh_l.append(-ksh); us_l.append(-kus)  # j->i, -shift
         if src_l:
             edge_index = torch.stack([torch.cat(src_l), torch.cat(dst_l)], dim=0)
             shifts = torch.cat(sh_l, dim=0)
+            unit_shifts = torch.cat(us_l, dim=0)
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             shifts = torch.zeros((0, 3), dtype=self.dtype, device=device)
-        unit_shifts = torch.zeros((edge_index.size(1), 3), dtype=self.dtype, device=device)
+            unit_shifts = torch.zeros((0, 3), dtype=self.dtype, device=device)
         return edge_index, shifts, unit_shifts
 
     def _batched_ef_eV(self):
@@ -381,6 +400,114 @@ class MaceOffBatchCalc:
         F_Ha = F_flat.view(self.B, self.nmax_dof) * EV2HARTREE
         E_Ha = E_eV * EV2HARTREE
         return E_Ha, F_Ha
+
+    # -------------------------------------------------------------- stress (2C)
+    def _batched_efs_eV(self):
+        """ONE stress-enabled multi-graph forward -> (E_eV (B,), F_eV (N,3),
+        stress_eV_ang3 (B,6) ASE Voigt).
+
+        Reuses mace's OWN per-graph virial autograd (``compute_stress=True``):
+        ``prepare_graph`` creates a per-graph symmetric-strain leaf ``displacement``,
+        recomputes every edge shift as ``unit_shifts @ (cell + cell @ eps)``, and
+        ``autograd.grad(E, displacement)`` yields the per-graph virial; mace then forms
+        ``stress = virial / V`` = ``(1/V) dE/deps`` (ASE convention, +sign, eV/Ang^3).
+        Because the co-batched graph is BLOCK-DIAGONAL (verified byte-isolated), graph
+        g's energy depends only on ``displacement[g]`` -> the returned stress is exactly
+        per-replica, with no cross-replica virial leak. The forces returned here are the
+        SAME quantity as ``get_ef_gpu`` (both = -dE/dr from the one grad call), so a
+        single stress forward gives E, F AND stress for the NPT loop.
+
+        MACE-OFF is native eV/Ang, so the mace->ASE stress unit factor is 1: stress[b]
+        matches ``ase MACECalculator.get_stress(voigt=True)`` on replica b to fp64."""
+        coord = self.coord.detach().to(self.device, self.dtype).requires_grad_(True)
+        edge_index, shifts, unit_shifts = self._build_edges_gpu(coord)
+        d = dict(self._static)                       # shallow copy; static tensors reused
+        d["positions"] = coord
+        d["edge_index"] = edge_index
+        d["shifts"] = shifts
+        d["unit_shifts"] = unit_shifts
+        out = self.model(d, compute_force=True, compute_stress=True, training=False)
+        E_eV = out["energy"].detach().reshape(-1).to(self.dtype)           # (B,)
+        F_eV = out["forces"].detach().to(self.dtype)                       # (N,3)
+        s33 = out["stress"].detach().to(self.dtype).reshape(self.B, 3, 3)  # (B,3,3) eV/Ang^3
+        # ASE Voigt [xx,yy,zz,yz,xz,xy] with symmetrized off-diagonals
+        # (== ase.stress.full_3x3_to_voigt_6_stress on each 3x3).
+        stress_voigt = torch.stack([
+            s33[:, 0, 0], s33[:, 1, 1], s33[:, 2, 2],
+            0.5 * (s33[:, 1, 2] + s33[:, 2, 1]),
+            0.5 * (s33[:, 0, 2] + s33[:, 2, 0]),
+            0.5 * (s33[:, 0, 1] + s33[:, 1, 0]),
+        ], dim=1)                                                          # (B,6)
+        return E_eV, F_eV, stress_voigt
+
+    def get_stress_gpu(self):
+        """Per-replica configurational stress (B,6) eV/Ang^3, ASE Voigt convention
+        [xx,yy,zz,yz,xz,xy]. Periodic batch required (a non-periodic batch has no cell;
+        the barostat/pressure path is meaningless there)."""
+        if self.B == 0:
+            return torch.zeros((0, 6), dtype=self.dtype, device=self.device)
+        if not self._periodic:
+            raise NotImplementedError(
+                "get_stress_gpu requires a PERIODIC batch (no cell -> no configurational "
+                "virial). Isolated replicas run NVE/NVT only.")
+        _E, _F, s = self._batched_efs_eV()
+        return s
+
+    def get_efs_gpu(self):
+        """ONE stress-enabled forward -> (E_Ha (B,), F_Ha (B, nmax_dof), stress (B,6)).
+
+        E/F units + padded (B, nmax_dof) layout are IDENTICAL to ``get_ef_gpu`` (Hartree,
+        Hartree/Ang); stress is ASE Voigt eV/Ang^3 (the unit ``compute_instantaneous_
+        pressure`` and the Berendsen/C-rescale barostats consume). Used once per step by
+        BatchedNPT so pressure + force come from a single forward."""
+        if self.B == 0:
+            z = torch.zeros((0,), dtype=self.dtype, device=self.device)
+            return (z, torch.zeros((0, 0), dtype=self.dtype, device=self.device),
+                    torch.zeros((0, 6), dtype=self.dtype, device=self.device))
+        if not self._periodic:
+            raise NotImplementedError("get_efs_gpu requires a PERIODIC batch.")
+        E_eV, F_eV, stress = self._batched_efs_eV()
+        F_flat = torch.zeros(self.B * self.nmax_dof, dtype=self.dtype, device=self.device)
+        if self.N_atoms > 0:
+            base = self._base
+            F_flat[base] = F_eV[:, 0]
+            F_flat[base + 1] = F_eV[:, 1]
+            F_flat[base + 2] = F_eV[:, 2]
+        F_Ha = F_flat.view(self.B, self.nmax_dof) * EV2HARTREE
+        E_Ha = E_eV * EV2HARTREE
+        return E_Ha, F_Ha, stress
+
+    # --------------------------------------------------------- barostat (2C)
+    def volumes(self):
+        """Per-replica cell volume (B,) [Ang^3]. Zeros for a non-periodic batch."""
+        if not self._periodic:
+            return torch.zeros((self.B,), dtype=self.dtype, device=self.device)
+        return torch.linalg.det(self._cell).abs()
+
+    def get_cells(self):
+        """Per-replica cell (B,3,3) [Ang], ASE row-vector convention (or None)."""
+        return None if not self._periodic else self._cell.clone()
+
+    @torch.no_grad()
+    def rescale_isotropic_(self, mu):
+        """Isotropic barostat rescale of each replica by the per-replica scalar mu (B,):
+        scale REAL-atom positions about the cell origin (cartesian *= mu -- exact for a
+        scalar cell scale, i.e. ase ``set_cell(cell*mu, scale_atoms=True)`` keeps
+        fractional coords) AND the per-replica cell + its inverse + the static per-graph
+        stress cell (+ rcell if present) by mu. One call keeps the calc's box and
+        geometry mutually consistent, so the next edge build + stress forward see the new
+        box. Periodic batch only (the barostat is a PBC feature)."""
+        assert self._prepared and self._periodic, "rescale_isotropic_ needs a periodic batch"
+        mu = mu.to(self.device, self.dtype).reshape(self.B)
+        if self.N_atoms > 0:
+            self.coord.mul_(mu[self._atom_rep][:, None])
+        self._cell = self._cell * mu[:, None, None]
+        self._cell_inv = torch.linalg.inv(self._cell)
+        if self._static is not None and self._static.get("cell") is not None:
+            self._static["cell"] = self._cell.reshape(self.B * 3, 3).clone()
+        if self._static is not None and self._static.get("rcell") is not None:
+            self._static["rcell"] = (2.0 * np.pi * torch.linalg.inv(
+                self._cell.transpose(-1, -2))).reshape(self.B * 3, 3)
 
     # --------------------------------------------------------------- isolation
     def isolation_check(self, perturb: float = 0.05) -> float:
