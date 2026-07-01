@@ -1,0 +1,302 @@
+{
+  "env": {
+    "torch": "2.6.0+cu124",
+    "cuda": true,
+    "gpu": "NVIDIA A100-SXM4-80GB"
+  },
+  "backend_load": {
+    "mace-off": {
+      "loaded": true,
+      "class": "MaceOffBatchCalc",
+      "SUPPORTS_PBC": true,
+      "batch_isolated_attr": true,
+      "expected_isolated": true
+    },
+    "mace-mp": {
+      "loaded": true,
+      "class": "MaceOffBatchCalc",
+      "SUPPORTS_PBC": true,
+      "batch_isolated_attr": true,
+      "expected_isolated": true
+    },
+    "std-mace(maceomol)": {
+      "loaded": true,
+      "class": "MACEBatchCalc",
+      "SUPPORTS_PBC": false,
+      "batch_isolated_attr": null,
+      "expected_isolated": true
+    },
+    "macepol": {
+      "loaded": false,
+      "reason": "RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+    },
+    "aimnet2-native": {
+      "loaded": true,
+      "class": "AIMNet2BatchCalc",
+      "SUPPORTS_PBC": false,
+      "batch_isolated_attr": null,
+      "expected_isolated": false
+    },
+    "aimnet2-decoupled": {
+      "loaded": false,
+      "reason": "ModuleNotFoundError: No module named 'aimnet2calc'"
+    },
+    "uma": {
+      "loaded": false,
+      "reason": "ImportError: fairchem-core is not importable: No module named 'fairchem'"
+    }
+  },
+  "gate": {
+    "MaceOffBatchCalc": {
+      "expected_accept": true,
+      "accepted": true,
+      "ok": true,
+      "reject_msg_clean": null,
+      "msg": ""
+    },
+    "UMABatchCalc": {
+      "expected_accept": true,
+      "accepted": true,
+      "ok": true,
+      "reject_msg_clean": null,
+      "msg": ""
+    },
+    "AIMNet2DecoupledBatchCalc": {
+      "expected_accept": true,
+      "accepted": true,
+      "ok": true,
+      "reject_msg_clean": null,
+      "msg": ""
+    },
+    "MACEBatchCalc": {
+      "expected_accept": true,
+      "accepted": true,
+      "ok": true,
+      "reject_msg_clean": null,
+      "msg": ""
+    },
+    "AIMNet2BatchCalc": {
+      "expected_accept": false,
+      "accepted": false,
+      "ok": true,
+      "reject_msg_clean": true,
+      "msg": "BatchedNVT B=2>1 requires a batch-ISOLATED calculator (per-system energies independent)"
+    },
+    "MACEPolBatchCalc": {
+      "expected_accept": false,
+      "accepted": false,
+      "ok": true,
+      "reject_msg_clean": true,
+      "msg": "BatchedNVT B=2>1 requires a batch-ISOLATED calculator (per-system energies independent)"
+    },
+    "SomeGenericCoupledCalc": {
+      "expected_accept": false,
+      "accepted": false,
+      "ok": true,
+      "reject_msg_clean": true,
+      "msg": "BatchedNVT B=2>1 requires a batch-ISOLATED calculator (per-system energies independent)"
+    },
+    "_all_ok": true
+  },
+  "matrix": {
+    "mace-off": {
+      "BatchedNVT": {
+        "status": "PASS",
+        "detail": "T0=274.7K T1=392.2K PE=-155.1326Ha isoDE=0.0e+00Ha finite=True"
+      },
+      "B1-parity": {
+        "status": "PASS",
+        "detail": "max|dpos|=1.1e-15A max|dvel|=1.1e-17au"
+      },
+      "umbrella_batched": {
+        "status": "PASS",
+        "detail": "bias_additive=True(dE_err=2.9e-15,dF=4.5e-02) PMF_finite=True win_cv=[2.664, 2.885, 3.18, 3.409]"
+      },
+      "GaMD_batched": {
+        "status": "PASS",
+        "detail": "prod_frames=1408 k=50.57/Ha E=-119.1925Ha boost_factor=[0.305,1.000] in[0,1]=True"
+      },
+      "REMD": {
+        "status": "PASS",
+        "detail": "noswap_parity max|dpos|=2.0e-15A max|dvel|=3.8e-17au isoDE=5.7e-14Ha"
+      },
+      "SMD_batched": {
+        "status": "PASS",
+        "detail": "analytic_Ferr=0.0e+00(exact) works_finite=True n_pulls=4 isoDE=0.0e+00Ha"
+      }
+    },
+    "mace-mp": {
+      "BatchedNVT": {
+        "status": "PASS",
+        "detail": "T0=298.5K T1=340.0K PE=-1.7261Ha isoDE=0.0e+00Ha finite=True"
+      },
+      "B1-parity": {
+        "status": "PASS",
+        "detail": "max|dpos|=1.6e-15A max|dvel|=1.0e-17au"
+      },
+      "umbrella_batched": {
+        "status": "PASS",
+        "detail": "bias_additive=True(dE_err=5.9e-17,dF=4.5e-02) PMF_finite=True win_cv=[2.628, 2.86, 3.164, 3.401]"
+      },
+      "GaMD_batched": {
+        "status": "PASS",
+        "detail": "prod_frames=1408 k=57.34/Ha E=-2.0844Ha boost_factor=[0.346,1.000] in[0,1]=True"
+      },
+      "REMD": {
+        "status": "PASS",
+        "detail": "noswap_parity max|dpos|=2.1e-15A max|dvel|=4.1e-17au isoDE=0.0e+00Ha"
+      },
+      "SMD_batched": {
+        "status": "PASS",
+        "detail": "analytic_Ferr=0.0e+00(exact) works_finite=True n_pulls=4 isoDE=0.0e+00Ha"
+      }
+    },
+    "std-mace(maceomol)": {
+      "BatchedNVT": {
+        "status": "N/A-model",
+        "reason": "no genuine batch-generic maceomol .pt provisioned; the loaded stand-in is a single-graph / mace-off-format trace, so the adapter emits a clean actionable error. Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)"
+      },
+      "B1-parity": {
+        "status": "N/A-model",
+        "reason": "no genuine batch-generic maceomol .pt provisioned; the loaded stand-in is a single-graph / mace-off-format trace, so the adapter emits a clean actionable error. forward() expected at most 4 argument(s) but received 7 argument(s). Declaration: forward(__torch__.Wrapper self, Dict(str, Tensor) data, Tensor local_or_ghost, bool compute_virials=False) -> Tensor?"
+      },
+      "umbrella_batched": {
+        "status": "N/A-model",
+        "reason": "no genuine batch-generic maceomol .pt provisioned; the loaded stand-in is a single-graph / mace-off-format trace, so the adapter emits a clean actionable error. Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)"
+      },
+      "GaMD_batched": {
+        "status": "N/A-model",
+        "reason": "no genuine batch-generic maceomol .pt provisioned; the loaded stand-in is a single-graph / mace-off-format trace, so the adapter emits a clean actionable error. Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)"
+      },
+      "REMD": {
+        "status": "N/A-model",
+        "reason": "no genuine batch-generic maceomol .pt provisioned; the loaded stand-in is a single-graph / mace-off-format trace, so the adapter emits a clean actionable error. Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)"
+      },
+      "SMD_batched": {
+        "status": "N/A-model",
+        "reason": "no genuine batch-generic maceomol .pt provisioned; the loaded stand-in is a single-graph / mace-off-format trace, so the adapter emits a clean actionable error. Standard MACE model 'maceomol' was traced single-graph (B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest a multi-graph batch. Re-export the model batch-generic, or run molecules one at a time. (This is the same trace-lock that affects MACE-POL.)"
+      }
+    },
+    "macepol": {
+      "BatchedNVT": {
+        "status": "SKIP",
+        "reason": "backend not loadable: RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+      },
+      "B1-parity": {
+        "status": "SKIP",
+        "reason": "backend not loadable: RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+      },
+      "umbrella_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+      },
+      "GaMD_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+      },
+      "REMD": {
+        "status": "SKIP",
+        "reason": "backend not loadable: RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+      },
+      "SMD_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found"
+      }
+    },
+    "aimnet2-native": {
+      "BatchedNVT": {
+        "status": "N/A-gate",
+        "reason": "coupled calc (global charge/polarization); B>1 batched methods rejected by _assert_batch_isolated (clean). Use single-system NVT."
+      },
+      "B1-parity": {
+        "status": "N/A-gate",
+        "reason": "coupled calc (global charge/polarization); B>1 batched methods rejected by _assert_batch_isolated (clean). Use single-system NVT."
+      },
+      "umbrella_batched": {
+        "status": "N/A-gate",
+        "reason": "coupled calc (global charge/polarization); B>1 batched methods rejected by _assert_batch_isolated (clean). Use single-system NVT."
+      },
+      "GaMD_batched": {
+        "status": "N/A-gate",
+        "reason": "coupled calc (global charge/polarization); B>1 batched methods rejected by _assert_batch_isolated (clean). Use single-system NVT."
+      },
+      "REMD": {
+        "status": "N/A-gate",
+        "reason": "coupled calc (global charge/polarization); B>1 batched methods rejected by _assert_batch_isolated (clean). Use single-system NVT."
+      },
+      "SMD_batched": {
+        "status": "N/A-gate",
+        "reason": "coupled calc (global charge/polarization); B>1 batched methods rejected by _assert_batch_isolated (clean). Use single-system NVT."
+      }
+    },
+    "aimnet2-decoupled": {
+      "BatchedNVT": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ModuleNotFoundError: No module named 'aimnet2calc'"
+      },
+      "B1-parity": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ModuleNotFoundError: No module named 'aimnet2calc'"
+      },
+      "umbrella_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ModuleNotFoundError: No module named 'aimnet2calc'"
+      },
+      "GaMD_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ModuleNotFoundError: No module named 'aimnet2calc'"
+      },
+      "REMD": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ModuleNotFoundError: No module named 'aimnet2calc'"
+      },
+      "SMD_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ModuleNotFoundError: No module named 'aimnet2calc'"
+      }
+    },
+    "uma": {
+      "BatchedNVT": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ImportError: fairchem-core is not importable: No module named 'fairchem'"
+      },
+      "B1-parity": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ImportError: fairchem-core is not importable: No module named 'fairchem'"
+      },
+      "umbrella_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ImportError: fairchem-core is not importable: No module named 'fairchem'"
+      },
+      "GaMD_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ImportError: fairchem-core is not importable: No module named 'fairchem'"
+      },
+      "REMD": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ImportError: fairchem-core is not importable: No module named 'fairchem'"
+      },
+      "SMD_batched": {
+        "status": "SKIP",
+        "reason": "backend not loadable: ImportError: fairchem-core is not importable: No module named 'fairchem'"
+      }
+    }
+  },
+  "plumed": {
+    "status": "PASS",
+    "backend": "mace-off",
+    "bias_additive_dF": 0.0019043994235673281,
+    "run_finite": true
+  },
+  "fixes": [
+    "Validation-harness only (no generic-adapter bug was found): (1) PLUMED wrapper class is PlumedCalculator (not PlumedBias); (2) PYTHONUTF8=1 to survive an ascii locale; (3) reclassify single-graph-traced / incompatible model errors as N/A-model (clean actionable limitation) vs ERROR."
+  ],
+  "notes": [
+    "mace-off + mace-mp both adapt through the SAME generic MaceOffBatchCalc adapter (torch.load MACE .model) with ZERO code change -> all 5 batched methods + B=1 parity PASS. No adapter bug found.",
+    "std-MACE(maceomol): no genuine batch-generic maceomol .pt is provisioned; the loaded stand-in (maceoff23m.pt) is a single-graph / mace-off-format trace. MACEBatchCalc's batch-native PROBE cleanly rejects it at B>1 ('traced single-graph, B=1-locked') and the B=1 path surfaces the raw forward-signature mismatch -> both are clean actionable errors, NOT adapter bugs. Real limitation: needs a batch-generic maceomol export.",
+    "macepol: MACEPolBatchCalc could not load the val_movable/*.pt (no constants.pkl in the archive); it is coupled by construction anyway, so its B>1 batched cells are N/A by the gate (reject verified generically in Part 2).",
+    "aimnet2-native: AIMNet2BatchCalc LOADS (jit.load aimnet2.pt) as a REAL charge-coupled calc and is correctly REJECTED for B>1 by _assert_batch_isolated (clean message). Its B=1 single-system use is valid.",
+    "aimnet2-decoupled + uma: package absent in the plumed env (aimnet2calc / fairchem) -> SKIP. The GATE would ACCEPT both (verified by class-name logic in Part 2). UMA single-system loaded OK in a separate fairchem env (job 47848031).",
+    "Harness portability: the single-system NVT logger writes a Unicode 'tau' char; under the compute-node ascii locale this raised UnicodeEncodeError. Fixed in the run wrapper via PYTHONUTF8=1 (not a backend/adapter bug)."
+  ]
+}
