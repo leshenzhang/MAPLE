@@ -114,6 +114,22 @@ class BatchedNVTParams:
     vram_slope_mib_per_atom: float = 1.3   # linear forward-VRAM model (MiB per atom)
     large_atom_threshold: int   = 200      # replicas >= this are compute-bound...
     large_atom_B_cap:     int   = 4        # ...so cap B here (throughput already flat)
+    # --- GPU-opt Lever 3: fully on-device (fused) hot loop (opt-in; default OFF) ---
+    # False (default) => EXACT current behavior (byte-identical): the per-step
+    # thermostat substep goes through the per-replica ``_v_real``/``_set_v_real``
+    # (.to("cpu").numpy()) roundtrip. True => the LF-Middle Langevin OU substep is
+    # done fully ON the torch device (v never leaves the GPU; only the RNG noise --
+    # drawn from the SAME per-replica numpy stream in the SAME order -- is H2D-copied
+    # once/step), killing the 2*B per-step host<->device velocity syncs that dominate
+    # at large B. BIT-IDENTICAL to the default path (elementwise fp64 OU + preserved
+    # RNG stream; parity gate _test_fused_loop.py). CEILING: covers the Langevin
+    # thermostat only -- v-rescale/NHC keep the per-replica substep because their
+    # KE/akin REDUCTION cannot be reproduced bit-for-bit by a GPU reduction (different
+    # summation order -> chaotic MD divergence), and the cadence-gated COM/angular
+    # projection stays on the (bit-identical) numpy path (fires every remove_com_every
+    # steps only, not the per-step bottleneck). Default OFF pending on-GPU parity +
+    # throughput confirmation (cannot be measured without a CUDA device).
+    fused_loop:           bool  = False
     # --- HMR (mass-only; supported) ---
     hmr:           str   = ""               # ""/off => no-op; on/true => 3.0; or a number
     hmr_factor:    Optional[float] = None
@@ -502,6 +518,20 @@ class BatchedNVT(JobABC):
         self._hist_T, self._hist_KE, self._hist_PE = [], [], []
         self._steps_done = 0
 
+        # GPU-opt Lever 3: fused (fully on-device) hot loop. Default OFF => byte-identical
+        # legacy path. When ON, the Langevin OU substep runs on-device (bit-exact); build
+        # its device coefficients once here. v-rescale/NHC keep the per-replica substep
+        # (their KE/akin reduction is not bit-reproducible on a GPU reduction -- ceiling).
+        self._fused = bool(getattr(self.params, "fused_loop", False))
+        self._host_sync_count = 0
+        if self._fused and self.params.thermostat == "langevin":
+            self._build_langevin_coeffs_dev()
+        elif self._fused:
+            self.log_info(["\n[fused_loop] on-device fusion currently covers the Langevin "
+                           f"OU thermostat only; thermostat={self.params.thermostat} retains "
+                           "the per-replica substep (bit-identical). Ceiling: v-rescale/NHC "
+                           "KE/akin reduction is not bit-reproducible on a GPU reduction.\n"])
+
     # ------------------------------------------------------------- force helper
     def _forces_au(self):
         """ONE batched forward -> (E (B,) Ha, F (B, nmax_dof) a.u. = Ha/Bohr).
@@ -528,6 +558,11 @@ class BatchedNVT(JobABC):
 
     # --- per-replica numpy <-> padded-buffer slicing helpers ------------------
     def _v_real(self, v, b):
+        # Host-sync counter: this is the ONE per-replica device->host (.to("cpu")
+        # .numpy()) velocity roundtrip in the hot loop. The fused-loop path
+        # (_apply_thermostat_fused) never calls it, so on a fused Langevin run with
+        # remove_com_every=0 this counter stays 0 -- the no-host-sync gate asserts it.
+        self._host_sync_count = getattr(self, "_host_sync_count", 0) + 1
         n = int(self.n_b[b])
         return v[b, :3 * n].detach().to("cpu").numpy().reshape(n, 3)
 
@@ -603,6 +638,61 @@ class BatchedNVT(JobABC):
                 remove_angular_every=self.params.remove_angular_every)
             self._set_v_real(v, b, vb)
         return v
+
+    # ---------------------------------------------- fused (fully on-device) OU
+    def _build_langevin_coeffs_dev(self):
+        """Build the on-device LF-Middle OU coefficients for the fused hot loop.
+
+        c1 = exp(-gamma*dt) is a per-replica scalar (temperature-INDEPENDENT); c2 =
+        sqrt((1-c1^2)*kT/m) is per-atom. BOTH are COPIED verbatim from the
+        authoritative per-replica ``LangevinThermostat`` (``._c1`` / ``._c2``, numpy
+        fp64), so their bits equal the per-replica path exactly; the OU update is then
+        the pure elementwise fp64 tensor op ``v' = c1*v + c2*xi`` (NO reduction) ->
+        bit-exact parity. Padding columns are left 0 so padded dofs stay 0
+        (c1*0 + 0*noise = 0). Also allocates the reusable padded noise host buffer."""
+        torch = self._torch
+        B, nmax = self.B, self.nmax_dof
+        dev, dt = self.device, self.dtype
+        self._c1_dev = torch.zeros((B, 1), dtype=dt, device=dev)
+        self._c2_dev = torch.zeros((B, nmax), dtype=dt, device=dev)
+        for b, th in enumerate(self._thermostats):
+            n = int(self.n_b[b])
+            self._c1_dev[b, 0] = float(th._c1)
+            c2b = torch.as_tensor(np.asarray(th._c2), dtype=dt, device=dev)   # (n,)
+            self._c2_dev[b, :3 * n] = c2b.repeat_interleave(3)
+        # reusable host-side padded noise buffer (real slots overwritten each step;
+        # padding stays 0). One H2D copy/step replaces the 2*B per-replica syncs.
+        self._noise_np = np.zeros((B, nmax), dtype=np.float64)
+
+    def _refresh_c2_dev(self):
+        """Re-pull c2 into ``_c2_dev`` after an anneal step retuned each thermostat's
+        ``._c2`` (c1 is temperature-independent, so it never needs a refresh)."""
+        torch = self._torch
+        for b, th in enumerate(self._thermostats):
+            n = int(self.n_b[b])
+            c2b = torch.as_tensor(np.asarray(th._c2), dtype=self.dtype, device=self.device)
+            self._c2_dev[b, :3 * n] = c2b.repeat_interleave(3)
+
+    def _apply_thermostat_fused(self, v, step):
+        """Fully on-device LF-Middle OU thermostat substep (fused-loop path).
+
+        BIT-IDENTICAL drop-in for ``_apply_thermostat(v, vrescale=False)``: it draws
+        the SAME per-replica numpy RNG stream in the SAME order (so the noise is
+        byte-for-byte what each ``LangevinThermostat.apply`` would draw), then does the
+        OU affine combine ``v' = c1*v + c2*xi`` as ONE elementwise fp64 tensor op ON
+        DEVICE. The velocity NEVER leaves the GPU -- no ``_v_real``/``_set_v_real``
+        (.to("cpu").numpy()) per replica; only the small padded noise buffer is
+        H2D-copied once/step. No ``.cpu()``/``.numpy()`` on a device tensor -> no
+        host-sync stall (gate: no-host-sync)."""
+        torch = self._torch
+        if self._anneal_fn is not None:            # anneal retuned each th._c2 this step
+            self._refresh_c2_dev()
+        nb = self._noise_np
+        for b in range(self.B):                    # SAME stream/order as the numpy path
+            n = int(self.n_b[b])
+            nb[b, :3 * n] = self._rngs[b].standard_normal((n, 3)).reshape(-1)
+        noise = torch.tensor(nb, dtype=self.dtype, device=self.device)
+        return self._c1_dev * v + self._c2_dev * noise
 
     def _set_anneal_T(self, step):
         if self._anneal_fn is None:
@@ -681,7 +771,10 @@ class BatchedNVT(JobABC):
         self._set_anneal_T(step)
         v = v + F / self.mass * self.dt_au                # full kick (carried)
         self._displace(v, 0.5)                            # half drift
-        v = self._apply_thermostat(v, vrescale=False)     # per-replica OU
+        if getattr(self, "_fused", False):
+            v = self._apply_thermostat_fused(v, step)     # fully on-device OU (bit-exact)
+        else:
+            v = self._apply_thermostat(v, vrescale=False) # per-replica OU
         self._displace(v, 0.5)                            # half drift
         E, F = self._forces_au()                          # post-thermostat forward
         v = self._apply_projection(v, step)               # per-replica COM/angular
@@ -800,6 +893,10 @@ class BatchedNVT(JobABC):
         lines.append(f"Remove COM ev.:  {p.remove_com_every} steps (runtime, per replica)\n")
         prec = str(p.precision or "").strip().lower() or "fp64(default)"
         lines.append(f"Precision:       {prec}  (calc dtype={self.dtype})\n")
+        if getattr(p, "fused_loop", False):
+            fu = "ON (Langevin OU on-device, bit-exact)" if p.thermostat == "langevin" \
+                else f"ON but no-op for thermostat={p.thermostat} (per-replica substep)"
+            lines.append(f"Fused loop:      {fu}\n")
         if p.auto_batch:
             lines.append(f"Auto-batch:      ON  (cap={p.auto_batch_cap}, "
                          f"safety={p.vram_safety}, large>= {p.large_atom_threshold} "
