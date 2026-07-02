@@ -219,8 +219,8 @@ class CommittorCV:
         contract as :func:`bias.batched_metad._com_distance_cv_grad`. dq/dx is the
         exact physical gradient via torch autograd through the descriptor."""
         import torch
-        p = torch.as_tensor(np.asarray(pos, float), dtype=torch.float64,
-                            requires_grad=True)
+        p = torch.tensor(np.asarray(pos, float), dtype=torch.float64,
+                         requires_grad=True)
         feats = self._norm(self.descriptor(p).reshape(-1)).unsqueeze(0)        # (1,d)
         q = self._q_from_norm(feats)[0]                                        # scalar
         (g,) = torch.autograd.grad(q, p, create_graph=False)
