@@ -31,6 +31,7 @@ from .steered_batched import BatchedMovingRestraint
 from .ml_cv import (CommittorCV, CommittorMetaD, IdentityDescriptor,
                     PairwiseDistanceDescriptor, DihedralDescriptor,
                     CompositeDescriptor)
+from .eabf import (ExtendedABF, ABFGrid, czar_pmf, eabf_toy_1d, attach_eabf)
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "PosresCalculator", "posres_enabled", "GamdCalculator",
@@ -40,7 +41,8 @@ __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "BatchedGaMD", "BatchedMovingRestraint",
            "CommittorCV", "CommittorMetaD", "IdentityDescriptor",
            "PairwiseDistanceDescriptor", "DihedralDescriptor",
-           "CompositeDescriptor"]
+           "CompositeDescriptor",
+           "ExtendedABF", "ABFGrid", "czar_pmf", "eabf_toy_1d", "attach_eabf"]
 
 
 def maybe_wrap_bias(atoms, params, output):
