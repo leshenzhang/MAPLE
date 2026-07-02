@@ -237,6 +237,7 @@ class BatchCalcABC:
         self.Nmax_atoms = 0
         self.nmax_dof = 0
         self._coord_backup = None
+        self._periodic = False  # set in prepare(); shared hook for the PBC MD stack
 
     # =====================================================================  #
     # prepare — topology fixed once per batch (COMMON; hooks _build_topology) #
@@ -250,10 +251,22 @@ class BatchCalcABC:
         inconsistency #5: only 2 of 7 classes validated it).
         """
         device, dtype = self.device, self.dtype
-        # PBC fail-fast (inconsistency #6: 3 of 7 raised, 4 silently ignored).
-        if not self.SUPPORTS_PBC:
-            for at in atoms_list:
-                reject_periodic_atoms(at, type(self).__name__)
+        # PBC gate (aligned with ai-maple-md Phase-B). Molecular backends
+        # (SUPPORTS_PBC=False) reject any periodic replica (inconsistency #6:
+        # 3 of 7 raised, 4 silently ignored). A PBC-capable backend
+        # (SUPPORTS_PBC=True -- UMA-periodic / MACE with _build_edges_pbc) instead
+        # requires a HOMOGENEOUS pbc state across the batch and keeps cell/pbc as
+        # calc-internal state, carried on atoms_list into _build_topology / _forward
+        # (the get_ef_gpu return contract is unchanged; cell fixed = NVT).
+        # ``self._periodic`` is the shared hook the sibling batched-MD stack reads.
+        pbc_flags = [bool(np.any(np.asarray(getattr(at, "pbc", False)))) for at in atoms_list]
+        self._periodic = any(pbc_flags)
+        if self._periodic and not self.SUPPORTS_PBC:
+            reject_periodic_atoms(atoms_list[pbc_flags.index(True)], type(self).__name__)
+        if self._periodic and not all(pbc_flags):
+            raise NotImplementedError(
+                f"{type(self).__name__}: heterogeneous PBC across the batch is unsupported; "
+                "all replicas must share one periodic state (homogeneous-pbc gate).")
 
         B = len(atoms_list)
         self._atoms_B = B

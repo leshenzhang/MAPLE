@@ -113,11 +113,36 @@ def test_pbc_fail_fast():
     raise AssertionError("expected NotImplementedError on periodic atoms")
 
 
+@register_batch_calculator
+class _HarmonicPBC(_HarmonicBatch):
+    """PBC-capable variant: SUPPORTS_PBC=True (aligns with ai-maple-md Phase-B)."""
+    MODEL_NAMES = ("_harmonic_pbc_test",)
+    SUPPORTS_PBC = True
+
+
+def test_pbc_capable_accepts_and_homogeneous_gate():
+    """A SUPPORTS_PBC=True backend accepts periodic atoms + enforces homogeneous pbc."""
+    from ase import Atoms
+    c = _HarmonicPBC(device="cpu", dtype=torch.float64)
+    at_p = Atoms("H2", positions=np.zeros((2, 3)), cell=[5, 5, 5], pbc=True)
+    c.prepare([at_p, at_p.copy()])                 # homogeneous periodic -> OK
+    assert c._periodic is True
+    E, F = c.get_ef_gpu()
+    assert E.shape == (2,)
+    at_m = Atoms("H2", positions=np.zeros((2, 3)))  # non-periodic
+    try:
+        c.prepare([at_p, at_m])                     # heterogeneous -> reject
+    except NotImplementedError:
+        return
+    raise AssertionError("expected NotImplementedError on heterogeneous PBC")
+
+
 if __name__ == "__main__":
     test_all_backends_import_and_register()
     test_capability_contract_declared()
     test_base_plumbing_harmonic_cpu()
     test_pbc_fail_fast()
+    test_pbc_capable_accepts_and_homogeneous_gate()
     n = len({id(c) for c in _BATCH_REGISTRY.values()})
     print(f"batch-calc contract tests PASS: {n} registered backends contract-compliant "
           f"+ base plumbing + PBC fail-fast")
