@@ -26,13 +26,15 @@ from . import umbrella
 from . import wham2d
 from .batched import BatchedHarmonicRestraint, BatchedGaMD
 from .steered_batched import BatchedMovingRestraint
+from .eabf import (ExtendedABF, ABFGrid, czar_pmf, eabf_toy_1d, attach_eabf)
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "PosresCalculator", "posres_enabled", "GamdCalculator",
            "gamd_enabled", "gamd_params", "gamd_reweight_1d",
            "SteeredMDCalculator", "smd_enabled", "jarzynski_1d",
            "read_smd_work", "umbrella", "wham2d", "BatchedHarmonicRestraint",
-           "BatchedGaMD", "BatchedMovingRestraint"]
+           "BatchedGaMD", "BatchedMovingRestraint",
+           "ExtendedABF", "ABFGrid", "czar_pmf", "eabf_toy_1d", "attach_eabf"]
 
 
 def maybe_wrap_bias(atoms, params, output):
