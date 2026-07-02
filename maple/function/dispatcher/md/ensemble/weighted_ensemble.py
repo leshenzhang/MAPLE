@@ -279,8 +279,9 @@ class WeightedEnsemble(BatchedNVT):
 
     def _walker_positions(self):
         """Per-walker positions (list of (n,3) Angstrom numpy) from the calc master."""
+        from ..bias.batched import _ptr_to_np  # sanctioned torch|numpy _ptr coercion
         coord = self.calc.coord.detach().to("cpu").numpy()
-        ptr = self.calc._ptr.detach().to("cpu").numpy().tolist()
+        ptr = _ptr_to_np(self.calc._ptr).tolist()
         return [coord[ptr[b]:ptr[b + 1]].copy() for b in range(self.B)]
 
     def _compute_xi(self):
