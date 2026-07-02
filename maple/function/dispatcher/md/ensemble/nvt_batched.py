@@ -114,8 +114,8 @@ class BatchedNVTParams:
     vram_slope_mib_per_atom: float = 1.3   # linear forward-VRAM model (MiB per atom)
     large_atom_threshold: int   = 200      # replicas >= this are compute-bound...
     large_atom_B_cap:     int   = 4        # ...so cap B here (throughput already flat)
-    # --- GPU-opt Lever 3: fully on-device (fused) hot loop (default ON; GPU-confirmed) ---
-    # False => EXACT legacy behavior (byte-identical): the per-step
+    # --- GPU-opt Lever 3: fully on-device (fused) hot loop (opt-in; default OFF) ---
+    # False (default) => EXACT current behavior (byte-identical): the per-step
     # thermostat substep goes through the per-replica ``_v_real``/``_set_v_real``
     # (.to("cpu").numpy()) roundtrip. True => the LF-Middle Langevin OU substep is
     # done fully ON the torch device (v never leaves the GPU; only the RNG noise --
@@ -127,10 +127,12 @@ class BatchedNVTParams:
     # KE/akin REDUCTION cannot be reproduced bit-for-bit by a GPU reduction (different
     # summation order -> chaotic MD divergence), and the cadence-gated COM/angular
     # projection stays on the (bit-identical) numpy path (fires every remove_com_every
-    # steps only, not the per-step bottleneck). ADOPTED default ON (B-152): on-GPU
-    # (A100) parity gate bit-identical + throughput 1.06x@B1 / 2.09x@B8 / 5.04x@B32 /
-    # 11.32x@B128 (grows with B). Set False to force the legacy per-replica host path.
-    fused_loop:           bool  = True
+    # steps only, not the per-step bottleneck). VALIDATED opt-in (B-153): on-GPU (A100)
+    # parity BIT-IDENTICAL + throughput 1.06x@B1 / 2.09x@B8 / 5.04x@B32 / 11.32x@B128 for
+    # fixed-B NVT. Default OFF because it does NOT yet handle the WE-recycling re-prepare
+    # path (buffers sized at prepare() go stale on walker relocation -> shape error);
+    # per the accuracy-unchanged adoption rule it stays opt-in until that fix lands.
+    fused_loop:           bool  = False
     # --- HMR (mass-only; supported) ---
     hmr:           str   = ""               # ""/off => no-op; on/true => 3.0; or a number
     hmr_factor:    Optional[float] = None
