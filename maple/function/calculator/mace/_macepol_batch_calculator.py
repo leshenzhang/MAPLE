@@ -48,11 +48,21 @@ caller can decide. Standard (non-POL) MACE-OFF does NOT have this problem (nativ
 multi-graph batching) -- see the companion standard-MACE batch calculator.
 ================================================================================
 
+Retrofit note (BatchCalcABC): inherits ``BatchCalcABC`` + ``@register_batch_calculator``.
+The shared surface (prepare topology / step_cart_ / set_coords_ / backup_coords /
+restore_coords / _pad_forces flat scatter / _resolve_movable) comes from the base;
+MACE-POL keeps its coupling-specific overrides (the single-graph packed forward, the
+raise/sequential/approx dispatch, the seeded-analytic + batched-FD Hessians, the
+sequential single-calc fallback, isolation_check). Because MACE-POL globally couples
+molecules it declares ``SUPPORTS_COUPLING=True`` / ``BATCHABLE=False`` (default
+coupling_mode='raise' cannot batch B>1).
+
 Contract (matches AIMNet2BatchCalc): prepare / step_cart_ / set_coords_ /
 backup_coords / restore_coords / get_ef_gpu -> (E_Ha(B,), F_Ha(B,nmax_dof)) /
 get_efh_gpu -> (E_Ha, F_Ha, H_Ha(B,nmax,nmax), P(B,) padding-atom count).
-Units: Hartree, Hartree/Angstrom (model returns eV; EV2HARTREE=1/27.211386245988).
-Gas phase ONLY (raises if a solvent is requested).
+Units: Hartree, Hartree/Angstrom (model returns eV; EV2HARTREE=1/27.211386245988,
+imported from the base -- the ONLY unit source).
+Gas phase ONLY (raises if a solvent is requested; base rejects periodic atoms).
 """
 
 import os
@@ -62,8 +72,11 @@ import numpy as np
 from typing import List, Sequence
 from ase import Atoms
 
-EV2HARTREE = 1.0 / 27.211386245988
-EH2EV = 27.211386245988
+from ..batch_calculator_base import (
+    BatchCalcABC,
+    EV2HARTREE,
+    register_batch_calculator,
+)
 
 _MACEPOL_MODEL_FILES = {
     'macepols': 'macepols.pt',
@@ -83,13 +96,24 @@ def _one_hot_node_attrs(Z: torch.Tensor, atomic_number_table: Sequence[int],
     return eq.to(dtype)
 
 
-class MACEPolBatchCalc:
+@register_batch_calculator
+class MACEPolBatchCalc(BatchCalcABC):
     """Batched MACE-POL calculator. See module docstring for the coupling finding.
 
     coupling_mode: 'raise' (default, safe) | 'sequential' (correct, no speedup) |
                    'approx' (fast single-graph batch, ~1e-3 Ha/A coupling error).
     isolation_tol: Ha/A force-leak threshold used by the warning/guard logic.
     """
+
+    # ---- capability protocol (BatchCalcABC declarative attrs) --------------
+    MODEL_NAMES = ('macepols', 'macepolm', 'macepoll')
+    MODEL_ENERGY_UNIT = "eV"                 # model returns eV; base -> Hartree once
+    MODEL_DTYPE = torch.float32              # traced MACE-POL is f32 (master coord f64)
+    SUPPORTS_PBC = False                     # gas-phase molecular wrapper only
+    SUPPORTED_HESSIAN_MODES = ("numerical", "autograd")  # fd (numerical) + seeded analytic
+    HAS_HVP = False
+    SUPPORTS_COUPLING = True                 # global charge-eq + long-range Coulomb couple mols
+    BATCHABLE = False                        # default coupling_mode='raise' cannot batch B>1
 
     def __init__(self,
                  device: str = "cuda",
@@ -107,8 +131,11 @@ class MACEPolBatchCalc:
         if coupling_mode not in ("raise", "sequential", "approx"):
             raise ValueError("coupling_mode must be 'raise'|'sequential'|'approx'")
 
-        self.device = torch.device(device)
-        self.dtype = dtype
+        # base.__init__ resolves device (torch.device) + dtype and inits the generic
+        # prepared-state (_prepared/_atoms_B/_ptr/numbers/mol_idx/_local_atom/_n_b/
+        # _cols/coord/N_atoms/Nmax_atoms/nmax_dof/_coord_backup). Must run BEFORE the
+        # model load below (map_location=self.device).
+        super().__init__(device, dtype)
         self.mdtype = torch.float32                  # traced MACE-POL is f32
         self.coupling_mode = coupling_mode
         self.isolation_tol = float(isolation_tol)
@@ -130,26 +157,15 @@ class MACEPolBatchCalc:
         self._hess_mode = None                       # 'analytic'|'fd' (approx mode)
         self._seq_calc = None                        # lazy single MACEPolCalculator
 
-        # buffers
-        self._prepared = False
-        self._atoms_B = 0
-        self._ptr = None
-        self.numbers = None
+        # model-specific prepared-state ONLY (base.__init__ already inits the generic
+        # layout state; do NOT re-init those here). These are filled in _build_topology.
         self.node_attrs = None
-        self.mol_idx = None
-        self.coord = None
-        self.N_atoms = 0
-        self.Nmax_atoms = 0
-        self.nmax_dof = 0
         self.total_charge = None
         self.total_spin = None
         self._charges_host = None
         self._mults_host = None
         self.cand_i = None
         self.cand_j = None
-        self._base = None
-        self._n_b = None
-        self._coord_backup = None
 
         try:
             self._probe_double_backward()
@@ -158,58 +174,18 @@ class MACEPolBatchCalc:
 
     # =====================================================================
     def prepare(self, atoms_list: List[Atoms], fixed_nmax: int = None):
-        device, dtype = self.device, self.dtype
-        B = len(atoms_list)
-        self._atoms_B = B
+        """Fix topology for a batch of B molecules, then run MACE-POL coupling-mode
+        gating.
 
-        ptr = [0]
-        nums, mids, coords, charges, spins = [], [], [], [], []
-        for i, at in enumerate(atoms_list):
-            Z = torch.tensor(at.get_atomic_numbers(), dtype=torch.int64, device=device)
-            n = int(Z.shape[0])
-            ptr.append(ptr[-1] + n)
-            nums.append(Z)
-            mids.append(torch.full((n,), i, dtype=torch.int64, device=device))
-            coords.append(torch.tensor(at.get_positions(), dtype=dtype, device=device))
-            charges.append(float(at.info.get('charge', 0)))
-            spins.append(float(int(at.info.get('mult', 1)) - 1))
-
-        self._ptr = torch.tensor(ptr, dtype=torch.int64, device=device)
-        self.numbers = torch.cat(nums) if nums else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.mol_idx = torch.cat(mids) if mids else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.coord = (torch.cat(coords).contiguous() if coords
-                      else torch.zeros((0, 3), dtype=dtype, device=device))
-        self.N_atoms = int(self.numbers.numel())
-        self.Nmax_atoms = int(max((len(at) for at in atoms_list), default=0))
-        self.nmax_dof = (3 * self.Nmax_atoms) if fixed_nmax is None else int(fixed_nmax)
-        self._charges_host = charges
-        self._mults_host = [int(at.info.get('mult', 1)) for at in atoms_list]
-
-        self.node_attrs = (_one_hot_node_attrs(self.numbers, self.atomic_numbers, self.mdtype)
-                           if self.N_atoms > 0
-                           else torch.zeros((0, len(self.atomic_numbers)), dtype=self.mdtype, device=device))
-        self.total_charge = torch.tensor(charges, dtype=self.mdtype, device=device)
-        self.total_spin = torch.tensor(spins, dtype=self.mdtype, device=device)
-
-        s = self._ptr[:-1]; t = self._ptr[1:]
-        self._n_b = (t - s)
-        if self.N_atoms > 0:
-            local_idx = torch.arange(self.N_atoms, device=device) - s[self.mol_idx]
-            self._base = self.mol_idx * self.nmax_dof + 3 * local_idx
-        else:
-            self._base = torch.zeros((0,), dtype=torch.int64, device=device)
-
-        ci, cj = [], []
-        for b in range(B):
-            n = int(self._n_b[b].item()); off = int(s[b].item())
-            if n >= 2:
-                iu, ju = torch.triu_indices(n, n, offset=1, device=device)
-                ci.append(iu + off); cj.append(ju + off)
-        self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
-
-        self._coord_backup = None
-        self._prepared = True
+        ``BatchCalcABC.prepare`` builds the generic layout (ptr/numbers/mol_idx/
+        _local_atom/_n_b/_cols flat scatter/coord/nmax_dof), rejects periodic atoms
+        (SUPPORTS_PBC=False), validates ``fixed_nmax``, calls ``_build_topology``
+        (the MACE-POL node_attrs / total_charge / total_spin / candidate pairs), and
+        sets ``_prepared=True``. The coupling-mode gating MUST run AFTER that because
+        isolation_check() and the single-graph forward require ``_prepared``.
+        """
+        super().prepare(atoms_list, fixed_nmax=fixed_nmax)
+        B = self._atoms_B
 
         # ---- mode gating ----------------------------------------------------
         # single-graph packing carries one total_charge; mixed per-mol charge is
@@ -253,37 +229,43 @@ class MACEPolBatchCalc:
             warnings.warn(msg, RuntimeWarning)
 
     # =====================================================================
-    # coordinate ops (shared, vectorized)
+    # topology hook -- MACE-POL-specific batch state (called at end of prepare)
     # =====================================================================
-    @torch.no_grad()
-    def step_cart_(self, s_cart: torch.Tensor):
-        assert self._prepared, "call prepare() first"
+    def _build_topology(self, atoms_list):
+        """Cache MACE-POL-specific batch state: one-hot node attrs, per-molecule
+        total charge/spin (mdtype), host-side charge/mult lists (for the sequential
+        fallback + mixed-charge gate), and the intra-molecular candidate-pair lists
+        for the block-diagonal radius graph.
+
+        Called at the END of ``BatchCalcABC.prepare()`` -- which already built
+        ptr/numbers/mol_idx/_local_atom/_n_b/_cols flat scatter/coord/nmax_dof (with
+        the shared PBC reject + fixed_nmax validation) and reset _coord_backup.
+        """
+        device = self.device
         B = self._atoms_B
-        assert s_cart.shape == (B, self.nmax_dof), \
-            f"step_cart_ expects (B,{self.nmax_dof}), got {tuple(s_cart.shape)}"
-        if self.N_atoms == 0:
-            return
-        s_flat = s_cart.reshape(-1).to(self.device, self.dtype)
-        base = self._base
-        disp = torch.stack([s_flat[base], s_flat[base + 1], s_flat[base + 2]], dim=1)
-        self.coord.add_(disp)
+        charges = [float(at.info.get('charge', 0)) for at in atoms_list]
+        spins = [float(int(at.info.get('mult', 1)) - 1) for at in atoms_list]
+        self._charges_host = charges
+        self._mults_host = [int(at.info.get('mult', 1)) for at in atoms_list]
 
-    @torch.no_grad()
-    def set_coords_(self, coord: torch.Tensor):
-        assert self._prepared, "call prepare() first"
-        assert coord.shape == (self.N_atoms, 3)
-        self.coord.copy_(coord.to(self.device, self.dtype))
+        self.node_attrs = (_one_hot_node_attrs(self.numbers, self.atomic_numbers, self.mdtype)
+                           if self.N_atoms > 0
+                           else torch.zeros((0, len(self.atomic_numbers)), dtype=self.mdtype, device=device))
+        self.total_charge = torch.tensor(charges, dtype=self.mdtype, device=device)
+        self.total_spin = torch.tensor(spins, dtype=self.mdtype, device=device)
 
-    @torch.no_grad()
-    def backup_coords(self):
-        if self._prepared:
-            self._coord_backup = self.coord.clone()
+        s = self._ptr[:-1]
+        ci, cj = [], []
+        for b in range(B):
+            n = int(self._n_b[b].item()); off = int(s[b].item())
+            if n >= 2:
+                iu, ju = torch.triu_indices(n, n, offset=1, device=device)
+                ci.append(iu + off); cj.append(ju + off)
+        self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
+        self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
 
-    @torch.no_grad()
-    def restore_coords(self):
-        if self._coord_backup is not None:
-            self.coord.copy_(self._coord_backup)
-            self._coord_backup = None
+    # step_cart_ / set_coords_ / backup_coords / restore_coords / _resolve_movable
+    # are byte-identical to BatchCalcABC's flat-_cols versions -> inherited (deleted).
 
     # =====================================================================
     # single-graph block-diagonal forward (approx mode + isolation_check)
@@ -337,42 +319,20 @@ class MACEPolBatchCalc:
         F_all_eV = -grad
         return E_eV.to(self.dtype), F_all_eV, coord_leaf
 
-    def _scatter_forces(self, F_all: torch.Tensor) -> torch.Tensor:
-        B = self._atoms_B
-        F_flat = torch.zeros(B * self.nmax_dof, dtype=self.dtype, device=self.device)
-        if self.N_atoms > 0:
-            base = self._base
-            F_flat[base] = F_all[:, 0]; F_flat[base + 1] = F_all[:, 1]; F_flat[base + 2] = F_all[:, 2]
-        return F_flat.view(B, self.nmax_dof)
+    def _forward(self, coord: torch.Tensor, need_graph: bool):
+        """BatchCalcABC forward-contract adapter: ONE batched single-graph forward ->
+        (E_eV (B,), F_all_eV (N,3), leaf|None) in NATIVE eV (the base converts once via
+        MODEL_ENERGY_UNIT; do NOT scale by EV2HARTREE here). Delegates to the
+        coupling-aware ``_forward_single_graph`` (packs all molecules into ONE graph --
+        the only shape the B=1-locked MACE-POL trace accepts); the requires_grad
+        position leaf is returned only under need_graph."""
+        E_eV, F_all_eV, leaf = self._forward_single_graph(coord, need_graph)
+        return E_eV, F_all_eV, (leaf if need_graph else None)
 
     # =====================================================================
     # partial-Hessian (movable-atom subspace) helpers -- mirror UMABatchCalc
     # =====================================================================
-    def _resolve_movable(self, movable_masks):
-        """Per-structure list[int] of movable atom indices. None = all atoms;
-        per-structure None/bool-mask/index-list otherwise. Frozen atoms still appear
-        in every forward (they exert forces); only their Hessian rows/cols are
-        dropped (exact FixAtoms-constrained block). Mirrors UMABatchCalc."""
-        B = self._atoms_B
-        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
-        if movable_masks is None:
-            return [list(range(n_b[b])) for b in range(B)]
-        out = []
-        for b in range(B):
-            m = movable_masks[b]
-            if m is None:
-                out.append(list(range(n_b[b])))
-                continue
-            m_arr = np.asarray(m)
-            if m_arr.dtype == bool:
-                out.append([int(i) for i in np.nonzero(m_arr)[0]])
-            else:
-                idxs = [int(i) for i in m_arr.reshape(-1)]
-                assert all(0 <= a < n_b[b] for a in idxs), (
-                    f"movable index out of range for structure {b} "
-                    f"(n_atoms={n_b[b]}): {idxs}")
-                out.append(idxs)
-        return out
+    # _resolve_movable is byte-identical to BatchCalcABC's -> inherited (deleted here).
 
     def _movable_tensors(self, movable_masks):
         """Return (movable_atom (N,) bool, movable_la (B,nmax_a) bool). Both reduce to
@@ -422,7 +382,7 @@ class MACEPolBatchCalc:
         if self.coupling_mode == "sequential":
             return self._ef_sequential()
         E_eV, F_all_eV, _ = self._forward_single_graph(self.coord, need_graph=False)
-        F_eV = self._scatter_forces(F_all_eV.detach().to(dtype))
+        F_eV = self._pad_forces(F_all_eV.detach().to(dtype))
         return (E_eV.detach() * EV2HARTREE, F_eV * EV2HARTREE)
 
     def get_efh_gpu(self, movable_masks=None):
@@ -526,7 +486,7 @@ class MACEPolBatchCalc:
         N, nmax, nmax_a = self.N_atoms, self.nmax_dof, self.Nmax_atoms
         E_eV, F_all_eV, coord_leaf = self._forward_single_graph(self.coord, need_graph=True)
         s = self._ptr[:-1]; n_b = self._n_b; n_b_list = n_b.tolist()
-        F_eV = self._scatter_forces(F_all_eV.to(dtype))
+        F_eV = self._pad_forces(F_all_eV.to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
         movable_atom, movable_la = self._movable_tensors(movable_masks)
@@ -555,7 +515,7 @@ class MACEPolBatchCalc:
         E_eV, F_all_eV, _ = self._forward_single_graph(self.coord, need_graph=False)
         base_coord = self.coord.clone()
         s = self._ptr[:-1]; n_b = self._n_b; n_b_list = n_b.tolist()
-        F_eV = self._scatter_forces(F_all_eV.detach().to(dtype))
+        F_eV = self._pad_forces(F_all_eV.detach().to(dtype))
         H_eV = torch.zeros((B, nmax, nmax), dtype=dtype, device=device)
         P = (nmax_a - n_b).to(torch.int64)
         movable_atom, movable_la = self._movable_tensors(movable_masks)

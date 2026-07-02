@@ -22,10 +22,16 @@ Target model format = the 6-positional-arg "general" MACE wrapper used by
     model(positions, node_attrs, edge_index, shifts, batch, ptr) -> total_energy (B,)  [eV]
 Master coords are float64 (this wrapper is f64, matching the single calc). Gas phase only.
 
-Contract matches AIMNet2BatchCalc exactly: prepare / step_cart_ / set_coords_ /
-backup_coords / restore_coords / get_ef_gpu -> (E_Ha(B,), F_Ha(B,nmax_dof)) /
-get_efh_gpu -> (E_Ha, F_Ha, H_Ha(B,nmax,nmax), P(B,) padding-atom count).
-Units: Hartree, Hartree/Angstrom (model returns eV; EV2HARTREE=1/27.211386245988).
+Retrofit (2026): inherits ``BatchCalcABC`` -- the base owns prepare()'s
+ptr/mol_idx/numbers/_cols/coord/nmax_dof (+ PBC fail-fast + fixed_nmax validation),
+the coord ops (step_cart_/set_coords_/backup_coords/restore_coords), _resolve_movable,
+_pad_forces, unit conversion, and get_ef_gpu. This class keeps ONLY the model-specific
+surface: the multi-graph forward (_forward / _forward_ef_ / _build_edges), the block-
+diagonal seeded analytic Hessian + FD fallback with auto double-backward probe
+(get_efh_gpu / _efh_analytic / _efh_fd), _scatter_forces, and the topology cache
+(_build_topology: node_attrs / candidate pairs / _base). get_ef_gpu -> (E_Ha(B,),
+F_Ha(B,nmax_dof)); get_efh_gpu -> (E_Ha, F_Ha, H_Ha(B,nmax,nmax), P(B,) padding count).
+Units: Hartree, Hartree/Angstrom (model returns eV; EV2HARTREE imported from the base).
 
 VALIDATION STATUS (2026-06-26): the model-free logic (batch collation, block-diagonal
 offset edges, vectorized step_cart_/scatter) is unit-tested. The E/F-vs-single and
@@ -42,8 +48,11 @@ import numpy as np
 from typing import List, Sequence
 from ase import Atoms
 
-EV2HARTREE = 1.0 / 27.211386245988
-EH2EV = 27.211386245988
+from ..batch_calculator_base import (  # noqa: E402
+    BatchCalcABC,
+    EV2HARTREE,
+    register_batch_calculator,
+)
 
 
 def _one_hot_node_attrs(Z: torch.Tensor, atomic_number_table: Sequence[int],
@@ -57,8 +66,19 @@ def _one_hot_node_attrs(Z: torch.Tensor, atomic_number_table: Sequence[int],
     return eq.to(dtype)
 
 
-class MACEBatchCalc:
+@register_batch_calculator
+class MACEBatchCalc(BatchCalcABC):
     """Batched standard-MACE calculator (true multi-graph). See module docstring."""
+
+    # ---- capability protocol (BatchCalcABC declarative attrs) --------------
+    MODEL_NAMES = ("mace",)
+    MODEL_ENERGY_UNIT = "eV"                  # model returns eV / eV.A^-1; base -> Hartree once
+    MODEL_DTYPE = torch.float64               # standard MACE wrapper is f64 (master coord f64)
+    SUPPORTS_PBC = False                      # gas-phase molecular wrapper
+    SUPPORTED_HESSIAN_MODES = ("numerical", "autograd")  # auto double-backward probe -> fd fallback
+    HAS_HVP = False
+    SUPPORTS_COUPLING = False                 # pure local MLIP; block-diagonal batch is isolated
+    BATCHABLE = True                          # true multi-graph batching (unless trace-locked)
 
     def __init__(self,
                  device: str = "cuda",
@@ -71,9 +91,11 @@ class MACEBatchCalc:
             raise ValueError(
                 f"MACEBatchCalc is gas-phase ONLY; got solvent={solvent!r}.")
 
-        self.device = torch.device(device)
-        self.dtype = dtype                            # standard MACE wrapper is f64
-        self.mdtype = dtype
+        # base.__init__ resolves device (torch.device) + dtype and inits the generic
+        # prepared-state (_prepared / _atoms_B / _ptr / numbers / mol_idx / _local_atom /
+        # _n_b / _cols / coord / N_atoms / Nmax_atoms / nmax_dof / _coord_backup).
+        super().__init__(device, dtype)
+        self.mdtype = dtype                           # standard MACE wrapper is f64
         self._model_name = model
 
         if model_path is None:
@@ -88,25 +110,13 @@ class MACEBatchCalc:
         self.r_max = float(self.model.r_max)
         self.atomic_numbers = [int(z) for z in self.model.atomic_numbers]
 
+        # ---- model-specific runtime state ONLY (base.__init__ set the generic layout).
         self._batch_native = None     # set by probe: True if model accepts B>1
         self._hess_mode = None        # 'analytic' | 'fd'
-
-        # buffers
-        self._prepared = False
-        self._atoms_B = 0
-        self._ptr = None
-        self.numbers = None
-        self.node_attrs = None
-        self.mol_idx = None
-        self.coord = None
-        self.N_atoms = 0
-        self.Nmax_atoms = 0
-        self.nmax_dof = 0
-        self.cand_i = None
+        self.node_attrs = None        # one-hot species (built in _build_topology)
+        self.cand_i = None            # block-diagonal intra-mol candidate pairs
         self.cand_j = None
-        self._base = None
-        self._n_b = None
-        self._coord_backup = None
+        self._base = None             # flat x-slot scatter map (mol*nmax_dof + 3*local_atom)
 
         try:
             self._probe_batch_native()
@@ -115,10 +125,14 @@ class MACEBatchCalc:
 
     # =====================================================================
     def prepare(self, atoms_list: List[Atoms], fixed_nmax: int = None):
-        device, dtype = self.device, self.dtype
-        B = len(atoms_list)
-        self._atoms_B = B
+        """Fix topology for a batch of B molecules.
 
+        MACE-specific pre-check: reject a multi-graph batch when the traced ``.pt``
+        is single-graph-locked (per-graph scatter ``dim_size`` frozen to 1). Then
+        delegate to ``BatchCalcABC.prepare`` (builds ptr/mol_idx/numbers/_cols/coord/
+        nmax_dof + PBC fail-fast + fixed_nmax validation, then calls _build_topology).
+        """
+        B = len(atoms_list)
         if self._batch_native is None:
             try:
                 self._probe_batch_native()
@@ -130,40 +144,33 @@ class MACEBatchCalc:
                 "(B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest "
                 "a multi-graph batch. Re-export the model batch-generic, or run molecules "
                 "one at a time. (This is the same trace-lock that affects MACE-POL.)")
+        super().prepare(atoms_list, fixed_nmax)
 
-        ptr = [0]
-        nums, mids, coords = [], [], []
-        for i, at in enumerate(atoms_list):
-            Z = torch.tensor(at.get_atomic_numbers(), dtype=torch.int64, device=device)
-            n = int(Z.shape[0])
-            ptr.append(ptr[-1] + n)
-            nums.append(Z)
-            mids.append(torch.full((n,), i, dtype=torch.int64, device=device))
-            coords.append(torch.tensor(at.get_positions(), dtype=dtype, device=device))
+    # -------------------------------------------------------- topology hook
+    def _build_topology(self, atoms_list):
+        """Cache MACE-specific batch topology (called at the END of prepare()).
 
-        self._ptr = torch.tensor(ptr, dtype=torch.int64, device=device)
-        self.numbers = torch.cat(nums) if nums else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.mol_idx = torch.cat(mids) if mids else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.coord = (torch.cat(coords).contiguous() if coords
-                      else torch.zeros((0, 3), dtype=dtype, device=device))
-        self.N_atoms = int(self.numbers.numel())
-        self.Nmax_atoms = int(max((len(at) for at in atoms_list), default=0))
-        self.nmax_dof = (3 * self.Nmax_atoms) if fixed_nmax is None else int(fixed_nmax)
+        base.prepare() already built ptr/numbers/mol_idx/_local_atom/_n_b/_cols/coord/
+        nmax_dof. Here we cache the one-hot node_attrs, the flat x-slot scatter base
+        (``_base`` = mol_idx*nmax_dof + 3*local_atom, used by _scatter_forces -- the same
+        map _cols encodes), and the block-diagonal intra-molecule candidate pairs used by
+        _build_edges to build the radius graph each forward.
+        """
+        device = self.device
+        self.node_attrs = (
+            _one_hot_node_attrs(self.numbers, self.atomic_numbers, self.mdtype)
+            if self.N_atoms > 0
+            else torch.zeros((0, len(self.atomic_numbers)), dtype=self.mdtype, device=device)
+        )
 
-        self.node_attrs = (_one_hot_node_attrs(self.numbers, self.atomic_numbers, self.mdtype)
-                           if self.N_atoms > 0
-                           else torch.zeros((0, len(self.atomic_numbers)), dtype=self.mdtype, device=device))
-
-        s = self._ptr[:-1]; t = self._ptr[1:]
-        self._n_b = (t - s)
         if self.N_atoms > 0:
-            local_idx = torch.arange(self.N_atoms, device=device) - s[self.mol_idx]
-            self._base = self.mol_idx * self.nmax_dof + 3 * local_idx
+            self._base = self.mol_idx * self.nmax_dof + 3 * self._local_atom
         else:
             self._base = torch.zeros((0,), dtype=torch.int64, device=device)
 
+        s = self._ptr[:-1]
         ci, cj = [], []
-        for b in range(B):
+        for b in range(self._atoms_B):
             n = int(self._n_b[b].item()); off = int(s[b].item())
             if n >= 2:
                 iu, ju = torch.triu_indices(n, n, offset=1, device=device)
@@ -171,41 +178,8 @@ class MACEBatchCalc:
         self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
         self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
 
-        self._coord_backup = None
-        self._prepared = True
-
-    # =====================================================================
-    # coordinate ops (shared, vectorized)
-    # =====================================================================
-    @torch.no_grad()
-    def step_cart_(self, s_cart: torch.Tensor):
-        assert self._prepared, "call prepare() first"
-        B = self._atoms_B
-        assert s_cart.shape == (B, self.nmax_dof), \
-            f"step_cart_ expects (B,{self.nmax_dof}), got {tuple(s_cart.shape)}"
-        if self.N_atoms == 0:
-            return
-        s_flat = s_cart.reshape(-1).to(self.device, self.dtype)
-        base = self._base
-        disp = torch.stack([s_flat[base], s_flat[base + 1], s_flat[base + 2]], dim=1)
-        self.coord.add_(disp)
-
-    @torch.no_grad()
-    def set_coords_(self, coord: torch.Tensor):
-        assert self._prepared, "call prepare() first"
-        assert coord.shape == (self.N_atoms, 3)
-        self.coord.copy_(coord.to(self.device, self.dtype))
-
-    @torch.no_grad()
-    def backup_coords(self):
-        if self._prepared:
-            self._coord_backup = self.coord.clone()
-
-    @torch.no_grad()
-    def restore_coords(self):
-        if self._coord_backup is not None:
-            self.coord.copy_(self._coord_backup)
-            self._coord_backup = None
+    # step_cart_ / set_coords_ / backup_coords / restore_coords / _resolve_movable are
+    # identical to BatchCalcABC's -> inherited (deleted here).
 
     # =====================================================================
     # forward (true multi-graph)
@@ -245,6 +219,23 @@ class MACEBatchCalc:
                                    create_graph=need_graph, retain_graph=need_graph)[0]
         return E_eV.to(self.dtype), -grad, coord_leaf
 
+    def _forward(self, coord: torch.Tensor, need_graph: bool):
+        """BatchCalcABC forward-contract adapter over the MACE multi-graph forward.
+
+        Returns (E_eV (B,), F_all_eV (N,3), leaf|None) in NATIVE eV -- the base's
+        get_ef_gpu converts to Hartree ONCE via MODEL_ENERGY_UNIT (do NOT scale by
+        EV2HARTREE here). Thin wrapper over ``_forward_ef_`` (which the model-specific
+        Hessian overrides call directly, using its always-returned coord_leaf):
+          * need_graph=False -> detached values + leaf None, byte-identical to the
+            pre-retrofit get_ef_gpu (which detached E and the FD force field);
+          * need_graph=True  -> the grad-carrying force field + the requires_grad
+            position leaf, so the base's generic seeded-autograd Hessian can consume it.
+        """
+        E_eV, F_all_eV, coord_leaf = self._forward_ef_(coord, need_graph=need_graph)
+        if need_graph:
+            return E_eV, F_all_eV, coord_leaf
+        return E_eV.detach(), F_all_eV.detach(), None
+
     def _scatter_forces(self, F_all: torch.Tensor) -> torch.Tensor:
         B = self._atoms_B
         F_flat = torch.zeros(B * self.nmax_dof, dtype=self.dtype, device=self.device)
@@ -256,37 +247,11 @@ class MACEBatchCalc:
     # =====================================================================
     # partial-Hessian (movable-atom subspace) helpers -- mirror UMABatchCalc
     # =====================================================================
-    def _resolve_movable(self, movable_masks):
-        """Per-structure list[int] of atom indices whose DOFs are perturbed.
-        None = all atoms; per-structure None/bool-mask/index-list otherwise. Frozen
-        atoms still appear in every forward (they exert forces); only their Hessian
-        rows/cols are omitted (exact FixAtoms-constrained PES block). Mirrors
-        UMABatchCalc._resolve_movable so all backends agree."""
-        B = self._atoms_B
-        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
-        if movable_masks is None:
-            return [list(range(n_b[b])) for b in range(B)]
-        out = []
-        for b in range(B):
-            m = movable_masks[b]
-            if m is None:
-                out.append(list(range(n_b[b])))
-                continue
-            m_arr = np.asarray(m)
-            if m_arr.dtype == bool:
-                out.append([int(i) for i in np.nonzero(m_arr)[0]])
-            else:
-                idxs = [int(i) for i in m_arr.reshape(-1)]
-                assert all(0 <= a < n_b[b] for a in idxs), (
-                    f"movable index out of range for structure {b} "
-                    f"(n_atoms={n_b[b]}): {idxs}")
-                out.append(idxs)
-        return out
-
     def _movable_tensors(self, movable_masks):
         """Return (movable_atom (N,) bool, movable_la (B,nmax_a) bool). Both all-True
         within each structure's real-atom range when movable_masks is None, so the
-        seeded loop reduces byte-identically to the full Hessian."""
+        seeded loop reduces byte-identically to the full Hessian. Uses the inherited
+        ``_resolve_movable`` (identical to the pre-retrofit local copy)."""
         N, B, nmax_a = self.N_atoms, self._atoms_B, self.Nmax_atoms
         device = self.device
         mov = self._resolve_movable(movable_masks)
@@ -301,23 +266,17 @@ class MACEBatchCalc:
         return movable_atom, movable_la
 
     # =====================================================================
-    def get_ef_gpu(self):
-        B = self._atoms_B
-        device, dtype = self.device, self.dtype
-        if B == 0:
-            return (torch.zeros((0,), dtype=dtype, device=device),
-                    torch.zeros((0, 0), dtype=dtype, device=device))
-        E_eV, F_all_eV, _ = self._forward_ef_(self.coord, need_graph=False)
-        F_eV = self._scatter_forces(F_all_eV.detach().to(dtype))
-        return (E_eV.detach() * EV2HARTREE, F_eV * EV2HARTREE)
-
+    # get_ef_gpu is the generic forward->pad->convert pattern -> inherited from
+    # BatchCalcABC (deleted here); _forward returns native eV and the base converts.
+    # =====================================================================
     def get_efh_gpu(self, movable_masks=None):
         """Energy + forces + per-structure Hessian. ``movable_masks`` (mirrors
         UMABatchCalc): None = full Hessian (byte-identical current behavior); a
         per-structure spec restricts the perturbed/responding DOFs to a movable-atom
         subspace -> only movable rows/cols filled, frozen atoms still exert forces
         (exact FixAtoms-constrained block). Applies to both the seeded analytic and
-        the FD fallback path identically."""
+        the FD fallback path identically. Mode is auto-selected by probing whether the
+        traced model supports double-backward (analytic) with FD fallback."""
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:

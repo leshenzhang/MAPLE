@@ -81,6 +81,111 @@ def get_registered_batch_calculator(name: str) -> type:
     return _BATCH_REGISTRY[str(name).lower()]
 
 
+# --------------------------------------------------------------------------- #
+# Lazy backend import + generic factory. Importing a backend module runs its    #
+# @register_batch_calculator (populating _BATCH_REGISTRY). Each import is        #
+# guarded so one missing optional dep (torchani / aimnet2calc / a MACE build)   #
+# is skipped instead of sinking registration of the backends that ARE           #
+# importable. Imports stay lazy (inside the helper) so importing THIS module     #
+# never eagerly drags in every backend.                                         #
+# --------------------------------------------------------------------------- #
+_BACKENDS_IMPORTED = False
+
+# Dotted paths for the 7 batch backends (order irrelevant; each self-registers).
+_BATCH_BACKEND_MODULES = (
+    "maple.function.calculator.uma._uma_batch_calculator",
+    "maple.function.calculator.aimnet._aimnet2_batch_calculator",
+    "maple.function.calculator.aimnet._aimnet2_decoupled_batch_calculator",
+    "maple.function.calculator.ani._ani_batch_calculator",
+    "maple.function.calculator.mace._mace_batch_calculator",
+    "maple.function.calculator.mace._mace_autograd_batch_calculator",
+    "maple.function.calculator.mace._macepol_batch_calculator",
+)
+
+
+def _import_batch_backends(force: bool = False) -> list:
+    """Import every backend module so its @register_batch_calculator runs.
+
+    Idempotent (guarded by ``_BACKENDS_IMPORTED``). Each import is wrapped in
+    try/except so a backend whose optional dependency is missing (torchani /
+    aimnet2calc / a specific MACE build) is skipped rather than breaking
+    registration of the importable backends. Returns the module paths that
+    failed to import (for diagnostics).
+    """
+    global _BACKENDS_IMPORTED
+    failed = []
+    if _BACKENDS_IMPORTED and not force:
+        return failed
+    import importlib
+    for mod in _BATCH_BACKEND_MODULES:
+        try:
+            importlib.import_module(mod)
+        except Exception:  # noqa: BLE001 - optional-dep guard; keep the registry alive
+            failed.append(mod)
+    _BACKENDS_IMPORTED = True
+    return failed
+
+
+def make_batch_calc(model, model_path=None, device="cuda", dtype=None, **opts):
+    """Build a GPU-batched calculator by registered ``model`` name.
+
+    Backend-agnostic front door to the batch registry: lazily imports the 7
+    backend modules (so their ``@register_batch_calculator`` populates
+    ``_BATCH_REGISTRY``), looks up the class for ``model`` (case-insensitive),
+    and constructs it, forwarding ONLY the arguments that class's ``__init__``
+    actually accepts (the 7 constructors are heterogeneous).
+
+    Args:
+      model: registered batch-calc name -- 'uma', 'aimnet2', 'aimnet2_decoupled',
+        'ani2x'/'ani1x'/..., 'mace', 'mace_autograd', 'macepols'/'macepolm'/'macepoll'.
+      model_path: checkpoint / traced-model path; forwarded (as ``None`` when
+        None -- NOT the string 'None') whenever the backend declares a
+        ``model_path`` arg, so a path-less ANI/MACE/MACE-POL falls back to its
+        own local model dir. Backends without the arg (AIMNet2-decoupled) ignore it.
+      device: 'cuda'|'cpu'|'gpu*'|'auto' token (backend _resolve_device normalizes).
+      dtype: torch dtype; forwarded only when not None (else backend default, f64).
+      **opts: backend-specific extras (task=, cutoff=, coupling_mode=,
+        hessian_mode=, ...) forwarded verbatim; a caller-supplied opt wins over
+        the derived device/dtype/model_path/model defaults.
+
+    Raises ValueError when ``model`` is not a registered batch-calc name (lists
+    the available names).
+    """
+    import inspect
+
+    key = str(model).lower().strip()
+    _import_batch_backends()
+    try:
+        cls = get_registered_batch_calculator(key)
+    except KeyError:
+        avail = ", ".join(sorted(_BATCH_REGISTRY)) or "<none importable>"
+        raise ValueError(
+            f"No batch calculator registered for model {model!r}. Available: {avail}."
+        )
+
+    params = inspect.signature(cls).parameters   # __init__ minus self
+    _has = params.__contains__                    # forward only EXPLICIT ctor args
+
+    kwargs = dict(opts)                           # caller opts win over derived below
+    if _has("device"):
+        kwargs.setdefault("device", device)
+    if dtype is not None and _has("dtype"):
+        kwargs.setdefault("dtype", dtype)
+    # Forward model_path whenever the ctor declares it -- INCLUDING None, which is
+    # the local-model-dir sentinel for ANI/MACE/MACE-POL (ANI's model_path is a
+    # required positional, so omitting it would raise). Never stringify None.
+    if _has("model_path"):
+        kwargs.setdefault(
+            "model_path", str(model_path) if model_path is not None else None)
+    # A class registered under >1 name selects its variant by the lookup name
+    # (ANI: ani2x/ani1x/...; MACE-POL: macepols/macepolm/macepoll). Single-name
+    # backends keep their own ``model`` default unless the caller overrides via opts.
+    if len(getattr(cls, "MODEL_NAMES", ())) > 1 and _has("model"):
+        kwargs.setdefault("model", key)
+
+    return cls(**kwargs)
+
+
 def _resolve_device(device) -> torch.device:
     """Map a 'cuda'/'gpu*'/'cpu'/'auto'/'' token (or torch.device) to a device.
 

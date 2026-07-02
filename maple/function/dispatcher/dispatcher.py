@@ -77,16 +77,42 @@ def resolve_batched_calc(params, atoms_list, attached_calc=None):
       1. ``params['batched_calc']``        -- a pre-built batched calc instance.
       2. ``attached_calc`` already batch-capable (duck-typed prepare+get_ef_gpu),
          e.g. a UMABatchCalc someone attached by hand (the sp pattern).
-      3. ``params['batch_model_path']``    -- build a UMABatchCalc from the .pt.
-      4. derive a UMABatchCalc from the SAME UMA checkpoint the engine's single
-         calculator already uses, so a plain '#model=uma(...)' multi-structure
-         job needs NO extra params (the normal job-interface path).
+      3/4. registry-driven build for ANY registered backend via
+         ``make_batch_calc(model_name, model_path=...)`` -- MACE / ANI / AIMNet2 /
+         MACE-POL / decoupled build from ``params['batch_model_path']`` or their
+         own local model dir. UMA keeps its dedicated fallback: derive the SAME
+         UMA checkpoint the engine's single calc uses, so a plain '#model=uma(...)'
+         multi-structure job needs NO extra params (the normal job-interface path).
     """
     calc = params.get("batched_calc")
     if calc is not None:
         return calc
     if _is_batch_calc(attached_calc):
         return attached_calc
+
+    import torch
+
+    # Bare registry token (drop any '(...)' options tail) + UMA detection. Only
+    # UMA models carry the 'uma' substring among the registered backends.
+    model_str = str(params.get("model") or "").lower()
+    model_name = model_str.split("(")[0].strip()
+    is_uma = ("uma" in model_str) or (
+        attached_calc is not None
+        and type(attached_calc).__name__ == "UMACalculator")
+
+    # Path 3/4 (non-UMA registered backends): route through the generic factory.
+    if model_name and not is_uma:
+        from ..calculator.batch_calculator_base import make_batch_calc
+        return make_batch_calc(
+            model_name,
+            model_path=params.get("batch_model_path"),
+            device=batch_device_str(params),
+            dtype=params.get("batch_dtype", torch.float64),
+            **(params.get("batch_model_options") or {}),
+        )
+
+    # UMA fallback (default + explicit '#model=uma(...)'): preserve the EXACT
+    # checkpoint auto-derive + UMABatchCalc construction the single calc uses.
     model_path = params.get("batch_model_path") or _derive_uma_checkpoint_path(
         params, attached_calc)
     if not model_path:
@@ -95,7 +121,6 @@ def resolve_batched_calc(params, atoms_list, attached_calc=None):
             "params['batched_calc'] or params['batch_model_path'], attach a "
             "batch-capable calculator, or use '#model=uma(...)' so the batched "
             "UMA checkpoint is auto-resolved from the local model directory.")
-    import torch
     from ..calculator.uma._uma_batch_calculator import UMABatchCalc
     return UMABatchCalc(
         str(model_path),

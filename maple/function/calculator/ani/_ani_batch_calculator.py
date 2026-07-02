@@ -24,16 +24,19 @@ edges). Padding atoms use torchani's universal dummy convention ``species = -1``
 ``AEVComputer`` / ``ANIModel`` skip dummy atoms), so a padded row's dummy atoms
 contribute zero energy and receive zero force. The perturb-one / 3-identical-far-
 apart decouple gate gives dE_others == 0 and batch E/F == isolated E/F to fp tol.
+This is why ``SUPPORTS_COUPLING = False`` (perturbing one molecule cannot leak).
 
 Hartree-native units
 --------------------
 ANI's TorchScript checkpoints return Hartree directly (MODEL_ENERGY_UNIT =
 'hartree' in ``_ani_calculator.py``); coordinates are Angstrom. So ``E`` is Ha,
 ``F = -dE/dx`` is Ha/A, and the Hessian ``d^2E/dx^2`` is Ha/A^2 with NO eV->Ha
-conversion (contrast UMA/MACE which multiply by EV2HARTREE). The model wrapper is
-float32 (matching the single ``ANICalculator``), so the forward bridges through
-f32 while the master coordinate tensor is kept f64 for the contract; E/F/H are
-returned in f64.
+conversion (contrast UMA/MACE which multiply by EV2HARTREE). Because
+``MODEL_ENERGY_UNIT = 'hartree'``, the base's ``_to_hartree`` is a NO-OP, so
+``_forward`` returns native Hartree and no scaling is applied anywhere. The model
+wrapper is float32 (matching the single ``ANICalculator``), so the forward
+bridges through f32 while the master coordinate tensor is kept f64 for the
+contract; E/F/H are returned in f64.
 
 Forces and Hessian are BOTH autograd (torchani is fully twice-differentiable)
 -----------------------------------------------------------------------------
@@ -72,6 +75,10 @@ Contract (mirrors UMABatchCalc / MACEBatchCalc / AIMNet2BatchCalc EXACTLY)
                       H_Ha (B, nmax_dof, nmax_dof), P (B,) int64)
     hvp(v: (B, nmax_dof)) -> Hn_Ha (B, nmax_dof)
 Units: Hartree, Hartree/Angstrom, Hartree/Angstrom^2. Gas phase only (no PBC).
+Retrofit: inherits ``BatchCalcABC`` (prepare/topology/coord-ops/get_ef_gpu/pad/
+unit-conversion/registry are the shared base); this file overrides ONLY the
+model-specific surface (``_build_topology`` species pad, ``_forward`` /
+``_forward_ef_``, the ANI autograd Hessian / HVP, get_efh_gpu dispatch).
 
 References for the autograd Hessian / HVP
 -----------------------------------------
@@ -85,14 +92,20 @@ References for the autograd Hessian / HVP
 """
 
 import os
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import numpy as np
 import torch
 from ase import Atoms
 
+from ..batch_calculator_base import (  # noqa: E402
+    BatchCalcABC,
+    register_batch_calculator,
+)
 
-class ANIBatchCalc:
+
+@register_batch_calculator
+class ANIBatchCalc(BatchCalcABC):
     """Batched ANI (torchani) calculator -- native (species, coords) batching.
 
     One ``prepare()`` fixes the topology (padded species + scatter maps) of a
@@ -103,6 +116,17 @@ class ANIBatchCalc:
     Hartree-native, so outputs are Hartree / Hartree-per-Angstrom directly.
     """
 
+    # ---- capability protocol (BatchCalcABC declarative attrs) --------------
+    MODEL_NAMES = ("ani2x", "ani1x", "ani1ccx", "ani1xnr")  # mirror single ANICalculator
+    MODEL_ENERGY_UNIT = "hartree"            # ANI is Hartree-native; base _to_hartree is a no-op
+    MODEL_DTYPE = torch.float32              # ANI TorchScript wrapper is f32 (master coord stays f64)
+    SUPPORTS_PBC = False                     # gas-phase molecular batch only
+    SUPPORTED_HESSIAN_MODES = ("numerical", "autograd")  # numerical = default + parity oracle
+    HAS_HVP = True                           # autograd batched H@v (BPRFO / dimer consumer)
+    SUPPORTS_COUPLING = False                # pure local potential; rows are isolated by construction
+    BATCHABLE = True                         # torchani batches B>1 over the row dimension natively
+
+    # Back-compat lowercase alias (pre-retrofit callers / sibling backends read this).
     supported_hessian_modes = ("numerical", "autograd")
 
     def __init__(self,
@@ -129,10 +153,11 @@ class ANIBatchCalc:
                 "single ANICalculator for d4=True, or run d4 as a separate "
                 "per-molecule correction.")
 
-        dev = str(device)
-        dev = "cuda" if dev.startswith("cuda") else "cpu"
-        self.device = torch.device(dev)
-        self.dtype = dtype                 # master coord dtype (f64)
+        # base.__init__ resolves device (-> torch.device) + dtype and inits the
+        # generic prepared-state (_prepared / _atoms_B / _ptr / numbers / mol_idx /
+        # _local_atom / _n_b / _cols / coord / N_atoms / Nmax_atoms / nmax_dof /
+        # _coord_backup); do NOT re-init those here.
+        super().__init__(device, dtype)
         self.mdtype = torch.float32        # ANI TorchScript wrapper is f32
         self._model_name = model
 
@@ -161,21 +186,12 @@ class ANIBatchCalc:
 
         self._n_forward = 0   # model-forward counter (algorithmic-cost verification)
 
-        # prepare() state
-        self._prepared = False
-        self._atoms_B = 0
-        self._ptr = None
-        self.numbers = None
-        self.mol_idx = None
+        # ---- model-specific prepared-state ONLY. base.__init__ already inits the
+        #      generic layout state; these three are ANI-specific (built in
+        #      _build_topology at the end of prepare()).
         self._local_idx = None
-        self.coord = None
-        self.N_atoms = 0
-        self.Nmax_atoms = 0
-        self.nmax_dof = 0
         self._base = None
-        self._n_b = None
         self._species_pad = None
-        self._coord_backup = None
 
     # ------------------------------------------------------------------ utils
     def reset_fwd_count(self):
@@ -185,46 +201,23 @@ class ANIBatchCalc:
     def n_forward(self) -> int:
         return self._n_forward
 
-    # =====================================================================
-    def prepare(self, atoms_list: List[Atoms], fixed_nmax: int = None):
-        """Fix topology (padded species + scatter maps) + initial coords.
+    # -------------------------------------------------------- topology hook
+    def _build_topology(self, atoms_list):
+        """Cache ANI-specific batch topology: the per-atom scatter base + the
+        padded species tensor (``species = -1`` dummy padding).
 
-        ``fixed_nmax`` (optional) overrides the padded per-structure DOF size so a
-        batch-PRFO driver can share one padded layout across iterations (matches
-        the UMA/MACE/AIMNet2 batch semantics).
+        Called at the END of ``BatchCalcABC.prepare()`` -- which already built
+        ptr/numbers/mol_idx/_local_atom/_n_b/coord/_cols/nmax_dof (with the shared
+        ``fixed_nmax`` validation) and reset ``_coord_backup``. ANI's forward /
+        scatter helpers reference ``self._local_idx`` (base's ``_local_atom``) and
+        ``self._base`` (identical map to base's ``_cols``), so alias / build them
+        here. The padded species is geometry-INDEPENDENT, so it is built ONCE here
+        and reused on every forward.
         """
-        device, dtype = self.device, self.dtype
-        B = len(atoms_list)
-        self._atoms_B = B
-
-        if any(bool(np.any(getattr(at, "pbc", False))) for at in atoms_list):
-            raise NotImplementedError(
-                "ANIBatchCalc is a no-PBC molecular batch calculator.")
-
-        ptr = [0]
-        nums, mids, locs, coords = [], [], [], []
-        for i, at in enumerate(atoms_list):
-            Z = torch.tensor(at.get_atomic_numbers(), dtype=torch.int64, device=device)
-            n = int(Z.shape[0])
-            ptr.append(ptr[-1] + n)
-            nums.append(Z)
-            mids.append(torch.full((n,), i, dtype=torch.int64, device=device))
-            locs.append(torch.arange(n, dtype=torch.int64, device=device))
-            coords.append(torch.tensor(at.get_positions(), dtype=dtype, device=device))
-
-        self._ptr = torch.tensor(ptr, dtype=torch.int64, device=device)
-        self.numbers = torch.cat(nums) if nums else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.mol_idx = torch.cat(mids) if mids else torch.zeros((0,), dtype=torch.int64, device=device)
-        self._local_idx = torch.cat(locs) if locs else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.coord = (torch.cat(coords).contiguous() if coords
-                      else torch.zeros((0, 3), dtype=dtype, device=device))
-        self.N_atoms = int(self.numbers.numel())
-        self.Nmax_atoms = int(max((len(at) for at in atoms_list), default=0))
-        self.nmax_dof = (3 * self.Nmax_atoms) if fixed_nmax is None else int(fixed_nmax)
-
-        s = self._ptr[:-1]
-        t = self._ptr[1:]
-        self._n_b = (t - s)
+        device = self.device
+        B = self._atoms_B
+        # ANI helpers' name for base's _local_atom (values identical).
+        self._local_idx = self._local_atom
 
         # scatter map: global atom g (mol b, local a) -> flat (B, nmax_dof) base col
         if self.N_atoms > 0:
@@ -238,41 +231,10 @@ class ANIBatchCalc:
         if self.N_atoms > 0:
             self._species_pad[self.mol_idx, self._local_idx] = self.numbers
 
-        self._coord_backup = None
-        self._prepared = True
-
-    # =====================================================================
-    # coordinate ops (shared, vectorized)
-    # =====================================================================
-    @torch.no_grad()
-    def step_cart_(self, s_cart: torch.Tensor):
-        assert self._prepared, "call prepare() first"
-        B = self._atoms_B
-        assert s_cart.shape == (B, self.nmax_dof), \
-            f"step_cart_ expects (B,{self.nmax_dof}), got {tuple(s_cart.shape)}"
-        if self.N_atoms == 0:
-            return
-        s_flat = s_cart.reshape(-1).to(self.device, self.dtype)
-        base = self._base
-        disp = torch.stack([s_flat[base], s_flat[base + 1], s_flat[base + 2]], dim=1)
-        self.coord.add_(disp)
-
-    @torch.no_grad()
-    def set_coords_(self, coord: torch.Tensor):
-        assert self._prepared, "call prepare() first"
-        assert coord.shape == (self.N_atoms, 3)
-        self.coord.copy_(coord.to(self.device, self.dtype))
-
-    @torch.no_grad()
-    def backup_coords(self):
-        if self._prepared:
-            self._coord_backup = self.coord.clone()
-
-    @torch.no_grad()
-    def restore_coords(self):
-        if self._coord_backup is not None:
-            self.coord.copy_(self._coord_backup)
-            self._coord_backup = None
+    # step_cart_ / set_coords_ / backup_coords / restore_coords / _resolve_movable
+    # are identical to BatchCalcABC's -> inherited (deleted here). base.step_cart_
+    # uses self._cols (== self._base map) and is byte-identical to the old stack-
+    # based ANI displacement.
 
     # =====================================================================
     # forward (native species/coordinates batching)
@@ -324,6 +286,24 @@ class ANIBatchCalc:
                                 create_graph=need_graph, retain_graph=need_graph)[0]
         return E.to(self.dtype), (-g), coord_leaf
 
+    def _forward(self, coord: torch.Tensor, need_graph: bool = False):
+        """BatchCalcABC forward-contract adapter over ANI's native ``_forward_ef_``.
+
+        Returns ``(E (B,), F_all (N,3), leaf|None)`` in NATIVE Hartree units (ANI
+        is Hartree-native; the base's ``_to_hartree`` is a no-op for
+        ``MODEL_ENERGY_UNIT='hartree'``, so NO unit conversion happens here or in
+        the base). Delegates to ``_forward_ef_`` (the model-specific fused forward
+        that every Hessian / HVP path uses) so the forward math is byte-identical;
+        for ``need_graph=False`` the energy / forces are detached and ``leaf`` is
+        dropped to ``None`` per the base contract (matching the old ``get_ef_gpu``
+        ``.detach()``). ``need_graph=True`` returns the grad-enabled force field +
+        the requires_grad position leaf for the base's generic ``_efh_analytic``.
+        """
+        E, F_all, leaf = self._forward_ef_(coord, need_graph=need_graph)
+        if need_graph:
+            return E, F_all, leaf
+        return E.detach(), F_all.detach(), None
+
     def _scatter_forces(self, F_all: torch.Tensor) -> torch.Tensor:
         """(N,3) per-atom -> (B, nmax_dof) padded per structure."""
         B = self._atoms_B
@@ -343,17 +323,10 @@ class ANIBatchCalc:
         return torch.stack([v_flat[base], v_flat[base + 1], v_flat[base + 2]], dim=1)
 
     # =====================================================================
-    def get_ef_gpu(self):
-        """Energy + forces from one batched forward (1 forward + 1 backward)."""
-        B = self._atoms_B
-        device, dtype = self.device, self.dtype
-        if B == 0:
-            return (torch.zeros((0,), dtype=dtype, device=device),
-                    torch.zeros((0, 0), dtype=dtype, device=device))
-        E_Ha, F_all_Ha, _ = self._forward_ef_(self.coord, need_graph=False)
-        F_Ha = self._scatter_forces(F_all_Ha.detach())
-        return (E_Ha.detach(), F_Ha)
-
+    # get_ef_gpu is the generic (forward -> pad -> convert) pattern; ANI is
+    # Hartree-native so BatchCalcABC.get_ef_gpu (with the _to_hartree no-op)
+    # reproduces the old output byte-for-byte -> inherited (deleted here).
+    # =====================================================================
     def get_efh_gpu(self, movable_masks=None):
         """Energy + forces + per-structure Hessian.
 
@@ -385,27 +358,7 @@ class ANIBatchCalc:
     # =====================================================================
     # partial-Hessian (movable-atom subspace) helpers -- mirror MACEBatchCalc
     # =====================================================================
-    def _resolve_movable(self, movable_masks):
-        B = self._atoms_B
-        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
-        if movable_masks is None:
-            return [list(range(n_b[b])) for b in range(B)]
-        out = []
-        for b in range(B):
-            m = movable_masks[b]
-            if m is None:
-                out.append(list(range(n_b[b])))
-                continue
-            m_arr = np.asarray(m)
-            if m_arr.dtype == bool:
-                out.append([int(i) for i in np.nonzero(m_arr)[0]])
-            else:
-                idxs = [int(i) for i in m_arr.reshape(-1)]
-                assert all(0 <= a < n_b[b] for a in idxs), (
-                    f"movable index out of range for structure {b} "
-                    f"(n_atoms={n_b[b]}): {idxs}")
-                out.append(idxs)
-        return out
+    # _resolve_movable is identical to BatchCalcABC's -> inherited (deleted here).
 
     def _movable_tensors(self, movable_masks):
         N, B, nmax_a = self.N_atoms, self._atoms_B, self.Nmax_atoms

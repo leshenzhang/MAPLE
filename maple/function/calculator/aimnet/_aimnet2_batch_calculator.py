@@ -1,16 +1,39 @@
 # -*- coding: utf-8 -*-
-"""Out-of-scope for the unified MAPLE calculator protocol.
+"""Batched AIMNet2 (charge-equilibration / NSE) calculator for the MAPLE GPU-batch path.
 
-Consumed by BatchLBFGS only; does not implement the CalcABC protocol
-(`_finalize_results`, `_analytic_hessian`, `MODEL_*` class attrs). Keep
-self-contained until a future commit retrofits the batch path.
+Retrofitted onto :class:`BatchCalcABC` (batch_calculator_base.py): the coord ops
+(step_cart_/set_coords_/backup_coords/restore_coords), the ``(B, nmax_dof)``
+pack/scatter, unit conversion, PBC fail-fast, fixed_nmax validation, the movable
+subspace resolver and the registry now come from the base. This subclass keeps
+ONLY the AIMNet2-specific surface: the jit model, the block-diagonal neighbour
+list, the per-molecule energy pooling, the charge/sentinel graph inputs, the
+energy-only ``get_e_gpu`` fast path, and the model-specific SEEDED block-diagonal
+ANALYTIC Hessian (``get_efh_gpu``) that exploits the block-diagonal graph to obtain
+column k of every per-structure Hessian from ONE backward.
+
+Coupling.  The bundled charge-equilibration (NSE) model does a global charge
+equilibration, so this is the COUPLED variant (``SUPPORTS_COUPLING = True``;
+matches eulerpc's ``_COUPLED_BATCH_CALC_NAMES``). It still runs B>1 batches
+mechanically (``BATCHABLE = True``); the cross-reaction-safe decoupled sibling is
+``AIMNet2DecoupledBatchCalc`` (mol_idx-segmented graph, SUPPORTS_COUPLING=False).
+
+Hessian.  AIMNet2's Hessian path is exact autograd (seeded double-backward), so
+``SUPPORTED_HESSIAN_MODES = ('autograd',)`` and ``get_efh_gpu`` is kept as an
+override rather than the base generic ``_efh_analytic`` (the override is the
+block-diagonal-seed optimization: 3*Nmax_atoms backward passes for the WHOLE batch
+instead of 3*N_total). Reference kept as ``_get_efh_gpu_global_ref`` for parity.
+
+Units.  AIMNet2 returns eV / eV.A^-1; the base's ``_to_hartree`` / ``EV2HARTREE``
+is the ONLY unit conversion (this retrofit centralizes the pre-retrofit per-method
+``/EH2EV`` into the single base conversion, killing the divide/multiply split).
 """
 import torch
-from typing import List
-from ase import Atoms
-import numpy as np
 
-EH2EV = 27.211386245988
+from ..batch_calculator_base import (  # noqa: F401
+    BatchCalcABC,
+    EV2HARTREE,
+    register_batch_calculator,
+)
 
 
 def pad_dim0(a: torch.Tensor, value=0) -> torch.Tensor:
@@ -146,132 +169,70 @@ def nblist_block_padded_multi(coord: torch.Tensor, mol_idx: torch.Tensor, cutoff
     return _nblist_block_core(coord, cutoff, ptr, nmax_b, valid, local2global, N)
 
 
-def _ptr_from_atoms(atoms_list: List[Atoms], device) -> torch.Tensor:
-    ptr = [0]
-    for at in atoms_list:
-        ptr.append(ptr[-1] + len(at))
-    return torch.tensor(ptr, dtype=torch.long, device=device)
+@register_batch_calculator
+class AIMNet2BatchCalc(BatchCalcABC):
+    """AIMNet2 (charge-equilibration / NSE) batch calculator.
 
-
-class AIMNet2BatchCalc:
-    """
-    AIMNet2 batch calculator.
+    One ``prepare()`` (BatchCalcABC's) fixes B molecules' topology; thereafter
+    ``get_ef_gpu`` (base generic forward->pad->convert) and ``get_efh_gpu`` (the
+    model-specific seeded block-diagonal analytic Hessian kept below) run batched
+    forwards. Coordinates are the base's f64 master ``coord`` tensor.
     """
 
-    def __init__(self, model_path: str, device: str = "cuda", cutoff: float = 5.0, dtype: torch.dtype = torch.float64):
-        self.device = torch.device(device)
-        self.dtype  = dtype
-        self.model  = torch.jit.load(model_path, map_location=self.device).eval()
+    # ---- capability protocol (BatchCalcABC declarative attrs) --------------
+    MODEL_NAMES = ("aimnet2",)
+    MODEL_ENERGY_UNIT = "eV"                 # AIMNet2 returns eV; base -> Hartree once
+    MODEL_DTYPE = torch.float64              # jit forward runs at the f64 master dtype
+    SUPPORTS_PBC = False                     # no-PBC molecular wrapper
+    SUPPORTED_HESSIAN_MODES = ("autograd",)  # seeded block-diagonal double-backward
+    HAS_HVP = False
+    SUPPORTS_COUPLING = True                 # global charge-eq (NSE) couples molecules
+    BATCHABLE = True                         # runs B>1 (block nblist); not default-raise
+
+    def __init__(self, model_path: str, device: str = "cuda", cutoff: float = 5.0,
+                 dtype: torch.dtype = torch.float64):
+        # base.__init__ resolves device (torch.device via _resolve_device) + dtype
+        # and inits the generic prepared-state (_prepared/_atoms_B/_ptr/numbers/
+        # mol_idx/_local_atom/_n_b/_cols/coord/N_atoms/Nmax_atoms/nmax_dof/
+        # _coord_backup); load the jit model onto the resolved device afterward.
+        super().__init__(device, dtype)
+        self.model = torch.jit.load(model_path, map_location=self.device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 
         self.cutoff = float(cutoff)
 
-        # prepare-related internal buffers
-        self._prepared    = False
-        self._atoms_B     = 0
-        self._ptr         = None
-        self.numbers      = None
-        self.mol_idx      = None
-        self.coord        = None
-        self.N_atoms      = 0
-        self.Nmax_atoms   = 0
-        self.nmax_dof     = 0   # <<< will be overridden if fixed_nmax is provided
+        # ---- model-specific prepared-state ONLY (set in prepare/_build_topology).
+        #      Do NOT re-init the generic layout state base.__init__ already set.
         self.sentinel_mol = 0
         self.charge       = None
 
-        self._coord_backup = None
-
-        # precomputed (set in prepare): block-nblist metadata + flat scatter maps
+        # block-nblist metadata + flat scatter maps (set in _build_topology).
         self._blk_ptr        = None   # (B+1,)
         self._blk_nmax       = 1
         self._blk_valid      = None   # (B, nmax_b) bool
         self._blk_local2g    = None   # (B, nmax_b) int64
-        self._cart_idx_flat  = None   # (3*N,) flat map: real atom DOF -> (B, nmax_dof) flat
-        self._atom_localidx  = None   # (N,) local atom index of each global atom
+        self._cart_idx_flat  = None   # (3*N,) flat map (== base _cols numerically)
+        self._atom_localidx  = None   # (N,) local atom index (== base _local_atom)
 
-    # -------------------------------------------------------------------------
-    # prepare() modified to accept fixed_nmax
-    # -------------------------------------------------------------------------
-    def prepare(self, atoms_list: List[Atoms], fixed_nmax: int = None):
+    # -------------------------------------------------------- topology hook
+    def _build_topology(self, atoms_list):
+        """Cache the AIMNet2-specific batch topology.
+
+        Called at the END of ``BatchCalcABC.prepare()`` -- which already built
+        ptr/numbers/mol_idx/_local_atom/_n_b/_cols/coord/nmax_dof (with the shared
+        fixed_nmax validation + PBC fail-fast) and reset _coord_backup. Here we set
+        the model's charge/sentinel graph inputs and the block-diagonal neighbour
+        list metadata + the flat scatter / local-atom index maps (topology fixed
+        across step/get_* calls; built ONCE to keep the hot path sync-free).
         """
-        Prepare topology & initial coordinates.
-        If fixed_nmax is provided, we override the internal nmax_dof so that
-        PRFO and calculator share the same padded DOF size.
-
-        This is crucial for compatibility with batch-PRFO, where PRFO wants
-        a fixed padded size (self._nmax) across all iterations.
-        """
-        device, dtype = self.device, self.dtype
-        if any(bool(np.any(getattr(at, "pbc", False))) for at in atoms_list):
-            raise NotImplementedError(
-                "AIMNet2BatchCalc is a no-PBC batch wrapper; use a validated "
-                "periodic backend for periodic systems."
-            )
-
-        self._atoms_B = len(atoms_list)
-        self._ptr     = _ptr_from_atoms(atoms_list, device)
-
-        nums, mids = [], []
-        for i, at in enumerate(atoms_list):
-            Z = torch.tensor(at.get_atomic_numbers(), dtype=torch.int64, device=device)
-            n = Z.shape[0]
-            nums.append(Z)
-            mids.append(torch.full((n,), i, dtype=torch.int64, device=device))
-
-        self.numbers = torch.cat(nums, dim=0) if nums else torch.zeros((0,), dtype=torch.int64, device=device)
-        self.mol_idx = torch.cat(mids, dim=0) if mids else torch.zeros((0,), dtype=torch.int64, device=device)
-
-        self.N_atoms     = int(self.numbers.numel())
-        self.Nmax_atoms  = int(max((len(at) for at in atoms_list), default=0))
-
-        # ---------------------------- MODIFICATION ----------------------------
-        # If PRFO supplies a fixed_nmax (padded 3*Nmax from first iteration),
-        # we MUST adopt that dimension for the calculator too.
-        #
-        # Otherwise step_cart_() will fail with shape mismatch: PRFO passes
-        # (B, fixed_nmax) but calculator expects (B, 3*Nmax_atoms_current).
-        # ----------------------------------------------------------------------
-        if fixed_nmax is None:
-            # normal behavior (first prepare call)
-            self.nmax_dof = 3 * self.Nmax_atoms
-        else:
-            # PRFO-defined padded dimension
-            self.nmax_dof = int(fixed_nmax)
-            required_dof = 3 * self.Nmax_atoms
-            if self.nmax_dof < required_dof:
-                raise ValueError(
-                    f"fixed_nmax={self.nmax_dof} is too small for the current batch; "
-                    f"need at least {required_dof} Cartesian DOFs."
-                )
-            if self.nmax_dof % 3 != 0:
-                raise ValueError(
-                    f"fixed_nmax={self.nmax_dof} is not a multiple of 3 Cartesian DOFs."
-                )
-        # ----------------------------------------------------------------------
-
-        if self.N_atoms > 0:
-            pos_list = [torch.tensor(at.get_positions(), dtype=dtype) for at in atoms_list]
-            coord0   = torch.cat(pos_list, dim=0)
-        else:
-            coord0   = torch.zeros((0, 3), dtype=dtype)
-
-        self.coord = coord0.to(device, non_blocking=True).contiguous()
-
         self.sentinel_mol = (int(self.mol_idx.max().item()) + 1) if self.N_atoms > 0 else 0
-        self.charge       = torch.zeros(self._atoms_B + 1, dtype=dtype, device=device)
-
-        # -------------------- precompute static index maps --------------------
-        # (topology fixed across step/get_* calls; build ONCE here to remove the
-        #  per-b python .item() loops & host-device syncs from the hot path)
+        self.charge       = torch.zeros(self._atoms_B + 1, dtype=self.dtype, device=self.device)
         self._build_static_maps()
-
-        self._coord_backup = None
-        self._prepared     = True
 
     def _build_static_maps(self):
         """Build all coordinate/force/nblist index maps that depend only on the
-        (fixed) topology. Called once per prepare()."""
+        (fixed) topology. Called once per prepare() (via _build_topology)."""
         device = self.device
         N      = self.N_atoms
         B      = self._atoms_B
@@ -290,55 +251,16 @@ class AIMNet2BatchCalc:
         self._atom_localidx = a_local                                   # (N,)
 
         # flat map: the 3 components of global atom g <-> (mol_idx[g], 3*a_local) in
-        # a (B, nmax_dof) padded buffer flattened. Same map drives step_cart_ gather
-        # AND the get_ef_/get_efh_ force scatter (reverse direction).
+        # a (B, nmax_dof) padded buffer flattened. Drives the get_ef_/get_efh_ force
+        # scatter; numerically identical to the base's _cols.
         nmax_dof = self.nmax_dof
         base = self.mol_idx.to(torch.int64) * nmax_dof + 3 * a_local    # (N,) start col in flat buf
         cart_idx = base[:, None] + torch.arange(3, device=device)[None, :]   # (N, 3)
         self._cart_idx_flat = cart_idx.reshape(-1)                      # (3*N,)
 
-    # -------------------------------------------------------------------------
-    # coordinate update
-    # -------------------------------------------------------------------------
-    @torch.no_grad()
-    def step_cart_(self, s_cart: torch.Tensor):
-        """
-        s_cart: (B, nmax_dof). MUST match self.nmax_dof (PRFO padded).
-        """
-        assert self._prepared, "call prepare() first"
-
-        B = self._atoms_B
-
-        # ---------------------------- MODIFICATION ----------------------------
-        # PRFO enforces a fixed padded DOF; here we enforce the same.
-        # ----------------------------------------------------------------------
-        assert s_cart.shape == (B, self.nmax_dof), \
-            f"step_cart_ expects (B,{self.nmax_dof}), got {tuple(s_cart.shape)}"
-        # ----------------------------------------------------------------------
-
-        if self.N_atoms == 0:
-            return
-        s_cart = s_cart.to(self.device, dtype=self.dtype)
-        # vectorized: gather each real atom's 3 DOFs from the padded buffer -> (N,3)
-        delta = s_cart.reshape(-1)[self._cart_idx_flat].reshape(self.N_atoms, 3)
-        self.coord.add_(delta)
-
-    @torch.no_grad()
-    def set_coords_(self, coord: torch.Tensor):
-        assert self._prepared, "call prepare() first"
-        assert coord.shape == (self.N_atoms, 3)
-        self.coord.copy_(coord.to(self.device, dtype=self.dtype))
-
-    @torch.no_grad()
-    def backup_coords(self):
-        if self._prepared:
-            self._coord_backup = self.coord.clone()
-
-    @torch.no_grad()
-    def restore_coords(self):
-        if self._coord_backup is not None:
-            self.coord.copy_(self._coord_backup)
-            self._coord_backup = None
+    # step_cart_ / set_coords_ / backup_coords / restore_coords / _resolve_movable
+    # are byte-identical to BatchCalcABC's (_cart_idx_flat == _cols, _n_b builds the
+    # same n_b) -> inherited (deleted here).
 
     # -------------------------------------------------------------------------
     # internal helpers
@@ -364,49 +286,14 @@ class AIMNet2BatchCalc:
 
     def _scatter_forces(self, F_all_eV: torch.Tensor) -> torch.Tensor:
         """Scatter per-atom (N,3) forces into the padded (B, nmax_dof) buffer
-        using the precomputed flat index map. Vectorized (no per-b loop)."""
+        using the precomputed flat index map. Vectorized (no per-b loop).
+        Numerically identical to the base's _pad_forces."""
         B    = self._atoms_B
         nmax = self.nmax_dof
         F_flat = torch.zeros(B * nmax, dtype=self.dtype, device=self.device)
         if self.N_atoms > 0:
             F_flat[self._cart_idx_flat] = F_all_eV.reshape(-1)
         return F_flat.view(B, nmax)
-
-    # -------------------------------------------------------------------------
-    # partial-Hessian (movable-atom subspace) helpers -- mirror UMABatchCalc
-    # -------------------------------------------------------------------------
-    def _resolve_movable(self, movable_masks):
-        """Per-structure list[int] of atom indices whose DOFs are perturbed.
-
-        ``movable_masks`` may be None (all atoms of every structure), or a
-        sequence of length B where entry b is None (all atoms of structure b),
-        a bool mask of length n_b, or an explicit list/array of atom indices.
-        Frozen atoms still appear in every forward (they exert forces); only
-        their columns/rows are omitted from the Hessian (the exact second-
-        derivative block of the FixAtoms-constrained PES). Mirrors
-        UMABatchCalc._resolve_movable exactly so the two backends agree.
-        """
-        B = self._atoms_B
-        n_b = (self._ptr[1:] - self._ptr[:-1]).tolist()
-        if movable_masks is None:
-            return [list(range(n_b[b])) for b in range(B)]
-        out = []
-        for b in range(B):
-            m = movable_masks[b]
-            if m is None:
-                out.append(list(range(n_b[b])))
-                continue
-            m_arr = np.asarray(m)
-            if m_arr.dtype == bool:
-                out.append([int(i) for i in np.nonzero(m_arr)[0]])
-            else:
-                idxs = [int(i) for i in m_arr.reshape(-1)]
-                assert all(0 <= a < n_b[b] for a in idxs), (
-                    f"movable index out of range for structure {b} "
-                    f"(n_atoms={n_b[b]}): {idxs}"
-                )
-                out.append(idxs)
-        return out
 
     def _movable_atom_mask(self, mov) -> torch.Tensor:
         """(N,) bool: global atom is movable. ``mov`` = _resolve_movable output.
@@ -421,13 +308,22 @@ class AIMNet2BatchCalc:
         return mask
 
     # -------------------------------------------------------------------------
-    # forward
+    # forward -- BatchCalcABC contract: (E (B,), F_all (N,3), leaf|None) NATIVE eV
     # -------------------------------------------------------------------------
-    def _forward_energy_forces_(self, c: torch.Tensor, need_graph: bool):
+    def _forward(self, coord: torch.Tensor, need_graph: bool = False):
+        """ONE batched forward -> (E_eV (B,), F_all_eV (N,3), leaf|None) in NATIVE
+        eV (the base converts once via MODEL_ENERGY_UNIT; do NOT scale by EV2HARTREE
+        here). AIMNet2 outputs energy; forces come from an autograd backward of the
+        per-structure energy sum (create_graph=need_graph).
+
+        Forward math is byte-identical to the pre-retrofit ``_forward_energy_forces_``;
+        the ONLY change is returning ``leaf=None`` when need_graph is False (no caller
+        uses the leaf in that case -- get_ef_gpu / the base FD path discard it).
+        """
         assert self._prepared, "call prepare() first"
         device, dtype = self.device, self.dtype
 
-        coord_leaf = c.detach().to(device=device, dtype=dtype).requires_grad_(True)
+        coord_leaf = coord.detach().to(device=device, dtype=dtype).requires_grad_(True)
         nbmat = self._nblist(coord_leaf)
 
         data = {
@@ -448,7 +344,7 @@ class AIMNet2BatchCalc:
                                    create_graph=need_graph, retain_graph=need_graph)[0]
         F_all_eV = -grad
 
-        return E_eV, F_all_eV, coord_leaf
+        return E_eV, F_all_eV, (coord_leaf if need_graph else None)
 
     def _forward_energy_(self, c: torch.Tensor):
         """Energy-ONLY forward (no autograd graph / no force backward)."""
@@ -475,50 +371,46 @@ class AIMNet2BatchCalc:
     # -------------------------------------------------------------------------
     def get_e_gpu(self):
         """Energy-only batched single point (skips the force backward). Same
-        per-structure energy as get_ef_gpu(); for SP / inner trial loops."""
+        per-structure energy as get_ef_gpu(); for SP / inner trial loops. Not part
+        of BatchCalcABC (E+F / E+F+H only); model-specific fast path kept here.
+        Converts eV->Hartree via the base's centralized EV2HARTREE."""
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
             return torch.zeros((0,), dtype=dtype, device=device)
         E_eV = self._forward_energy_(self.coord)
-        return E_eV / EH2EV
+        return E_eV * EV2HARTREE
 
-    def get_ef_gpu(self):
-        B = self._atoms_B
-        device, dtype = self.device, self.dtype
-        if B == 0:
-            return (torch.zeros((0,), dtype=dtype, device=device),
-                    torch.zeros((0, 0), dtype=dtype, device=device))
+    # get_ef_gpu is the generic forward->pad->convert pattern -> provided by
+    # BatchCalcABC (calls self._forward, self._pad_forces, self._to_hartree).
 
-        E_eV, F_all_eV, _ = self._forward_energy_forces_(self.coord, need_graph=False)
-
-        F_eV = self._scatter_forces(F_all_eV)
-        return E_eV / EH2EV, F_eV / EH2EV
-
-    def get_efh_gpu(self, movable_masks=None):
+    def get_efh_gpu(self, movable_masks=None, mode=None, delta: float = 2e-3,
+                    chunk_size=None, base_ef=None):
         """Energy + forces + per-structure Hessian (batched, padded to nmax).
 
-        OPTIMIZED (D-15): seeded block-diagonal analytic Hessian. Column k (local DOF)
-        of ALL B per-structure Hessians is obtained from ONE backward by seeding a
-        grad_outputs one-hot at local DOF k of every structure simultaneously; the
-        inter-molecular blocks are zero (block-diagonal nblist + per-mol energy pooling),
-        so each structure recovers its own column. Backward passes = 3*Nmax_atoms (NOT
-        3*N_total) -> ~B-fold fewer, and NO global (3*N_total)^2 matrix is ever formed.
-        Reference (slow, global) kept as _get_efh_gpu_global_ref for parity validation.
+        MODEL-SPECIFIC OPTIMIZATION -- kept as an override of the base generic
+        ``_efh_analytic`` (do NOT delete). Seeded block-diagonal analytic Hessian:
+        column k (local DOF) of ALL B per-structure Hessians is obtained from ONE
+        backward by seeding a grad_outputs one-hot at local DOF k of every structure
+        simultaneously; the inter-molecular blocks are zero (block-diagonal nblist +
+        per-mol energy pooling), so each structure recovers its own column. Backward
+        passes = 3*Nmax_atoms (NOT 3*N_total) -> ~B-fold fewer, and NO global
+        (3*N_total)^2 matrix is ever formed. Reference (slow, global) kept as
+        _get_efh_gpu_global_ref for parity validation.
 
-        OPT (D-16): the per-k python scatter loop (.nonzero().tolist()) and the per-b
-        force scatter are replaced by sync-free vectorized scatters; the seed one-hot is
-        built from the precomputed local-atom-index map. Results stay byte-identical to
-        _get_efh_gpu_global_ref.
+        Analytic (autograd) is AIMNet2's ONLY Hessian path
+        (SUPPORTED_HESSIAN_MODES=('autograd',)); ``mode`` / ``delta`` / ``chunk_size``
+        / ``base_ef`` are accepted for base-contract + dispatcher call-compatibility
+        and IGNORED -- the analytic path reuses its single need_graph=True forward as
+        the returned gradient, so there is no separate base forward to skip.
 
-        ``movable_masks`` (mirrors UMABatchCalc.get_efh_gpu): None = full Hessian
-        (current behavior, byte-identical oracle). A per-structure spec (None / bool
-        mask / index list, see _resolve_movable) restricts the perturbed/responding
-        DOFs to a movable-atom subspace: only movable atoms are SEEDED (so frozen
-        columns stay zero -- the block-diagonal seed never lights up a frozen DOF) and
-        only movable RESPONSE rows are scattered (frozen rows zeroed). Frozen atoms
-        still exert forces (they are in every forward), so the returned block is the
-        EXACT (3k x 3k) second-derivative block of the FixAtoms-constrained PES.
+        ``movable_masks`` (base ``_resolve_movable``): None = full Hessian
+        (byte-identical oracle). A per-structure spec restricts the perturbed/
+        responding DOFs to a movable-atom subspace: only movable atoms are SEEDED (so
+        frozen columns stay zero) and only movable RESPONSE rows are scattered.
+        Frozen atoms still exert forces (they are in every forward), so the returned
+        block is the EXACT (3k x 3k) second-derivative block of the FixAtoms-
+        constrained PES.
         """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
@@ -528,7 +420,7 @@ class AIMNet2BatchCalc:
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
 
-        E_eV, F_all_eV, coord_leaf = self._forward_energy_forces_(self.coord, need_graph=True)
+        E_eV, F_all_eV, coord_leaf = self._forward(self.coord, need_graph=True)
 
         N      = self.N_atoms
         nmax   = self.nmax_dof
@@ -544,7 +436,7 @@ class AIMNet2BatchCalc:
         local_atom = self._atom_localidx                # (N,) local atom index per global atom
 
         # partial-Hessian movable subspace (None -> all atoms -> byte-identical full).
-        mov = self._resolve_movable(movable_masks)
+        mov = self._resolve_movable(movable_masks)      # base's resolver (inherited)
         movable_atom = self._movable_atom_mask(mov)     # (N,) bool; all-True when None
         row_scale = movable_atom[:, None].to(dtype)     # (N,1) 0/1 row gate (1.0 when None)
 
@@ -569,9 +461,9 @@ class AIMNet2BatchCalc:
 
         H_eV = 0.5 * (H_eV + H_eV.transpose(1, 2))      # symmetrize per structure
 
-        return (E_eV / EH2EV,
-                F_eV / EH2EV,
-                H_eV / EH2EV,
+        return (E_eV * EV2HARTREE,
+                F_eV * EV2HARTREE,
+                H_eV * EV2HARTREE,
                 P)
 
     def _get_efh_gpu_global_ref(self):
@@ -586,7 +478,7 @@ class AIMNet2BatchCalc:
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
 
-        E_eV, F_all_eV, coord_leaf = self._forward_energy_forces_(self.coord, need_graph=True)
+        E_eV, F_all_eV, coord_leaf = self._forward(self.coord, need_graph=True)
 
         f_flat = F_all_eV.reshape(-1)
         cols = []
@@ -611,7 +503,7 @@ class AIMNet2BatchCalc:
                 F_eV[i, :dof]       = F_all_eV[s[i]:t[i], :].reshape(-1)
                 H_eV[i, :dof, :dof] = H_global_eV[3*s[i]:3*t[i], 3*s[i]:3*t[i]]
 
-        return (E_eV / EH2EV,
-                F_eV / EH2EV,
-                H_eV / EH2EV,
+        return (E_eV * EV2HARTREE,
+                F_eV * EV2HARTREE,
+                H_eV * EV2HARTREE,
                 P)
