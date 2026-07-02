@@ -113,6 +113,21 @@ def test_pbc_fail_fast():
     raise AssertionError("expected NotImplementedError on periodic atoms")
 
 
+def test_partial_hessian_movable_mask():
+    """PHVA path: get_efh_gpu(movable_masks=subset) matches the full Hessian's
+    movable block, frozen atoms decouple (rows/cols = 0). FD + autograd."""
+    from ase import Atoms
+    c = _HarmonicBatch(device="cpu", dtype=torch.float64)
+    c.prepare([Atoms("H2O", positions=np.random.RandomState(3).randn(3, 3))])  # 3 atoms
+    _, _, H_full, _ = c.get_efh_gpu(mode="numerical")
+    for mode in ("numerical", "autograd"):
+        _, _, H_p, _ = c.get_efh_gpu(movable_masks=[[0, 1]], mode=mode)  # atoms 0,1 movable
+        # movable block (DOFs 0..5) == the full Hessian's same block
+        assert torch.allclose(H_p[0][:6, :6], H_full[0][:6, :6], atol=1e-6), (mode, H_p[0][:6, :6])
+        # frozen atom 2 (DOFs 6,7,8): rows AND cols zero (constrained-PES block)
+        assert H_p[0][6:9, :].abs().max() < 1e-9 and H_p[0][:, 6:9].abs().max() < 1e-9, mode
+
+
 @register_batch_calculator
 class _HarmonicPBC(_HarmonicBatch):
     """PBC-capable variant: SUPPORTS_PBC=True (aligns with ai-maple-md Phase-B)."""
@@ -141,6 +156,7 @@ if __name__ == "__main__":
     test_all_backends_import_and_register()
     test_capability_contract_declared()
     test_base_plumbing_harmonic_cpu()
+    test_partial_hessian_movable_mask()
     test_pbc_fail_fast()
     test_pbc_capable_accepts_and_homogeneous_gate()
     n = len({id(c) for c in _BATCH_REGISTRY.values()})
