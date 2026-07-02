@@ -304,8 +304,8 @@ class GeodesicTSGuess(JobABC):
 
     @staticmethod
     def _is_batch_calc(calc) -> bool:
-        return (calc is not None and hasattr(calc, "prepare")
-                and hasattr(calc, "get_ef_gpu"))
+        from ..._batch_calc_utils import is_batch_calc
+        return is_batch_calc(calc)
 
     # ----------------------------- band construction ------------------------
     def build_band(self, atoms_R: Atoms, atoms_P: Atoms) -> List[Atoms]:

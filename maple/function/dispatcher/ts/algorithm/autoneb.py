@@ -1463,11 +1463,9 @@ class AutoNEBBatch(JobABC):
     # ------------------------------------------------------------------ gates
     @staticmethod
     def _is_batch_calc(calc) -> bool:
-        """A batch calculator exposes ``prepare(atoms_list)`` + ``get_ef_gpu()``
-        (UMABatchCalc / MACE*BatchCalc / AIMNet2*BatchCalc / ANIBatchCalc)."""
-        return (calc is not None
-                and hasattr(calc, "prepare")
-                and hasattr(calc, "get_ef_gpu"))
+        """A batch calculator exposes prepare() + get_ef_gpu() (shared predicate)."""
+        from ..._batch_calc_utils import is_batch_calc
+        return is_batch_calc(calc)
 
     @staticmethod
     def _is_coupled_calc(calc) -> bool:

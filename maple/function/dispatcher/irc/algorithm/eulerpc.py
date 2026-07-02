@@ -1002,11 +1002,9 @@ _COUPLED_BATCH_CALC_NAMES = {"MACEPolBatchCalc", "AIMNet2BatchCalc"}
 
 
 def _is_batch_calc(calc) -> bool:
-    """Duck-typed test mirroring dispatcher._is_batch_calc: a batched calculator
-    exposes prepare() + get_ef_gpu()."""
-    return (calc is not None
-            and callable(getattr(calc, "prepare", None))
-            and callable(getattr(calc, "get_ef_gpu", None)))
+    """A batch calculator exposes prepare() + get_ef_gpu() (shared predicate)."""
+    from ..._batch_calc_utils import is_batch_calc
+    return is_batch_calc(calc)
 
 
 def _is_coupled_calc(calc) -> bool:
@@ -1017,7 +1015,9 @@ def _is_coupled_calc(calc) -> bool:
         return False
     if getattr(calc, "batch_decoupled", False) is True:
         return False
-    if name in _COUPLED_BATCH_CALC_NAMES:
+    if bool(getattr(calc, "SUPPORTS_COUPLING", False)):   # declarative capability (BatchCalcABC)
+        return True
+    if name in _COUPLED_BATCH_CALC_NAMES:                 # legacy fallback (pre-capability calcs)
         return True
     if hasattr(calc, "coupling_mode"):          # MACE-POL exposes this
         return True

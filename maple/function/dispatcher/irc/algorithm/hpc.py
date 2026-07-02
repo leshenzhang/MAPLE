@@ -950,11 +950,9 @@ import torch as _torch
 
 
 def _is_batch_calc_hpc(calc) -> bool:
-    """Duck-typed test: a batched calculator exposes prepare() + get_ef_gpu()
-    (mirrors dispatcher._is_batch_calc)."""
-    return (calc is not None
-            and callable(getattr(calc, "prepare", None))
-            and callable(getattr(calc, "get_ef_gpu", None)))
+    """A batch calculator exposes prepare() + get_ef_gpu() (shared predicate)."""
+    from ..._batch_calc_utils import is_batch_calc
+    return is_batch_calc(calc)
 
 
 def _is_coupled_batch_calc(calc) -> bool:

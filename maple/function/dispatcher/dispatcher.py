@@ -32,10 +32,12 @@ def batch_device_str(params) -> str:
 
 
 def _is_batch_calc(calc) -> bool:
-    """Duck-typed test: a batched calculator exposes prepare() + get_ef_gpu()."""
-    return (calc is not None
-            and callable(getattr(calc, "prepare", None))
-            and callable(getattr(calc, "get_ef_gpu", None)))
+    """Duck-typed test: a batched calculator exposes prepare() + get_ef_gpu().
+
+    Delegates to the shared predicate so the batch-calc contract lives in ONE
+    place (dispatcher/_batch_calc_utils.py, mirrors BatchCalcABC)."""
+    from ._batch_calc_utils import is_batch_calc
+    return is_batch_calc(calc)
 
 
 def _uma_task(params, attached_calc=None) -> str:

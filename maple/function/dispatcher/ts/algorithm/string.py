@@ -1026,12 +1026,9 @@ except Exception:  # pragma: no cover - defensive only
 
 # ------------------------------------------------------------------ gates ----
 def _gsm_is_batch_calc(calc) -> bool:
-    """A Batch calculator exposes ``prepare(atoms_list, fixed_nmax)`` +
-    ``get_ef_gpu()`` (UMABatchCalc / AIMNet2*BatchCalc / MACE*BatchCalc /
-    ANIBatchCalc contract).  Mirrors NEB._is_batch_calc / irc gs.py."""
-    return (calc is not None
-            and callable(getattr(calc, "prepare", None))
-            and callable(getattr(calc, "get_ef_gpu", None)))
+    """A batch calculator exposes prepare() + get_ef_gpu() (shared predicate)."""
+    from ..._batch_calc_utils import is_batch_calc
+    return is_batch_calc(calc)
 
 
 def _gsm_calc_cross_batch_safe(calc) -> Tuple[bool, str]:
