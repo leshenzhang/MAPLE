@@ -19,6 +19,8 @@ Batched (one MLIP forward over B replicas) + enhanced-sampling ensembles:
     - WeightedEnsemble: WE rare-event sampling (split/merge walkers) on the batched
       NVT kernel -- weight-conserving, unbiased; steady-state flux -> MFPT
     - TPS: transition path sampling (aimless shooting), batch = N shooting trials
+    - ForwardFluxSampling: direct FFS interface rates for irreversible/high-barrier
+      rare events, batch = N parallel trial shots per interface -> k_AB = Phi_A * prod P
 """
 
 from .nve import NVE
@@ -35,6 +37,8 @@ from .remd import REMD, REMDParams
 from .hremd_rest2 import REST2, REST2Params
 from .weighted_ensemble import WeightedEnsemble, WEParams, we_split_merge
 from .tps import TPS, TPSParams, OrderParameter, committor_fraction
+from .ffs import (ForwardFluxSampling, FFSParams,
+                  count_interface_crossings, ffs_rate)
 
 __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'BatchedNPT', 'BatchedNPTParams',
@@ -42,4 +46,6 @@ __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'BatchedEABF', 'ExtendedABFParams', 'REMD', 'REMDParams',
            'REST2', 'REST2Params',
            'WeightedEnsemble', 'WEParams', 'we_split_merge',
-           'TPS', 'TPSParams', 'OrderParameter', 'committor_fraction']
+           'TPS', 'TPSParams', 'OrderParameter', 'committor_fraction',
+           'ForwardFluxSampling', 'FFSParams',
+           'count_interface_crossings', 'ffs_rate']
