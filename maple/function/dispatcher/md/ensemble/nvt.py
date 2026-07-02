@@ -25,6 +25,7 @@ from maple.function.timer import timer
 from ..integrator.velocity_verlet import VelocityVerlet
 from ..thermostat.langevin import LangevinThermostat
 from ..thermostat.vrescale import VRescaleThermostat
+from ..thermostat.nose_hoover import NoseHooverChain
 from ..utils import (
     VELOCITY_REPR_LFMIDDLE_CARRIED,
     VELOCITY_REPR_STANDARD,
@@ -45,6 +46,8 @@ from ..utils import (
 )
 from ..rst_io import get_rng_state_hex, restore_rng_from_hex
 from ..logger import MDLogger
+from ..constraints import build_constraint_manager, maybe_repartition_masses
+from ..anneal import make_anneal_fn
 
 
 def _apply_projection_with_work(
@@ -66,6 +69,10 @@ def _apply_projection_with_work(
     )
     kinetic_after = calculate_kinetic_energy(atoms, projected)
     return projected, projection, kinetic_after - kinetic_before
+
+
+from ..bias import maybe_wrap_bias
+from ..box_guard import check_box_size, composition_sanity
 
 
 @dataclass
@@ -97,6 +104,7 @@ class NVTParams:
     # 300 K: standard ambient condition used across all major MD tutorials.
     # ------------------------------------------------------------------
     temperature:     float = 300.0        # K
+    anneal:          str   = ""           # simulated-annealing T schedule (K); ""=constant T. e.g. "100,300" ramp, "300,500,300" heat/cool
 
     # ------------------------------------------------------------------
     # Thermostat algorithm
@@ -165,6 +173,21 @@ class NVTParams:
     tau_t:           float = 100.0        # fs  [Bussi 2007; GROMACS Manual 2024; LAMMPS fix nvt]
 
     # ------------------------------------------------------------------
+    # Nosé-Hoover chains parameters (used only when thermostat='nose-hoover'/'nhc').
+    # Deterministic, time-reversible canonical map (Martyna 1992/1996).  τ is taken
+    # from tau_t above (GROMACS coupling-period convention; sets Q = N_f kT τ²).
+    #   chain_length:  number of coupled thermostats M (>=3 restores ergodicity for
+    #                  stiff/few-mode systems where a single NH fails). Default 3.
+    #   nhc_n_respa:   RESPA sub-steps for the (stiff) chain integration. Default 1.
+    #   nhc_n_yoshida: Suzuki-Yoshida order (1/3/5/7) for the chain integration. Default 3.
+    # Refs: Martyna, Klein & Tuckerman (1992) JCP 97, 2635;
+    #       Martyna, Tuckerman, Tobias & Klein (1996) Mol. Phys. 87, 1117.
+    # ------------------------------------------------------------------
+    chain_length:    int   = 3            # M (Nosé-Hoover chains)
+    nhc_n_respa:     int   = 1            # RESPA sub-steps for the chain
+    nhc_n_yoshida:   int   = 3            # Suzuki-Yoshida order (1/3/5/7)
+
+    # ------------------------------------------------------------------
     # Output frequencies
     #
     # GROMACS/AMBER defaults (nstxout=500×2fs=1ps) target classical FF
@@ -202,7 +225,40 @@ class NVTParams:
     remove_angular:   bool  = False  # initialization-only COM + rotation; parallel to remove_com
     remove_com_every: int   = 100    # runtime-only COM removal
     remove_angular_every: int = 0    # runtime-only COM + rotation; parallel to remove_com_every
+    plumed:  str = ""    # PLUMED bias file (enhanced sampling); empty = off
+    colvars: str = ""    # Colvars bias file (eABF/ABF); empty = off
+    posres:       str   = ""        # GROMACS posres: off / ref-structure path / "initial"; empty = off
+    posres_fc:    float = 0.0       # restraint force constant, Ha/Å²
+    posres_group: str   = "heavy"   # restrained atoms: all / heavy / explicit "0,1,5-10"
+    posres_ramp:  str   = ""        # descending k schedule (Ha/Å²); empty = constant fc
     random_seed: Optional[int] = None
+    constraints: str = "none"            # none|h-bonds|all-bonds|h-angles (GROMACS)
+    constraint_algorithm: str = "lincs"  # lincs|shake (velocity-Verlet RATTLE solver)
+    # [Batch-3] GaMD boost (CV-free enhanced sampling); empty/off = no boost
+    gamd:            str   = ""       # ""/off/lower/upper - boost mode (reaches params via _init_params)
+    gamd_sigma0:     float = 6.0      # kcal/mol; anti-Gaussian width ceiling (sigma0)
+    gamd_prep_steps: int   = 2000     # conventional-MD steps to collect V statistics
+    gamd_params:     Optional[dict] = None  # pre-fit {mode,k,E,...}; set to skip prep
+    # [Batch-3] Hydrogen mass repartitioning (4 fs steps with H-bond constraints)
+    hmr:           str   = ""         # ""/off = no-op; on/true => factor 3.0; or a numeric factor
+    hmr_factor:    Optional[float] = None   # explicit factor override of params.hmr
+    hmr_bond_mult: float = 1.2        # covalent-radius scale for H-bond inference
+    # [Batch-3] Steered MD: constant-velocity pull on a COM-COM distance CV + Jarzynski work
+    smd:           str   = ""        # ""/off = no pull; on/distance => steer the COM-COM distance
+    smd_group1:    str   = ""        # first pull group:  all / heavy / "0,1,5-10" (taken as COM)
+    smd_group2:    str   = ""        # second pull group: all / heavy / "0,1,5-10" (taken as COM)
+    smd_k:         float = 0.0       # restraint force constant, Ha/Å² (same convention as posres_fc)
+    smd_lam0:      str   = ""        # start centre (Å); ""/auto = current CV distance at step 0
+    smd_lam1:      float = 0.0       # end centre (Å); centre moves lam0 -> lam1 linearly over the run
+    smd_log_every: int   = 10        # steps between *_smd.dat work-log rows
+
+    # ------------------------------------------------------------------
+    # box_check: minimum-image box-size guard severity (strict|warn|off).
+    # strict (default) = GROMACS-style fatal abort when the shortest periodic
+    # box width drops below 2*r_max (the MLIP receptive field); warn = log and
+    # continue; off = disable. Only acts for PBC calculators (finite r_max).
+    # ------------------------------------------------------------------
+    box_check:       str   = "strict"
 
 
 class NVT(JobABC):
@@ -212,7 +268,7 @@ class NVT(JobABC):
     Integrates with the MAPLE dispatcher via JobABC.
     """
 
-    _THERMOSTAT_CHOICES = {'langevin', 'v-rescale'}
+    _THERMOSTAT_CHOICES = {'langevin', 'v-rescale', 'nose-hoover', 'nhc'}
 
     def __init__(self, output: str, atoms: Atoms, paras: Optional[dict] = None):
         super().__init__(output)
@@ -222,6 +278,17 @@ class NVT(JobABC):
 
         self.atoms = atoms
         self.params = self._init_params(NVTParams, paras, ("md", "MD", "nvt", "NVT"))
+        maybe_repartition_masses(self.atoms, self.params)
+        maybe_wrap_bias(self.atoms, self.params, output)
+
+        # --- GROMACS-grompp-style physical preflight (box size + composition) ---
+        # Reject a periodic box shorter than 2*r_max (MLIP receptive field),
+        # which would cause silent minimum-image self-interaction. Self-skips
+        # for non-PBC calculators. See dispatcher/md/box_guard.py.
+        check_box_size(self.atoms, self.atoms.calc, self.params.box_check,
+                       context="NVT setup preflight")
+        composition_sanity(self.atoms, self.atoms.calc, self.params.box_check,
+                           context="NVT setup preflight")
 
         if self.params.thermostat not in self._THERMOSTAT_CHOICES:
             raise ValueError(
@@ -254,6 +321,26 @@ class NVT(JobABC):
         self._runtime_n_dof = get_n_dof_from_policy(runtime_policy)
         self._runtime_dof_description = describe_dof_policy(runtime_policy)
 
+        # [TASK#9 constraints] build the frozen constraint set (None if constraints=none)
+        self._constraints = build_constraint_manager(self.atoms, self.params)
+        self._n_constraints = self._constraints.n_dof_removed if self._constraints else 0
+        if self._constraints is not None:
+            # constrained dynamics use the velocity-Verlet RATTLE path (v-rescale / NVE).
+            # The Langevin LFMiddle path is not constraint-aware, so fall back to the
+            # GROMACS production thermostat (v-rescale) when constraints + Langevin.
+            if self.params.thermostat == 'langevin':
+                self.log_info([
+                    "\n*** NOTE: constraints require the velocity-Verlet RATTLE path; "
+                    "switching thermostat 'langevin' -> 'v-rescale' "
+                    "(GROMACS production default) for this constrained run.\n\n"
+                ])
+                self.params.thermostat = 'v-rescale'
+            # each distance constraint removes one DOF (rigid water = 3)
+            self._runtime_n_dof = max(self._runtime_n_dof - self._n_constraints, 1)
+            self._runtime_dof_description += (
+                f" - {self._n_constraints} constraints (3N - 3 - n_constraints)"
+            )
+
         if self.params.thermostat == 'langevin':
             self.thermostat = LangevinThermostat(
                 atoms,
@@ -261,6 +348,17 @@ class NVT(JobABC):
                 friction=self.params.friction,
                 timestep=self.params.timestep,
                 rng=self._rng,
+            )
+        elif self.params.thermostat in ('nose-hoover', 'nhc'):
+            self.thermostat = NoseHooverChain(
+                atoms,
+                temperature=self.params.temperature,
+                tau_t=self.params.tau_t,
+                timestep=self.params.timestep,
+                n_dof=self._runtime_n_dof,
+                chain_length=self.params.chain_length,
+                n_respa=self.params.nhc_n_respa,
+                n_yoshida=self.params.nhc_n_yoshida,
             )
         else:  # v-rescale
             self.thermostat = VRescaleThermostat(
@@ -420,6 +518,11 @@ class NVT(JobABC):
             lines.append(f"Friction (γ):       {self.params.friction:.4f} 1/fs\n")
         else:
             lines.append(f"τ_T:                {self.params.tau_t:.1f} fs\n")
+        if self.params.thermostat in ('nose-hoover', 'nhc'):
+            lines.append(
+                f"NHC chain length:   {self.params.chain_length} "
+                f"(RESPA={self.params.nhc_n_respa}, Suzuki-Yoshida={self.params.nhc_n_yoshida})\n"
+            )
         lines += [
             f"\nOutput frequencies:\n",
             f"  Log every:        {self.params.log_every} steps\n",
@@ -512,6 +615,7 @@ class NVT(JobABC):
             is_langevin and velocity_representation == VELOCITY_REPR_LFMIDDLE_CARRIED
         )
         is_vrescale = self.params.thermostat == 'v-rescale'
+        is_nhc = self.params.thermostat in ('nose-hoover', 'nhc')
 
         self.logger.start_simulation(
             ensemble='nvt',
@@ -524,13 +628,17 @@ class NVT(JobABC):
             n_dof=self._runtime_n_dof,
             dof_description=self._runtime_dof_description,
             write_sync_thermo=write_sync_thermo,
-            write_conserved_energy=is_vrescale,
+            write_conserved_energy=is_vrescale or is_nhc,
         )
         self.logger.log_main([
             f"\nStarting NVT simulation ({self.params.thermostat})...\n\n"
         ])
 
         integrator = VelocityVerlet(self.atoms, self.params.timestep)
+        # [TASK#9 constraints] attach the constraint set to the integrator
+        integrator.constraints = self._constraints
+        if self._constraints is not None:
+            self.logger.log_main([f"\n{self._constraints.summary()}\n"])
         v = velocities.copy()
 
         # Cache forces at t=0; reused as first B-step forces each cycle.
@@ -548,10 +656,26 @@ class NVT(JobABC):
         # runtime motion projection is allowed to coexist with V-rescale.
         is_vrescale = self.params.thermostat == 'v-rescale'
         w_bath = 0.0
+        # NHC conserved-quantity bookkeeping: H~ = H_phys + E_chain, where E_chain
+        # is the chain bath energy (state function returned by NoseHooverChain.apply).
+        e_chain = 0.0
 
+        anneal_fn = make_anneal_fn(self.params.anneal, n_steps)
         for step in range(1, n_steps + 1):
 
-            if is_vrescale:
+            if anneal_fn is not None:
+                self.thermostat.set_temperature(anneal_fn(step))
+
+            if is_nhc:
+                # Symmetric NHC-VV split (Martyna 1996): half-step thermostat ->
+                # full velocity-Verlet step -> half-step thermostat.  Each apply()
+                # advances the chain by dt/2; the pair realises exp(iL_NHC dt/2)
+                # exp(iL_VV dt) exp(iL_NHC dt/2).  e_chain after the trailing half
+                # is the end-of-step chain contribution to H~.
+                v, _e0 = self.thermostat.apply(v)
+                v, forces = integrator.step(v, forces)
+                v, e_chain = self.thermostat.apply(v)
+            elif is_vrescale:
                 v, forces = integrator.step(v, forces)
                 v, delta_w = self.thermostat.apply(v)
                 w_bath += delta_w
@@ -571,7 +695,7 @@ class NVT(JobABC):
                 remove_com_every=self.params.remove_com_every,
                 remove_angular_every=self.params.remove_angular_every,
             )
-            if is_vrescale:
+            if is_vrescale or is_nhc:
                 w_bath += delta_w_proj
 
             abs_step         = step_offset + step
@@ -598,8 +722,15 @@ class NVT(JobABC):
                 kinetic_energy_sync = calculate_kinetic_energy(self.atoms, v_sync)
                 total_energy_sync = kinetic_energy_sync + potential_energy
 
-            # Conserved energy: H̃ = H − Σ ΔW (V-rescale only)
-            conserved = (kinetic_energy + potential_energy - w_bath) if is_vrescale else None
+            # Conserved energy:
+            #   V-rescale: H̃ = H − Σ ΔW (thermostat + projection work ledger)
+            #   NHC:       H̃ = H + E_chain − Σ ΔW_proj (chain state + projection ledger)
+            if is_vrescale:
+                conserved = kinetic_energy + potential_energy - w_bath
+            elif is_nhc:
+                conserved = kinetic_energy + potential_energy + e_chain - w_bath
+            else:
+                conserved = None
 
             self.logger.log_step(
                 step=abs_step,

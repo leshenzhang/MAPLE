@@ -65,6 +65,7 @@ from ...jobABC import JobABC
 from maple.function.timer import timer
 from maple.function.utility import Molecules
 
+from ..box_guard import check_box_size
 from ..utils import (
     AMU_TO_AU,
     BOHR_TO_ANGSTROM,
@@ -148,17 +149,17 @@ class BatchedMD(JobABC):
                             "prepare()/get_ef_gpu()/step_cart_() (e.g. UMABatchCalc). "
                             "A plain ASE single-structure calculator -> use NVE/NVT instead.")
 
-        # The batched calc holds one block-diagonal graph; PBC/cell handling is not
-        # part of the UMA-omol batched contract, so this path is for isolated systems.
-        if any(any(at.pbc) for at in atoms_list):
-            raise NotImplementedError(
-                "BatchedMD currently supports isolated (non-periodic) replicas only "
-                "(UMA omol batched contract). Use the single-structure NVT/NPT path "
-                "for periodic systems.")
-
         self.atoms_list = atoms_list
         self.calc = calc
         self.B = len(atoms_list)
+
+        # PBC (Phase-1A): the block-diagonal batched calc carries a per-replica cell
+        # as calc-internal state when the replicas are periodic. Isolated batches take
+        # the default path BIT-UNCHANGED (this gate returns immediately, never reads a
+        # cell). Periodic batches require a PBC-capable backend (SUPPORTS_PBC) + a
+        # per-replica box guard (perpendicular width >= 2*r_max). NVT/NVE fixed cell
+        # only; NPT-PBC (stress/barostat) is Phase 2C.
+        self._setup_pbc_gate(calc, atoms_list)
 
         self.params = self._init_params(
             BatchedMDParams, paras, ("md", "MD", "batched", "BATCHED", "batchmd"))
@@ -184,6 +185,30 @@ class BatchedMD(JobABC):
         self.device = dev if dev is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = getattr(calc, "dtype", torch.float64)
+
+    def _setup_pbc_gate(self, calc, atoms_list):
+        """PBC (Phase-1A) gate; see BatchedNVT._setup_pbc_gate for the rationale.
+
+        Isolated batches: returns immediately, default path BIT-UNCHANGED. Periodic
+        batches: require SUPPORTS_PBC + per-replica box guard. Mixed: rejected.
+        """
+        pbc_flags = [bool(np.any(np.asarray(at.pbc))) for at in atoms_list]
+        if not any(pbc_flags):
+            return                                  # default isolated path unchanged
+        if not all(pbc_flags):
+            raise NotImplementedError(
+                "BatchedMD (Phase-1A) requires a HOMOGENEOUS pbc state: every replica "
+                "periodic or every replica isolated. Mixed batches are unsupported.")
+        if not bool(getattr(calc, "SUPPORTS_PBC", False)):
+            raise NotImplementedError(
+                f"BatchedMD got periodic replicas but calculator "
+                f"'{type(calc).__name__}' is non-periodic (SUPPORTS_PBC is False). "
+                f"PBC-capable batched backends: MACE-OFF (MaceOffBatchCalc), "
+                f"UMA-periodic (periodic task).")
+        box_mode = getattr(getattr(self, "params", None), "box_check", "strict")
+        for b, at in enumerate(atoms_list):
+            check_box_size(at, calc=calc, mode=box_mode,
+                           context=f"BatchedMD preflight replica {b}")
 
     # ====================================================================== run
     def run(self):

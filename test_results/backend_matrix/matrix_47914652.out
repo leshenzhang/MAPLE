@@ -1,0 +1,99 @@
+=== node gpu203-23-l Wed Jul  1 06:20:34 +03 2026 ===
+NVIDIA A100-SXM4-80GB, 81920 MiB
+torch 2.6.0+cu124 cuda True
+################## BACKEND x METHOD ADAPTATION MATRIX ##################
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
++++ Loading the PLUMED kernel runtime +++
++++ PLUMED_KERNEL="/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/libplumedKernel.so" +++
+torch 2.6.0+cu124 cuda True dev NVIDIA A100-SXM4-80GB
+
+##############################################################################
+# PART 1: BACKEND LOAD INVENTORY
+##############################################################################
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+  [LOAD OK]  mace-off               -> MaceOffBatchCalc (SUPPORTS_PBC=True, batch_isolated=True)
+  [LOAD OK]  mace-mp                -> MaceOffBatchCalc (SUPPORTS_PBC=True, batch_isolated=True)
+  [LOAD OK]  std-mace(maceomol)     -> MACEBatchCalc (SUPPORTS_PBC=False, batch_isolated=None)
+  [SKIP]     macepol                -> RuntimeError: PytorchStreamReader failed locating file constants.pkl: file not found
+  [LOAD OK]  aimnet2-native         -> AIMNet2BatchCalc (SUPPORTS_PBC=False, batch_isolated=None)
+  [SKIP]     aimnet2-decoupled      -> ModuleNotFoundError: No module named 'aimnet2calc'
+  [SKIP]     uma                    -> ImportError: fairchem-core is not importable: No module named 'fairchem'
+
+##############################################################################
+# PART 2: BATCHABLE-BACKEND CAPABILITY GATE (accept/reject B>1)
+##############################################################################
+  [OK ] MaceOffBatchCalc           -> ACCEPT (expected ACCEPT)
+  [OK ] UMABatchCalc               -> ACCEPT (expected ACCEPT)
+  [OK ] AIMNet2DecoupledBatchCalc  -> ACCEPT (expected ACCEPT)
+  [OK ] MACEBatchCalc              -> ACCEPT (expected ACCEPT)
+  [OK ] AIMNet2BatchCalc           -> REJECT (expected REJECT)  clean_msg=True
+          msg: BatchedNVT B=2>1 requires a batch-ISOLATED calculator (per-system energies independent)
+  [OK ] MACEPolBatchCalc           -> REJECT (expected REJECT)  clean_msg=True
+          msg: BatchedNVT B=2>1 requires a batch-ISOLATED calculator (per-system energies independent)
+  [OK ] SomeGenericCoupledCalc     -> REJECT (expected REJECT)  clean_msg=True
+          msg: BatchedNVT B=2>1 requires a batch-ISOLATED calculator (per-system energies independent)
+  --> GATE VERDICT: PASS (accept batchable / reject AIMNet2-native+MACE-POL)
+
+##############################################################################
+# PART 3: BACKEND x METHOD MATRIX (short smokes)
+##############################################################################
+
+== mace-off (MaceOffBatchCalc) ==
+  [PASS] BatchedNVT         T0=274.7K T1=392.2K PE=-155.1326Ha isoDE=0.0e+00Ha finite=True
+  [PASS] B1-parity          max|dpos|=1.1e-15A max|dvel|=1.1e-17au
+  [PASS] umbrella_batched   bias_additive=True(dE_err=2.9e-15,dF=4.5e-02) PMF_finite=True win_cv=[2.664, 2.885, 3.18, 3.409]
+  [PASS] GaMD_batched       prod_frames=1408 k=50.57/Ha E=-119.1925Ha boost_factor=[0.305,1.000] in[0,1]=True
+  [PASS] REMD               noswap_parity max|dpos|=2.0e-15A max|dvel|=3.8e-17au isoDE=5.7e-14Ha
+  [PASS] SMD_batched        analytic_Ferr=0.0e+00(exact) works_finite=True n_pulls=4 isoDE=0.0e+00Ha
+
+== mace-mp (MaceOffBatchCalc) ==
+  [PASS] BatchedNVT         T0=298.5K T1=340.0K PE=-1.7261Ha isoDE=0.0e+00Ha finite=True
+  [PASS] B1-parity          max|dpos|=1.6e-15A max|dvel|=1.0e-17au
+  [PASS] umbrella_batched   bias_additive=True(dE_err=5.9e-17,dF=4.5e-02) PMF_finite=True win_cv=[2.628, 2.86, 3.164, 3.401]
+  [PASS] GaMD_batched       prod_frames=1408 k=57.34/Ha E=-2.0844Ha boost_factor=[0.346,1.000] in[0,1]=True
+  [PASS] REMD               noswap_parity max|dpos|=2.1e-15A max|dvel|=4.1e-17au isoDE=0.0e+00Ha
+  [PASS] SMD_batched        analytic_Ferr=0.0e+00(exact) works_finite=True n_pulls=4 isoDE=0.0e+00Ha
+
+== std-mace(maceomol) (MACEBatchCalc) ==
+  [N/A-model] BatchedNVT         incompatible/single-graph-traced model (clean)
+  [N/A-model] B1-parity          incompatible/single-graph-traced model (clean)
+  [N/A-model] umbrella_batched   incompatible/single-graph-traced model (clean)
+  [N/A-model] GaMD_batched       incompatible/single-graph-traced model (clean)
+  [N/A-model] REMD               incompatible/single-graph-traced model (clean)
+  [N/A-model] SMD_batched        incompatible/single-graph-traced model (clean)
+
+== macepol: SKIP all methods (not loadable)
+
+== aimnet2-native: N/A-gate for batched methods (coupled; clean reject verified in Part 2)
+
+== aimnet2-decoupled: SKIP all methods (not loadable)
+
+== uma: SKIP all methods (not loadable)
+
+##############################################################################
+# PART 4: single-system PLUMED-bias (RESTRAINT additive)
+##############################################################################
+  [PASS] PLUMED RESTRAINT on mace-off: bias-additive dF=1.904e-03 Ha/A (>0 => bias injected), run_finite=True
+
+==============================================================================
+MATRIX_JSON_WRITTEN /ibex/user/xiaox/zls/ai-maple-md/MAPLE/worktrees/backendmatrix/test_results/backend_matrix/backend_matrix_result.json
+==============================================================================
+
+BACKEND x METHOD (status):
+  backend          | BatchedNVT       | B1-parity        | umbrella_batched | GaMD_batched     | REMD             | SMD_batched     
+  mace-off         | PASS             | PASS             | PASS             | PASS             | PASS             | PASS            
+  mace-mp          | PASS             | PASS             | PASS             | PASS             | PASS             | PASS            
+  std-mace(maceomol) | N/A-model        | N/A-model        | N/A-model        | N/A-model        | N/A-model        | N/A-model       
+  macepol          | SKIP             | SKIP             | SKIP             | SKIP             | SKIP             | SKIP            
+  aimnet2-native   | N/A-gate         | N/A-gate         | N/A-gate         | N/A-gate         | N/A-gate         | N/A-gate        
+  aimnet2-decoupled | SKIP             | SKIP             | SKIP             | SKIP             | SKIP             | SKIP            
+  uma              | SKIP             | SKIP             | SKIP             | SKIP             | SKIP             | SKIP            
+
+GATE: PASS
+PLUMED: PASS
+DONE_MATRIX
+MATRIX_EXIT=0
+DONE_MATRIX Wed Jul  1 06:22:12 +03 2026

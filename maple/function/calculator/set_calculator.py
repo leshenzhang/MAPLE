@@ -45,6 +45,12 @@ _BUILTIN_NAME_TO_MODULE = {
     'macepolm': 'maple.function.calculator.mace._macepol_calculator',
     'macepoll': 'maple.function.calculator.mace._macepol_calculator',
     'uma': 'maple.function.calculator.uma._uma_calculator',
+    # Universal-adapter (GenericASECalculator) coexistence backends: single-structure
+    # CalcABC wrappers that gain PBC+stress via the shared adapter, routed by name here
+    # like every other shipped backend (they self-register via @register_calculator).
+    'mace-mp-0-generic': 'maple.function.calculator.generic._mace_mp_generic',
+    'mace-off-generic': 'maple.function.calculator.generic._mace_off_generic',
+    'uma-generic': 'maple.function.calculator.generic._uma_generic',
 }
 
 

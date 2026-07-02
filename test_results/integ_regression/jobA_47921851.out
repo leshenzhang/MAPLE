@@ -1,0 +1,136 @@
+=== JOBA node gpu108-23-l Wed Jul  1 09:28:59 +03 2026 ===
+NVIDIA A100-SXM4-80GB
+torch 2.6.0+cu124 cuda True
+
+########## BEGIN STRESS ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/bin/python: can't open file '/ibex/user/xiaox/zls/ai-maple-md/MAPLE/worktrees/integ2/maple/function/calculator/mace/_test_stress_batched.py': [Errno 2] No such file or directory
+@@ STRESS EXIT=2
+########## END STRESS ##########
+
+########## BEGIN NPT ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+[env] device=cuda torch=2.6.0+cu124
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+[env] MACE-OFF r_max=5.000 A; box side must be >= 10.000 A
+[G3 c-rescale] steps=60 max|dvel|=2.507e-16 au  |dPE|=0.000e+00 eV  dVol_rel=1.639e-16  minimg|dpos|=2.039e-14 A  (Vleg=1387.424 Vbat=1387.424)
+[G3 berendsen] steps=60 max|dvel|=2.979e-16 au  |dPE|=0.000e+00 eV  dVol_rel=1.618e-16  minimg|dpos|=1.723e-14 A  (Vleg=1405.426 Vbat=1405.426)
+[G4] rep0 compressed: P_init=48268 bar  V 1560.9->1831.9 A^3 (L~12.24)  rho=1.045  P_tail=-384 bar  T=424.8 K
+[G4] rep1 expanded:   P_init=-811 bar  V 2863.3->2671.7 A^3 (L~13.88)  rho=0.717  P_tail=-3471 bar  T=380.2 K
+[G4] per-replica isolation energy leak = 0.000e+00 Ha
+[G4] rep0_relaxes=True rep1_relaxes=True boxes_valid=True rho_ok=True iso_ok=True T_bounded=True
+[G5] rep0: 192 constraints (rigid_water=64)  max|bond-d0|=1.619e-09 A
+[G5] rep1: 192 constraints (rigid_water=64)  max|bond-d0|=1.497e-09 A
+[G5] worst bond violation over both replicas = 1.619e-09 A (tol 1e-6); final L=[12.42, 12.8] valid=True
+
+==== NPT GATE SUMMARY (G3,G4,G5) ====
+  PASS  G3_parity_crescale
+  PASS  G3_parity_berendsen
+  PASS  G4_batched_npt_physics
+  PASS  G5_constraint_after_rescale
+==== NPT GATES G3/G4/G5 PASS ====
+@@ NPT EXIT=0
+########## END NPT ##########
+
+########## BEGIN CONSTR ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+torch 2.6.0+cu124 cuda True
+[CON-RATTLE] rigid water: n_water=1 n_constraints=3 DOF_removed=3 (expect 1/3/3)
+[CON-RATTLE] ethanol n_constraints=8  pos: max|d-d0|=7.16e-09 A (tol 1e-8)  vel: max|(vi-vj).rij|=7.39e-11 (tol 1e-10)
+[CON-RATTLE] PASS
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+
+  ┌─ NVT PRE-EQUILIBRATION ADVISORY ──────────────────────────────────────┐
+  │  Starting NVE from an optimised (0 K) structure without prior NVT     │
+  │  equilibration is known to cause:                                      │
+  │    • A large initial TE drop (~5–10 kcal/mol) in the first ~20 steps  │
+  │    • Actual mean temperature well below the target value               │
+  │    • Inflated σ(TE) that cannot be reduced by decreasing dt            │
+  │                                                                        │
+  │  Recommended workflow (GROMACS Manual 2024 §3.4.2; AMBER 2023 §3.1): │
+  │    opt → NVT (≥ 10 ps, Langevin) → NVE (production)                  │
+  │                                                                        │
+  │  To suppress: set restart=true (assumes prior NVT was completed).     │
+  └────────────────────────────────────────────────────────────────────────┘
+
+NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,
+  not an on/off pair. Initialization removes COM + rigid-body rotation once,
+  but runtime angular motion will not be projected out during the run.
+[CON-MDBOND] 500 constrained NVE steps @ 1.0fs (h-bonds, 6 X-H bonds)  final max|d-d0|=8.78e-09 A (tol 1e-8)
+[CON-MDBOND] PASS
+
+  ┌─ NVT PRE-EQUILIBRATION ADVISORY ──────────────────────────────────────┐
+  │  Starting NVE from an optimised (0 K) structure without prior NVT     │
+  │  equilibration is known to cause:                                      │
+  │    • A large initial TE drop (~5–10 kcal/mol) in the first ~20 steps  │
+  │    • Actual mean temperature well below the target value               │
+  │    • Inflated σ(TE) that cannot be reduced by decreasing dt            │
+  │                                                                        │
+  │  Recommended workflow (GROMACS Manual 2024 §3.4.2; AMBER 2023 §3.1): │
+  │    opt → NVT (≥ 10 ps, Langevin) → NVE (production)                  │
+  │                                                                        │
+  │  To suppress: set restart=true (assumes prior NVT was completed).     │
+  └────────────────────────────────────────────────────────────────────────┘
+
+NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,
+  not an on/off pair. Initialization removes COM + rigid-body rotation once,
+  but runtime angular motion will not be projected out during the run.
+
+  ┌─ NVT PRE-EQUILIBRATION ADVISORY ──────────────────────────────────────┐
+  │  Starting NVE from an optimised (0 K) structure without prior NVT     │
+  │  equilibration is known to cause:                                      │
+  │    • A large initial TE drop (~5–10 kcal/mol) in the first ~20 steps  │
+  │    • Actual mean temperature well below the target value               │
+  │    • Inflated σ(TE) that cannot be reduced by decreasing dt            │
+  │                                                                        │
+  │  Recommended workflow (GROMACS Manual 2024 §3.4.2; AMBER 2023 §3.1): │
+  │    opt → NVT (≥ 10 ps, Langevin) → NVE (production)                  │
+  │                                                                        │
+  │  To suppress: set restart=true (assumes prior NVT was completed).     │
+  └────────────────────────────────────────────────────────────────────────┘
+
+NOTE: remove_angular=true and remove_angular_every=0 are parallel settings,
+  not an on/off pair. Initialization removes COM + rigid-body rotation once,
+  but runtime angular motion will not be projected out during the run.
+[CON-NONE] build_constraint_manager('none') is None = True  NVE._constraints is None = True
+[CON-NONE] two 'none' runs: max|dpos|=0.0e+00 max|dvel|=0.0e+00  bit_identical=True
+[CON-NONE] PASS
+
+[CONSTRAINTS RESULT] rattle(pos=7.2e-09,vel=7.4e-11) md_bond=8.8e-09 none_bitident=True
+[CONSTRAINTS RESULT] ALL CONSTRAINT GATES PASS
+@@ CONSTR EXIT=0
+########## END CONSTR ##########
+
+########## BEGIN STDMACE ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+[env] device=cuda torch=2.6.0+cu124 model=mace-mp-0(20231203mace128L1_epoch199model)
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+[env] mace-mp-0 r_max=6.0000 A  n_elements=89  heads=['Default']  box side must be >= 12.00 A
+[sys] edge-gate water box: 81 atoms, side=13.500 A, min perp width=13.500 A
+[G1] _periodic=False (expect False)  edge_index bit-identical=True  shifts all-zero & identical=True  n_edges=1444
+[G2] my_edges=2288 ase_edges=2288 image_edges(|S|>0)=844 only_mine=0 only_ase=0 symdiff=0
+[G4] max|edge_dist-ASE_dist|=8.88e-16 A  all_within_rmax=True  min_edge=0.957A  cross_mol_min=2.833A no_spurious(<1.5)=True  small_box_ok=False(exp False) guard_raised=True big_box_passes=True
+[XID] MACEBatchCalc edges=2288 MaceOffBatchCalc edges=2288 symdiff=0  max|cartesian shift diff|=0.00e+00 A
+[G3] (mace-mp-0, real forward) B=4 identical periodic replicas: dE(rep-rep0)=0.000e+00 dE(B4-B1)=0.000e+00 Ha | dF(rep-rep0)=8.327e-17 dF(B4-B1)=1.110e-16 Ha/A | PBC isolation leak=1.78e-15 Ha
+[G3-bonus] (MACEBatchCalc OWN 6-arg forward, eager mace-mp-0) B=4: dE(rep-rep0)=1.776e-15 dE(B4-B1)=0.000e+00 | dF(rep-rep0)=6.592e-17 dF(B4-B1)=1.318e-16 Ha/A | isolation leak=6.94e-17 Ha
+[G5] bulk water: 192 atoms/replica, side=13.00 A, B=2, mace-mp-0
+[G5] rep0: <T>tail=316.5K sig=14.4K  O-O 1st peak=2.725A  min O-O=2.51A  <PE>=-34.1677Ha
+[G5] rep1: <T>tail=320.4K sig=18.5K  O-O 1st peak=2.7750000000000004A  min O-O=2.53A  <PE>=-34.1630Ha
+[G5] T_ok=True stable=True rdf_ok=True
+
+==================== std-MACE PBC GATE SUMMARY ====================
+  PASS  G1_pbc_false_bit_identical
+  PASS  G2_edge_set_vs_ASE
+  PASS  G4_min_image_short_contact
+  PASS  XID_cross_calc_identity
+  PASS  G3_single_vs_batched_dF
+  PASS  G3bonus_MACEBatchCalc_own_forward
+  PASS  G5_nvt_pbc_stable_rdf
+
+REQUIRED_GATES_FAIL=0  (0 => ALL REQUIRED PASS)
+STDMACE_PBC_ALL_PASS
+@@ STDMACE EXIT=0
+########## END STDMACE ##########
+DONE_JOBA Wed Jul  1 09:33:27 +03 2026

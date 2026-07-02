@@ -1,0 +1,36 @@
+=== JOBS node gpu101-02-r Wed Jul  1 09:31:01 +03 2026 ===
+NVIDIA A100-SXM4-80GB
+
+########## BEGIN STRESS ##########
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/ibex/user/xiaox/zls/ai-maple-md/envs/plumed/lib/python3.11/site-packages/mace/calculators/mace.py:226: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  torch.load(f=model_path, map_location=device)
+[env] device=cuda torch=2.6.0+cu124
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+[env] MACE-OFF r_max=5.0000 A; box side must be >= 10.000 A
+[sys] 3 periodic water boxes: 81 atoms each, L=11.000 A (>= 2*r_max=10.000)
+[G1] batched(B=3) vs single(B=1) per-replica stress: max|dstress|=1.019e-17 eV/Ang^3
+      rep0 stress_voigt(batched)=[ 0.000658  0.001461  0.001513 -0.000838  0.000434  0.000563]
+      rep1 stress_voigt(batched)=[ 0.000779  0.001245  0.000753 -0.000199 -0.000146 -0.000145]
+      rep2 stress_voigt(batched)=[ 0.000478  0.000126  0.001476  0.000191 -0.001074  0.001052]
+[G1b] batched vs ase MACECalculator.get_stress: max|dstress|=1.667e-17 eV/Ang^3
+[G2] rep0 analytic vs FD stress: max|d|=3.348e-09 eV/Ang^3
+      analytic=[ 0.000658  0.001461  0.001513 -0.000838  0.000434  0.000563]
+      numeric =[ 0.000658  0.001461  0.001513 -0.000838  0.000434  0.000563]
+[G2] rep1 analytic vs FD stress: max|d|=3.670e-09 eV/Ang^3
+      analytic=[ 0.000779  0.001245  0.000753 -0.000199 -0.000146 -0.000145]
+      numeric =[ 0.000779  0.001245  0.000753 -0.000199 -0.000146 -0.000145]
+[G2] rep2 analytic vs FD stress: max|d|=3.637e-09 eV/Ang^3
+      analytic=[ 0.000478  0.000126  0.001476  0.000191 -0.001074  0.001052]
+      numeric =[ 0.000478  0.000126  0.001476  0.000191 -0.001074  0.001052]
+[G2] worst analytic-vs-FD per-Voigt discrepancy = 3.670e-09 eV/Ang^3 (tol 1e-5)
+
+==== STRESS GATE SUMMARY (G1,G2) ====
+  PASS  G1_batched_single_parity
+  PASS  G1b_vs_ase_maceoff
+  PASS  G2_virial_vs_fd
+==== STRESS GATES G1/G2 PASS ====
+@@ STRESS EXIT=0
+########## END STRESS ##########
+DONE_JOBS Wed Jul 1 09:31:12 +03 2026

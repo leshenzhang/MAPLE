@@ -91,7 +91,7 @@ def get_registered_batch_calculator(name: str) -> type:
 # --------------------------------------------------------------------------- #
 _BACKENDS_IMPORTED = False
 
-# Dotted paths for the 7 batch backends (order irrelevant; each self-registers).
+# Dotted paths for the batch backends (order irrelevant; each self-registers).
 _BATCH_BACKEND_MODULES = (
     "maple.function.calculator.uma._uma_batch_calculator",
     "maple.function.calculator.aimnet._aimnet2_batch_calculator",
@@ -100,6 +100,7 @@ _BATCH_BACKEND_MODULES = (
     "maple.function.calculator.mace._mace_batch_calculator",
     "maple.function.calculator.mace._mace_autograd_batch_calculator",
     "maple.function.calculator.mace._macepol_batch_calculator",
+    "maple.function.calculator.mace._maceoff_batch_calculator",
 )
 
 

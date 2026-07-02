@@ -5,9 +5,35 @@ import numpy as np
 from pathlib import Path
 from ase import Atoms
 
+from . import obc as _obc
+
 # --- physical constants ---
 ANG2BOHR = 1.8897259886  # 1 Å = 1.8897 bohr
 OBC_RADIUS_OFFSET_BOHR = 0.09 * ANG2BOHR  # OpenMM/Amber OBC offset: 0.009 nm
+
+# --- default OBC-II per-element parameters (Angstrom radii + HCT screen) ---
+# mbondi-style intrinsic radii (Å) and standard OBC/HCT screening factors.
+# Used only by the model='obc2' path when explicit per-atom radii/screen are not
+# supplied; binding-FE rescoring should pass prmtop-sourced radii/screen instead.
+_MBONDI_RADIUS_ANG = {
+    1: 1.20, 6: 1.70, 7: 1.55, 8: 1.50, 9: 1.50, 15: 1.85, 16: 1.80, 17: 1.70,
+    35: 1.85, 53: 1.98,
+}
+_OBC_SCREEN = {
+    1: 0.85, 6: 0.72, 7: 0.79, 8: 0.85, 9: 0.88, 15: 0.86, 16: 0.96, 17: 0.80,
+    35: 0.80, 53: 0.80,
+}
+_DEFAULT_RADIUS_ANG = 1.50
+_DEFAULT_SCREEN = 0.80
+
+
+def default_obc_radii_screen(atomic_numbers):
+    """Return (radii_nm, screen) numpy arrays for the given atomic numbers."""
+    Z = np.asarray(atomic_numbers, dtype=int)
+    radii_ang = np.array([_MBONDI_RADIUS_ANG.get(int(z), _DEFAULT_RADIUS_ANG) for z in Z])
+    screen = np.array([_OBC_SCREEN.get(int(z), _DEFAULT_SCREEN) for z in Z])
+    return radii_ang * 0.1, screen  # radii in nm
+
 
 def load_gbsa_params(solvent="water"):
     """
@@ -47,22 +73,38 @@ def load_gbsa_params(solvent="water"):
 
 class GBSA(nn.Module):
     """
-    Experimental GB-polar correction with geometry-dependent Born radii.
+    GB implicit-solvent correction for MAPLE.
 
-    This class intentionally does not advertise production GBSA/OBC-II:
-    the nonpolar surface-area term is absent and the descreening integral is
-    a MAPLE heuristic.  It is gated by CommandControl/SetClaculator as an
-    experimental, energy-only correction.
+    Two models are available, selected with ``model=``:
 
-    Input coords in Å, output energy in Hartree. Public forces are disabled
-    because MAPLE's QEq charges are geometry-dependent and are not
-    variationally coupled to this heuristic GB-polar expression.
+    * ``model='legacy'`` (DEFAULT, unchanged): the original experimental
+      GB-polar correction with a MAPLE-heuristic Gaussian-volume descreening and
+      no surface-area term. Energy-only, public forces disabled
+      (``SUPPORTS_FORCES = False``) -- bit-for-bit identical to the historical
+      behaviour so existing energy-only paths are untouched.
+
+    * ``model='obc2'`` (NEW): production OBC-II / HCT Born radii (proper pairwise
+      descreening integral, OpenMM-locked), GB-polar (Still) energy, and a
+      differentiable ACE surface-area nonpolar term. This path advertises
+      ``SUPPORTS_FORCES = True``: at FIXED point charges the GB+SA force is the
+      exact analytic gradient ``-autograd.grad(E, coords)`` (the ML-GBSA
+      assumption -- charges parameterise the GB Coulomb term, the gas-phase
+      energy comes from the MLIP, so there is no dQ/dR consistency problem).
+
+    Input coords in Å, output energy in Hartree.
     """
 
-    def __init__(self, solvent="water", device="cpu"):
+    #: capability flag read by calculator_base to (un)gate solvent derivatives.
+    SUPPORTS_FORCES = False
+
+    def __init__(self, solvent="water", device="cpu", model="legacy",
+                 radii_nm=None, screen=None, solvent_dielectric=None,
+                 include_sa=True):
         super().__init__()
         params = load_gbsa_params(solvent)
         self.device = torch.device(device)
+        self.model = str(model).lower()
+        self.include_sa = bool(include_sa)
 
         # dielectric
         self.eps = float(params["eps"])
@@ -86,6 +128,19 @@ class GBSA(nn.Module):
 
         # small eps to keep numerics stable
         self.eps_dist = torch.tensor(1e-8, dtype=torch.float32, device=self.device)
+
+        # ---- OBC-II (production) configuration ----
+        if self.model == "obc2":
+            self.SUPPORTS_FORCES = True
+            # OBC-II / ai-pbsa-cal recipe lock: extdiel=78.5, intdiel=1.0.
+            self.solvent_dielectric = float(
+                solvent_dielectric if solvent_dielectric is not None else 78.5)
+            self.solute_dielectric = 1.0
+            # optional fixed per-atom radii/screen (e.g. from a prmtop)
+            self._radii_nm = None if radii_nm is None else np.asarray(radii_nm, dtype=float)
+            self._screen = None if screen is None else np.asarray(screen, dtype=float)
+        elif self.model != "legacy":
+            raise ValueError(f"Unknown GBSA model {self.model!r}; use 'legacy' or 'obc2'.")
 
     # ---- intrinsic radii from element table (Bohr) ----
     def intrinsic_radius(self, atom_index: torch.Tensor) -> torch.Tensor:
@@ -141,12 +196,47 @@ class GBSA(nn.Module):
         Ri = torch.clamp(Ri, min=0.5, max=100.0)
         return Ri
 
+    # ---- OBC-II helpers (production path) ----
+    def _resolve_radii_screen(self, atoms: Atoms):
+        """Per-atom (radii_nm, screen) torch tensors for the OBC-II path."""
+        if self._radii_nm is not None and self._screen is not None:
+            radii_nm, screen = self._radii_nm, self._screen
+        else:
+            radii_nm, screen = default_obc_radii_screen(atoms.get_atomic_numbers())
+        rn = torch.as_tensor(radii_nm, dtype=torch.float64, device=self.device)
+        sc = torch.as_tensor(screen, dtype=torch.float64, device=self.device)
+        return rn, sc
+
+    def _obc_energy(self, atoms: Atoms, return_components=False):
+        q_np = atoms.atomic_charges
+        if q_np is None or np.allclose(q_np, 0):
+            raise ValueError("Atoms object must have nonzero partial charges.")
+        q = torch.as_tensor(q_np, dtype=torch.float64, device=self.device)
+        coords_A = torch.as_tensor(atoms.get_positions(), dtype=torch.float64,
+                                   device=self.device)
+        coords_A.requires_grad_(True)
+        radii_nm, screen = self._resolve_radii_screen(atoms)
+        out = _obc.gbsa_energy_hartree(
+            coords_A, q, radii_nm, screen,
+            solute_dielectric=self.solute_dielectric,
+            solvent_dielectric=self.solvent_dielectric,
+            include_sa=self.include_sa,
+            return_components=return_components,
+        )
+        if return_components:
+            e_ha, comp = out
+            return e_ha, coords_A, comp
+        return out, coords_A
+
     # ---- API ----
     def get_energy(self, atoms: Atoms):
         """
         Returns: energy (Eh), coords_A (Å, requires_grad=True)
-        Only GB polar term. Nonpolar removed.
+        legacy: GB polar term only.  obc2: GB polar + ACE surface-area.
         """
+        if self.model == "obc2":
+            return self._obc_energy(atoms)
+
         # charges
         q_np = atoms.atomic_charges
         if q_np is None or np.allclose(q_np, 0):
@@ -180,27 +270,34 @@ class GBSA(nn.Module):
         return E_polar, coords_A
 
     def get_energy_and_force(self, atoms: Atoms):
-        """Public solvent forces are intentionally unavailable."""
-        raise NotImplementedError(
-            "Experimental GB-polar/QEq solvation is energy-only. Forces are "
-            "disabled because MAPLE currently obtains implicit-solvent charges "
-            "from geometry-dependent QEq, but this heuristic GB-polar correction "
-            "does not include the variational charge response dQ/dR. Returning "
-            "a fixed-charge gradient would be inconsistent with the reported "
-            "energy and could produce invalid optimization, MD, transition-state, "
-            "or frequency results. Use energy-only implicit solvation, or switch "
-            "to a production solvent backend that provides energy-consistent "
-            "forces."
-        )
+        """Energy (Eh) and force (Eh/Å) at FIXED point charges.
+
+        Only available on the production ``model='obc2'`` path, where the GB+SA
+        energy is a proper OBC-II expression and the fixed-charge gradient is the
+        physically correct ML-GBSA force.
+        """
+        if self.model != "obc2":
+            raise NotImplementedError(
+                "Experimental legacy GB-polar/QEq solvation is energy-only. Forces "
+                "are disabled because MAPLE obtains those charges from "
+                "geometry-dependent QEq and the heuristic GB-polar correction does "
+                "not include the variational charge response dQ/dR. Use "
+                "model='obc2' (production OBC-II, fixed point charges) for "
+                "dynamics-capable implicit-solvent forces."
+            )
+        energy, coords_A = self.get_energy(atoms)
+        force = -torch.autograd.grad(energy, coords_A, create_graph=False)[0]
+        return energy.detach(), force.detach()
 
     def _debug_energy_gradient_fixed_charges(self, atoms: Atoms):
         """
-        Debug-only fixed-charge gradient of the heuristic GB-polar expression.
+        Debug-only fixed-charge gradient of the (legacy) GB-polar expression.
 
-        This is not a MAPLE implicit-solvent force: it treats
+        This is not a MAPLE implicit-solvent force on the legacy path: it treats
         ``atoms.atomic_charges`` as externally fixed constants and omits the
         QEq charge response dQ/dR. Do not use it for optimization, MD, TS, or
-        frequency workflows.
+        frequency workflows. Use ``model='obc2'`` + ``get_energy_and_force`` for
+        a production force.
         """
         energy, coords_A = self.get_energy(atoms)
         force = -torch.autograd.grad(energy, coords_A, create_graph=False)[0]  # Eh/Å

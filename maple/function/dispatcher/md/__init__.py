@@ -32,6 +32,8 @@ from .ensemble.nvt import NVT
 from .ensemble.npt import NPT
 # Opt-in batched (replica/ensemble) MD; single-structure NVE/NVT path is the oracle.
 from .ensemble.batched import BatchedMD
+# C3: batched canonical (NVT) kernel — single-system NVT is the degenerate B=1 case.
+from .ensemble.nvt_batched import BatchedNVT
 
 # Thermostats
 from .thermostat.langevin import LangevinThermostat
@@ -58,7 +60,7 @@ __all__ = [
     # Ensembles
     'NVE', 'NVT', 'NPT',
     # Batched (replica/ensemble) MD
-    'BatchedMD',
+    'BatchedMD', 'BatchedNVT',
     # Thermostats
     'LangevinThermostat', 'VRescaleThermostat',
     # Barostats

@@ -166,6 +166,19 @@ class MACEPolBatchCalc(BatchCalcABC):
         self._mults_host = None
         self.cand_i = None
         self.cand_j = None
+        # R3-5: loop-invariant single-graph forward tensors, hoisted out of the
+        # per-forward hot path and set in _build_topology() (byte-identical to the
+        # former per-call allocation). Model-specific batch state -- NOT PBC: MACE-POL
+        # is gas-phase (SUPPORTS_PBC=False) and _fwd_cell is a fixed 3x3 zero.
+        # base.__init__ already owns _n_b/_coord_backup; scatter uses the base's flat
+        # _cols (no separate _base layout on this class).
+        self._fwd_batch = None
+        self._fwd_ptr = None
+        self._fwd_cell = None
+        self._fwd_tc = None
+        self._fwd_ts = None
+        self._fwd_ext = None
+        self._fwd_log = None
 
         try:
             self._probe_double_backward()
@@ -180,9 +193,10 @@ class MACEPolBatchCalc(BatchCalcABC):
         ``BatchCalcABC.prepare`` builds the generic layout (ptr/numbers/mol_idx/
         _local_atom/_n_b/_cols flat scatter/coord/nmax_dof), rejects periodic atoms
         (SUPPORTS_PBC=False), validates ``fixed_nmax``, calls ``_build_topology``
-        (the MACE-POL node_attrs / total_charge / total_spin / candidate pairs), and
-        sets ``_prepared=True``. The coupling-mode gating MUST run AFTER that because
-        isolation_check() and the single-graph forward require ``_prepared``.
+        (the MACE-POL node_attrs / total_charge / total_spin / candidate pairs +
+        the R3-5 loop-invariant _fwd_* tensors), and sets ``_prepared=True``. The
+        coupling-mode gating MUST run AFTER that because isolation_check() and the
+        single-graph forward require ``_prepared``.
         """
         super().prepare(atoms_list, fixed_nmax=fixed_nmax)
         B = self._atoms_B
@@ -264,6 +278,20 @@ class MACEPolBatchCalc(BatchCalcABC):
         self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
         self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
 
+        # R3-5 opt: hoist the 7 loop-invariant tensors consumed by the per-step
+        # _forward_single_graph model call out of the hot path (batch/ptr/cell are
+        # geometry-invariant; tc/ts derive from the fixed total_charge/total_spin;
+        # ext/log are the constant zero external-field / unit log-weight). Values are
+        # byte-identical to the former per-forward allocation.
+        N = self.N_atoms
+        self._fwd_batch = torch.zeros(N, dtype=torch.int64, device=device)
+        self._fwd_ptr = torch.tensor([0, N], dtype=torch.int64, device=device)
+        self._fwd_cell = torch.zeros((3, 3), dtype=self.mdtype, device=device)
+        self._fwd_tc = self.total_charge.sum().reshape(1)
+        self._fwd_ts = self.total_spin.sum().reshape(1)
+        self._fwd_ext = torch.zeros((N, 3), dtype=self.mdtype, device=device)
+        self._fwd_log = torch.ones((N,), dtype=self.mdtype, device=device)
+
     # step_cart_ / set_coords_ / backup_coords / restore_coords / _resolve_movable
     # are byte-identical to BatchCalcABC's flat-_cols versions -> inherited (deleted).
 
@@ -298,16 +326,10 @@ class MACEPolBatchCalc(BatchCalcABC):
         B, N = self._atoms_B, self.N_atoms
         coord_leaf = coord.detach().to(device=device, dtype=self.mdtype).requires_grad_(True)
         edge_index, shifts, unit_shifts = self._build_edges(coord_leaf)
-        batch = torch.zeros(N, dtype=torch.int64, device=device)   # single graph
-        ptr = torch.tensor([0, N], dtype=torch.int64, device=device)
-        cell = torch.zeros((3, 3), dtype=self.mdtype, device=device)
-        tc = self.total_charge.sum().reshape(1)                    # one graph total
-        ts = self.total_spin.sum().reshape(1)
-        ext = torch.zeros((N, 3), dtype=self.mdtype, device=device)
-        log = torch.ones((N,), dtype=self.mdtype, device=device)
-
+        # R3-5 opt: reuse the loop-invariant forward tensors hoisted in prepare().
         out = self.model(coord_leaf, self.node_attrs, edge_index, shifts, unit_shifts,
-                         batch, ptr, cell, tc, ts, ext, log)
+                         self._fwd_batch, self._fwd_ptr, self._fwd_cell,
+                         self._fwd_tc, self._fwd_ts, self._fwd_ext, self._fwd_log)
         total_energy, node_energy, _density = out[0], out[1], out[2]
 
         ne = node_energy.reshape(-1)

@@ -84,6 +84,16 @@ class LangevinThermostat:
         self._c1  = np.exp(-self.friction * self.timestep)
         self._c2  = np.sqrt((1.0 - self._c1**2) * kT / self.masses)
 
+    def set_temperature(self, temperature: float) -> None:
+        """Update the target temperature (K) and recompute the OU noise scale.
+
+        c1 = exp(-gamma*dt) is temperature-independent; only c2 carries kT, so a
+        simulated-annealing schedule can retune the thermostat each step cheaply.
+        """
+        self.temperature = float(temperature)
+        kT = self.temperature * KELVIN_TO_HARTREE
+        self._c2 = np.sqrt((1.0 - self._c1 ** 2) * kT / self.masses)
+
     def apply(self, velocities: np.ndarray) -> np.ndarray:
         """
         Apply the LFMiddle Ornstein-Uhlenbeck thermostat step to velocities.

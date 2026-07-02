@@ -181,6 +181,17 @@ class UMABatchCalc(BatchCalcABC):
     ``get_ef_gpu`` / ``get_efh_gpu`` run a single batched forward (plus, for the
     Hessian, chunked batched finite-difference forwards). Coordinates are kept as
     an f64 master tensor; the forward bridges through f32 (UMA runs in f32).
+
+    PBC (Phase-1A): UMA is natively periodic (``AtomicData.from_ase`` reads
+    ``atoms.cell``/``atoms.pbc``; the fairchem periodic tasks omat/oc20/oc22/oc25/
+    odac build minimum-image edges). When the prepared replicas carry a cell this
+    calc (i) requires a PERIODIC task (rejects the molecular ``omol`` task on
+    periodic input, mirroring the single-system gate), (ii) PRESERVES cell+pbc on
+    the per-replica AtomicData, and (iii) REBUILDS the batched AtomicData from the
+    current coordinates EACH forward (``_forward``) so the periodic edges are never
+    stale -- this sidesteps the precomputed-edge (``external_graph_gen``/r_edges)
+    staleness hazard entirely rather than trusting internal regen. The MD loop and
+    ``get_ef_gpu`` return contract are UNCHANGED (cell fixed -> NVT only).
     """
 
     # ---- capability protocol (BatchCalcABC declarative attrs) --------------
@@ -192,6 +203,19 @@ class UMABatchCalc(BatchCalcABC):
     HAS_HVP = True                           # autograd HVP + FD get_hvp (single-struct Dimer path)
     SUPPORTS_COUPLING = False                # block-diagonal batch; molecules are isolated
     BATCHABLE = True
+
+    # ---- batched-MD stack attrs (Phase-B; read outside the BatchCalcABC contract) --
+    # fairchem's per-atom ``batch`` index makes the co-batched graph block-diagonal:
+    # replica energies/forces are independent (no global charge equilibration), so
+    # BatchedNVT/REMD/... accept B>1 (read by nvt_batched._assert_batch_isolated).
+    batch_isolated = True
+    # Graph edge cutoff (matches the ``radius=6.0`` passed to AtomicData.from_ase in
+    # _a2g). box_guard.get_calculator_r_max reads this to enforce side >= 2*r_max for
+    # the periodic minimum-image guard; absent it, the guard silently no-ops.
+    r_max = 6.0
+    # fairchem periodic task names (single-system gate parity, _uma_calculator.py):
+    # periodic replicas require one of these (checked in _build_topology).
+    _PERIODIC_TASKS = ("omat", "oc20", "oc22", "oc25", "odac")
 
     # Back-compat lowercase alias (pre-retrofit callers / sibling backends read this).
     supported_hessian_modes = ("numerical", "autograd")
@@ -317,6 +341,10 @@ class UMABatchCalc(BatchCalcABC):
         self._fwd_count = 0   # diagnostics: total batched model forwards (_forward calls)
         self._ad_list = None
         self._batch_ad = None
+        # PBC (Phase-1A): cell-carrying source atoms cached so the periodic forward can
+        # REBUILD the batch with fresh minimum-image edges each step. base.__init__
+        # already owns _periodic (False default) / _coord_backup.
+        self._src_atoms = None
         # Phase-1b numerical-Hessian plan cache (D3): block-diagonal batch
         # containers + vectorized perturb/scatter index tensors, geometry
         # independent so they are built once per prepare() and reused across
@@ -327,7 +355,13 @@ class UMABatchCalc(BatchCalcABC):
     # ------------------------------------------------------------------ utils
     @staticmethod
     def _ad_atoms(at: Atoms) -> Atoms:
-        """Copy with UMA-convention info: spin = multiplicity, charge = charge."""
+        """Copy with UMA-convention info: spin = multiplicity, charge = charge.
+
+        PBC (Phase-1A): ``at.copy()`` already carries ``cell``/``pbc``; they are kept
+        verbatim so ``AtomicData.from_ase`` builds a PERIODIC neighbourhood for a
+        periodic replica (the previous code only copied ``info`` but ASE ``copy()``
+        preserves cell+pbc, so no extra work is needed -- this is asserted at
+        prepare() and the cell is the calc-internal periodic state)."""
         at = at.copy()
         at.info["spin"] = int(at.info.get("mult", at.info.get("spin", 1)))
         at.info["charge"] = int(at.info.get("charge", 0))
@@ -346,7 +380,42 @@ class UMABatchCalc(BatchCalcABC):
         every forward; per-forward we then only D2D-clone and overwrite ``pos``.
         """
         B = self._atoms_B
-        self._ad_list = [self._a2g(self._ad_atoms(at)) for at in atoms_list]
+
+        # PBC (Phase-1A): the base already set ``self._periodic`` and enforced the
+        # homogeneous-pbc gate against SUPPORTS_PBC. UMA adds the periodic-TASK gate
+        # (reject the molecular ``omol`` task on periodic input, mirroring the
+        # single-system gate) since that constraint is model-specific, not generic.
+        if self._periodic:
+            if self.task_name not in self._PERIODIC_TASKS:
+                raise NotImplementedError(
+                    f"UMABatchCalc got periodic replicas but task='{self.task_name}' is "
+                    f"molecular. Periodic UMA needs a periodic task "
+                    f"{self._PERIODIC_TASKS} (e.g. 'omat'). Rebuild the calc with "
+                    f"task='omat' for condensed-phase PBC.")
+            # ANTI-STALE-NEIGHBOR (R3-1): the periodic forward REBUILDS the batched
+            # AtomicData from current coords every step (_rebuild_periodic_batch), so
+            # periodic edges+shifts are ALWAYS fresh -- this holds even when
+            # external_graph_gen/r_edges=True (the precomputed edges are recomputed by
+            # from_ase each step) and is immune to the pos-overwrite-only staleness bug.
+            # Caveat: with torch.compile/fast_inference the per-step edge COUNT varies
+            # as atoms drift, so the compiled graph recompiles (correctness preserved,
+            # throughput may drop) -- warn once.
+            if (self._fast_inference or self._compile_model) and not getattr(
+                    self, "_warned_pbc_compile", False):
+                import warnings
+                warnings.warn(
+                    "UMABatchCalc periodic path rebuilds the neighbour graph each "
+                    "forward (fresh edges/shifts); torch.compile/fast_inference will "
+                    "recompile on the varying edge count. Correct but slower -- consider "
+                    "compile_model=False for periodic NVT.")
+                self._warned_pbc_compile = True
+
+        # Per-molecule AtomicData templates + reusable device-resident batched template.
+        # PBC: keep the per-replica UMA-convention ASE atoms (cell+pbc preserved by
+        # ASE ``copy()``) so the periodic forward can REBUILD the batch with fresh edges
+        # each step; the molecular path only D2D-clones this template + overwrites pos.
+        self._src_atoms = [self._ad_atoms(at) for at in atoms_list]
+        self._ad_list = [self._a2g(a) for a in self._src_atoms]
         self._batch_ad = (
             self._to_device(atomicdata_list_to_batch(self._ad_list)) if B > 0 else None
         )
@@ -384,6 +453,25 @@ class UMABatchCalc(BatchCalcABC):
         bidx = batch_ad.batch.to(self.device)
         return E, F, bidx
 
+    def _rebuild_periodic_batch(self, coord: torch.Tensor):
+        """PBC: rebuild the batched AtomicData from the CURRENT coordinates so the
+        periodic neighbour list is regenerated fresh every forward.
+
+        Overwriting only ``ad.pos`` on a cloned template (the isolated fast path)
+        would reuse a STALE periodic edge list once atoms drift across the box face
+        (the design's correctness hazard #5). Rebuilding via ``from_ase`` on the
+        cell-carrying source atoms emits the correct minimum-image edges each step
+        regardless of whether the model uses external or internal graph generation.
+        Cell/pbc are fixed (NVT) and taken from the prepare-time source atoms.
+        """
+        cpu = coord.detach().to("cpu", torch.float64).numpy()
+        ad_list = []
+        for i, at in enumerate(self._src_atoms):
+            a = at.copy()
+            a.set_positions(cpu[int(self._ptr[i]):int(self._ptr[i + 1])])
+            ad_list.append(self._a2g(a))
+        return atomicdata_list_to_batch(ad_list)
+
     def _forward(self, coord: torch.Tensor, need_graph: bool = False):
         """ONE batched forward -> BatchCalcABC contract (E_eV (B,), F_eV (N,3),
         leaf|None) in NATIVE eV (the base converts once via MODEL_ENERGY_UNIT; do
@@ -393,10 +481,13 @@ class UMABatchCalc(BatchCalcABC):
         the pre-retrofit ``_forward`` (single batched forward, detached). UMA's own
         overrides (get_ef_gpu / _get_efh_numerical / _get_efh_gpu_legacy) call this
         variant and pack the eV->Hartree conversion themselves, so they are
-        unchanged. need_graph=True: return the grad-enabled energy-graph force field
-        + the requires_grad position leaf (delegates to _forward_fall_graph, the
-        SAME construction the autograd Hessian/HVP path uses), satisfying the base's
-        generic _efh_analytic path.
+        unchanged. PBC (Phase-1A): when the batch is periodic the inference path
+        REBUILDS the batch from current coords (``_rebuild_periodic_batch``) so the
+        minimum-image edges stay fresh (anti-stale-neighbor); the molecular path
+        D2D-clones the device-resident template + overwrites pos. need_graph=True:
+        return the grad-enabled energy-graph force field + the requires_grad position
+        leaf (delegates to _forward_fall_graph, the SAME construction the autograd
+        Hessian/HVP path uses), satisfying the base's generic _efh_analytic path.
         """
         if need_graph:
             leaf = coord.detach().to(torch.float32).requires_grad_(True)
@@ -406,8 +497,11 @@ class UMABatchCalc(BatchCalcABC):
         # _to_device inside _predict_forces is the only one left (no-op here, kept
         # for the CPU-built batches passed at the partial/full-Hessian call sites).
         self._fwd_count += 1
-        ad = self._clone_batch()
-        ad.pos = coord.to(device=self.device, dtype=torch.float32)
+        if getattr(self, "_periodic", False):
+            ad = self._to_device(self._rebuild_periodic_batch(coord))
+        else:
+            ad = self._clone_batch()
+            ad.pos = coord.to(device=self.device, dtype=torch.float32)
         E, F, _ = self._predict_forces(ad)
         return E, F.reshape(self.N_atoms, 3), None
 
@@ -426,6 +520,26 @@ class UMABatchCalc(BatchCalcABC):
         if self.N_atoms > 0:
             F_pad.reshape(-1)[self._cols] = F_eV.reshape(-1)  # vectorized scatter
         return E_eV * EV2HARTREE, F_pad * EV2HARTREE
+
+    # --------------------------------------------------- block-diagonal isolation
+    def isolation_check(self, perturb: float = 0.05) -> float:
+        """Perturb replica-0 atom-0 and return the max ENERGY leak into the OTHER
+        replicas [Ha] (mirrors MaceOffBatchCalc.isolation_check).
+
+        fairchem's ``atomicdata_list_to_batch`` tags every atom with a per-replica
+        ``batch`` index, so the co-batched graph is BLOCK-DIAGONAL: a displacement
+        inside replica 0 can only re-wire replica 0's own node block (its periodic
+        edges are rebuilt from replica 0's coords alone) and cannot reach another
+        replica. The residual leak floor is UMA's fp32 GPU-forward nondeterminism
+        (~1e-6, D-59), NOT exactly 0.0 as for the fp64-deterministic MACE-OFF path.
+        """
+        assert self._prepared and self._atoms_B >= 2
+        E0, _ = self.get_ef_gpu()
+        self.backup_coords()
+        self.coord[0, 0] += float(perturb)
+        E1, _ = self.get_ef_gpu()
+        self.restore_coords()
+        return float((E1[1:] - E0[1:]).abs().max().item())
 
     # ------------------------------------------------- partial-Hessian helper
     def _movable_key(self, movable_masks):
