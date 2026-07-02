@@ -14,6 +14,8 @@ Batched (one MLIP forward over B replicas) + enhanced-sampling ensembles:
     - BatchedGaMD: batched GaMD + ParGaMD weighted-ensemble
     - BatchedSMD: batched constant-velocity steered MD -> Jarzynski Delta-G
     - REMD: temperature replica-exchange ridden on the batched NVT kernel
+    - WeightedEnsemble: WE rare-event sampling (split/merge walkers) on the batched
+      NVT kernel -- weight-conserving, unbiased; steady-state flux -> MFPT
 """
 
 from .nve import NVE
@@ -27,8 +29,10 @@ from .gamd_batched import BatchedGaMD
 from .smd_batched import BatchedSMD
 from .remd import REMD, REMDParams
 from .hremd_rest2 import REST2, REST2Params
+from .weighted_ensemble import WeightedEnsemble, WEParams, we_split_merge
 
 __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'BatchedNPT', 'BatchedNPTParams',
            'BatchedUmbrella', 'BatchedGaMD', 'BatchedSMD', 'REMD', 'REMDParams',
-           'REST2', 'REST2Params']
+           'REST2', 'REST2Params',
+           'WeightedEnsemble', 'WEParams', 'we_split_merge']
