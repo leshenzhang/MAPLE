@@ -30,7 +30,7 @@ from .steered_batched import BatchedMovingRestraint
 # numpy-only, so importing this package stays safe on a torch-less box).
 from .ml_cv import (CommittorCV, CommittorMetaD, IdentityDescriptor,
                     PairwiseDistanceDescriptor, DihedralDescriptor,
-                    CompositeDescriptor)
+                    CompositeDescriptor, MLIPLatentDescriptor)
 from .eabf import (ExtendedABF, ABFGrid, czar_pmf, eabf_toy_1d, attach_eabf)
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
@@ -41,7 +41,7 @@ __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "BatchedGaMD", "BatchedMovingRestraint",
            "CommittorCV", "CommittorMetaD", "IdentityDescriptor",
            "PairwiseDistanceDescriptor", "DihedralDescriptor",
-           "CompositeDescriptor",
+           "CompositeDescriptor", "MLIPLatentDescriptor",
            "ExtendedABF", "ABFGrid", "czar_pmf", "eabf_toy_1d", "attach_eabf"]
 
 

@@ -49,8 +49,12 @@ CV path does. Isolated (non-periodic) replicas (inherited from ``BatchedNVT``).
 ponytail shortcuts (name the upgrade path)
 ------------------------------------------
 * Descriptors are simple internal coordinates (pairwise distances / dihedrals).
-  UPGRADE: swap in MLIP-latent features (e.g. the MACE node embedding) as the
-  descriptor -- the CV/train API is unchanged (any callable ``pos->features``).
+  UPGRADE (ES-8, IMPLEMENTED): :class:`MLIPLatentDescriptor` swaps in MLIP-latent
+  features (the MACE per-atom node embedding, pooled to a fixed-size vector) as the
+  descriptor -- the CV/train API is unchanged (it is just another callable
+  ``pos->features``). With the positions fed as the mace forward's autograd leaf the
+  descriptor is DIFFERENTIABLE-through-positions, so ``dq/dx`` stays EXACT
+  end-to-end; a detached mode gives a fixed per-frame descriptor (``dq/dfeat`` only).
 * The Dirichlet energy is computed with the IDENTITY metric in descriptor space
   (``|grad_feat q|^2``). For the value/gradient CV used to BIAS we still take the
   exact physical ``dq/dx`` via autograd through the descriptor. UPGRADE: use the
@@ -147,6 +151,109 @@ class CompositeDescriptor:
     def __call__(self, pos):
         import torch
         return torch.cat([d(pos).reshape(-1) for d in self.descriptors])
+
+
+class MLIPLatentDescriptor:
+    """Descriptor = the MLIP backend's OWN learned per-atom node embeddings, pooled
+    to a fixed-size CV input (ES-8 -- the upgrade path named in this module's
+    docstring). Instead of hand-picked distances / dihedrals, the committor MLP
+    rides the MACE message-passing representation of the configuration.
+
+    The backend (a :class:`maple.function.calculator.mace._maceoff_batch_calculator.
+    MaceOffBatchCalc`) exposes ``node_features(coord_leaf, ...)`` -> per-atom node
+    feats ``(n, F)``; this descriptor pools them over the atoms (or a selected
+    ``group``) to a FIXED-size ``(F,)`` vector (independent of n), so it is a
+    drop-in for the existing ``pos -> features`` descriptor contract:
+    ``CommittorCV(descriptor=MLIPLatentDescriptor(...))`` works UNCHANGED and feeds
+    metaD / OPES via :class:`CommittorMetaD`.
+
+    Differentiability (feasibility crux -- stated honestly)
+    -------------------------------------------------------
+    * ``differentiable=True`` (default): the positions are fed as the autograd LEAF
+      of the mace forward, so the node feats -- hence the pooled descriptor -- carry
+      grad back to ``x``. The committor gradient ``dq/dx`` is then EXACT end-to-end
+      (autograd through the MACE forward), verified FD-vs-autograd in the gate. The
+      only non-smooth points are neighbour-list connectivity changes at ``r_max``
+      (measure-zero, identical to the MLIP force's own kinks).
+    * ``differentiable=False``: node feats are DETACHED (a fixed per-frame
+      descriptor). Biasing still works -- ``dq/dfeat`` is exact through the MLP --
+      but the descriptor is piecewise-fixed in x (no ``dq/dx`` from the embedding);
+      :meth:`CommittorCV.value_and_grad` (which returns ``dq/dx``) is not applicable
+      in that mode.
+
+    Rotation/translation invariance: node feats depend only on edge vectors
+    (translation-invariant); ``invariants_only=True`` (default) keeps only the l=0
+    channels so pooling is rotation-invariant too -- the CV is a proper scalar
+    reaction coordinate.
+
+    The backend is PREPARED for this single CV system at construction (B=1). Pass a
+    DEDICATED backend instance: ``prepare()`` resets its batch to the CV molecule,
+    so do NOT share it with the MD forces backend.
+    """
+
+    KIND = "mlip_latent"
+
+    def __init__(self, backend, atoms=None, atomic_numbers=None,
+                 init_positions=None, pool="mean", group=None,
+                 invariants_only=True, num_layers=None, differentiable=True):
+        import torch
+        self.backend = backend
+        self.pool = str(pool).lower()
+        if self.pool not in ("mean", "sum"):
+            raise ValueError("MLIPLatentDescriptor pool must be 'mean' or 'sum'.")
+        self.invariants_only = bool(invariants_only)
+        self.num_layers = num_layers
+        self.differentiable = bool(differentiable)
+        atoms = self._resolve_atoms(atoms, atomic_numbers, init_positions)
+        self.n_atoms = len(atoms)
+        backend.prepare([atoms])                          # B=1: THIS CV system
+        self.group = (None if group is None
+                      else np.asarray(group, dtype=int).reshape(-1))
+        # probe the fixed feature width ONCE (architecture-fixed; geometry-invariant).
+        with torch.no_grad():
+            nf = backend.node_features(invariants_only=self.invariants_only,
+                                       num_layers=self.num_layers, detach=True)
+        self._nfeat = int(nf.shape[1])
+
+    @staticmethod
+    def _resolve_atoms(atoms, atomic_numbers, init_positions):
+        """Build the ASE Atoms that PREPAREs the backend for this CV system. Only Z +
+        atom count drive the geometry-invariant static cache; per-call the REAL
+        positions are fed as the forward leaf, so a spread dummy geometry is fine
+        when only ``atomic_numbers`` is given."""
+        if atoms is not None:
+            return atoms
+        if atomic_numbers is None:
+            raise ValueError("MLIPLatentDescriptor needs `atoms` or `atomic_numbers`.")
+        from ase import Atoms
+        Z = np.asarray(atomic_numbers, dtype=int).reshape(-1)
+        if init_positions is None:
+            init_positions = np.stack(
+                [np.arange(len(Z)) * 1.2, np.zeros(len(Z)), np.zeros(len(Z))], axis=1)
+        return Atoms(numbers=Z, positions=np.asarray(init_positions, dtype=float))
+
+    def n_features(self):
+        return self._nfeat
+
+    def __call__(self, pos):
+        """``pos`` (n,3) Angstrom -> pooled latent feature vector ``(F,)`` (torch).
+        Differentiable through the MACE forward w.r.t. ``pos`` (``differentiable=
+        True``), so :meth:`CommittorCV.value_and_grad` gets the exact end-to-end
+        ``dq/dx``; detached (fixed descriptor) otherwise."""
+        import torch
+        p = (pos if torch.is_tensor(pos)
+             else torch.as_tensor(np.asarray(pos, dtype=float), dtype=torch.float64))
+        p = p.reshape(self.n_atoms, 3)
+        leaf = p.to(self.backend.device, self.backend.dtype)   # forward leaf (grad kept)
+        nf = self.backend.node_features(coord_leaf=leaf,
+                                        invariants_only=self.invariants_only,
+                                        num_layers=self.num_layers,
+                                        detach=not self.differentiable)   # (n, F)
+        if self.group is not None:
+            idx = torch.as_tensor(self.group, dtype=torch.long, device=nf.device)
+            nf = nf.index_select(0, idx)
+        feat = nf.mean(0) if self.pool == "mean" else nf.sum(0)           # (F,)
+        return feat.to(device=p.device, dtype=torch.float64)             # CV-MLP space
 
 
 # --------------------------------------------------------------------------- #

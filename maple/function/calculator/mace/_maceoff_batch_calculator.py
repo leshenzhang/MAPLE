@@ -594,6 +594,99 @@ class MaceOffBatchCalc(BatchCalcABC):
         S_Ha = S.detach() * EV2HARTREE
         return E_m_Ha, F_Ha, S_Ha
 
+    # ------------------------------------------------ latent node features (ES-8)
+    def _latent_meta(self):
+        """Cache ``(num_interactions, l_max, n_invariant_features)`` from the model
+        architecture (mirrors ``mace.calculators.MACECalculator.get_descriptors``),
+        used to slice the invariant (l=0) part out of the concatenated node feats.
+        ``e3nn.o3`` is a mace dependency (importable once the model is loaded)."""
+        if getattr(self, "_latent_meta_cache", None) is None:
+            from e3nn import o3
+            num_interactions = int(self.model.num_interactions)
+            irreps_out = o3.Irreps(str(self.model.products[0].linear.irreps_out))
+            l_max = int(irreps_out.lmax)
+            n_inv = int(irreps_out.dim // (l_max + 1) ** 2)
+            self._latent_meta_cache = (num_interactions, l_max, n_inv)
+        return self._latent_meta_cache
+
+    @staticmethod
+    def _extract_invariant(x, num_layers, n_features, l_max):
+        """Keep the l=0 (rotation-invariant) block of each interaction layer from the
+        concatenated ``node_feats`` (VERBATIM the mace ``extract_invariant`` slice:
+        the last layer is already invariant-only, and every earlier layer's block
+        begins at ``i*(l_max+1)^2*n_features`` with its invariant part first)."""
+        out = [x[:, :n_features]]
+        for i in range(1, num_layers):
+            out.append(x[:, i * (l_max + 1) ** 2 * n_features:
+                          (i * (l_max + 1) ** 2 + 1) * n_features])
+        return torch.cat(out, dim=-1)
+
+    def node_features(self, coord_leaf=None, invariants_only=True,
+                      num_layers=None, detach=False):
+        """Features-only forward -> per-atom MACE node embeddings ``(N_atoms, F)``.
+
+        ES-8 latent-CV extraction hook. Exposes the MLIP's OWN learned per-atom node
+        features -- the per-interaction-layer node feats MACE concatenates in its
+        forward (``out["node_feats"]``) -- so a committor / reaction ML-CV can ride
+        the LEARNED representation as its descriptor
+        (:class:`bias.ml_cv.MLIPLatentDescriptor`) instead of hand-picked internal
+        coordinates. It reuses the SAME validated static batch + on-GPU edge build as
+        the E/F path (``_build_static_cache`` + ``_build_edges_gpu``); only the
+        returned quantity differs (node feats, no force forward).
+
+        Parameters
+        ----------
+        coord_leaf : (N_atoms, 3) torch tensor | None
+            Positions leaf in the PREPARED batch ordering [Angstrom]. ``None`` -> use
+            the calc's current master coord (detached). Pass a ``requires_grad`` leaf
+            to get node features DIFFERENTIABLE w.r.t. positions (autograd through the
+            mace message passing) -- this is what makes the downstream CV gradient
+            ``dq/dx`` EXACT end-to-end.
+        invariants_only : bool
+            Keep only the l=0 (rotation-invariant) channels of each layer's node feats
+            (mirrors ``get_descriptors``). The equivariant l>0 channels rotate with
+            the frame, so pooling them would break the CV's rotational invariance --
+            default True.
+        num_layers : int | None
+            Number of interaction layers to keep (``None`` -> all).
+        detach : bool
+            Return a detached (fixed per-frame) descriptor. The CV is then
+            differentiable only through the MLP on fixed features (``dq/dfeat``
+            exact), with the descriptor piecewise-fixed in x.
+
+        Returns
+        -------
+        (N_atoms, F) torch tensor on the calc device/dtype (F = invariant feature
+        width summed over the kept layers; ``F_full`` if ``invariants_only=False``).
+        """
+        assert self._prepared, "call prepare() first"
+        if self.B == 0 or self.N_atoms == 0:
+            return torch.zeros((0, 0), dtype=self.dtype, device=self.device)
+        if coord_leaf is None:
+            coord = self.coord.detach().to(self.device, self.dtype)
+        else:
+            coord = coord_leaf.to(self.device, self.dtype)
+        edge_index, shifts, unit_shifts = self._build_edges_gpu(coord)
+        d = dict(self._static)                       # shallow copy; static tensors reused
+        d["positions"] = coord
+        d["edge_index"] = edge_index
+        d["shifts"] = shifts
+        d["unit_shifts"] = unit_shifts
+        # NO torch.no_grad(): when coord_leaf requires grad, node_feats must carry the
+        # graph back to positions (the end-to-end differentiable path). compute_force
+        # is off -- we only need the node representation, not -dE/dr.
+        out = self.model(d, compute_force=False, training=False)
+        nf = out["node_feats"]                                  # (N_atoms, F_full)
+        num_interactions, l_max, n_inv = self._latent_meta()
+        n_keep = num_interactions if num_layers is None else int(num_layers)
+        n_keep = max(1, min(n_keep, num_interactions))
+        if invariants_only:
+            nf = self._extract_invariant(nf, n_keep, n_inv, l_max)
+        elif num_layers is not None:
+            widths = [(l_max + 1) ** 2 * n_inv] * (num_interactions - 1) + [n_inv]
+            nf = nf[:, :int(sum(widths[:n_keep]))]
+        return nf.detach() if detach else nf
+
     # -------------------------------------------------------------- stress (2C)
     def _batched_efs_eV(self):
         """ONE stress-enabled multi-graph forward -> (E_eV (B,), F_eV (N,3),
