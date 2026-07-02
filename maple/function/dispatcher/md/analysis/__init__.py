@@ -38,6 +38,11 @@ from .msd import compute_msd, unwrap_positions
 from .rmsf_rmsd import compute_rmsd, compute_rmsf, kabsch_rotate
 from .density import total_density, density_profile
 from .hbonds import count_hbonds
+from .control_variate import (
+    control_variate_estimate,
+    batched_O_C,
+    batched_control_variate,
+)
 
 __all__ = [
     "DCDTrajReader",
@@ -57,4 +62,7 @@ __all__ = [
     "total_density",
     "density_profile",
     "count_hbonds",
+    "control_variate_estimate",
+    "batched_O_C",
+    "batched_control_variate",
 ]
