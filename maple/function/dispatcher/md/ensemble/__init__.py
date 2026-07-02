@@ -24,6 +24,8 @@ Batched (one MLIP forward over B replicas) + enhanced-sampling ensembles:
       batch axis) on the batched NVT kernel -- unbiased free-energy ladder (log-Z
       ratio) + annealed importance weights; no CV, no bins
     - TPS: transition path sampling (aimless shooting), batch = N shooting trials
+    - ForwardFluxSampling: direct FFS interface rates for irreversible/high-barrier
+      rare events, batch = N parallel trial shots per interface -> k_AB = Phi_A * prod P
 """
 
 from .nve import NVE
@@ -45,6 +47,8 @@ from .population_annealing import (
     systematic_resample, residual_resample, resample_indices,
     reduced_free_energy_increment)
 from .tps import TPS, TPSParams, OrderParameter, committor_fraction
+from .ffs import (ForwardFluxSampling, FFSParams,
+                  count_interface_crossings, ffs_rate)
 
 __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'BatchedNPT', 'BatchedNPTParams',
@@ -57,3 +61,6 @@ __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'systematic_resample', 'residual_resample', 'resample_indices',
            'reduced_free_energy_increment',
            'TPS', 'TPSParams', 'OrderParameter', 'committor_fraction']
+           'TPS', 'TPSParams', 'OrderParameter', 'committor_fraction',
+           'ForwardFluxSampling', 'FFSParams',
+           'count_interface_crossings', 'ffs_rate']
