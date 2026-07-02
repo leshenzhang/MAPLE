@@ -26,13 +26,21 @@ from . import umbrella
 from . import wham2d
 from .batched import BatchedHarmonicRestraint, BatchedGaMD
 from .steered_batched import BatchedMovingRestraint
+# Learned committor collective variable (torch-lazy: ml_cv's top level is
+# numpy-only, so importing this package stays safe on a torch-less box).
+from .ml_cv import (CommittorCV, CommittorMetaD, IdentityDescriptor,
+                    PairwiseDistanceDescriptor, DihedralDescriptor,
+                    CompositeDescriptor)
 
 __all__ = ["maybe_wrap_bias", "PlumedCalculator", "ColvarsCalculator",
            "PosresCalculator", "posres_enabled", "GamdCalculator",
            "gamd_enabled", "gamd_params", "gamd_reweight_1d",
            "SteeredMDCalculator", "smd_enabled", "jarzynski_1d",
            "read_smd_work", "umbrella", "wham2d", "BatchedHarmonicRestraint",
-           "BatchedGaMD", "BatchedMovingRestraint"]
+           "BatchedGaMD", "BatchedMovingRestraint",
+           "CommittorCV", "CommittorMetaD", "IdentityDescriptor",
+           "PairwiseDistanceDescriptor", "DihedralDescriptor",
+           "CompositeDescriptor"]
 
 
 def maybe_wrap_bias(atoms, params, output):
