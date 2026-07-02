@@ -13,6 +13,7 @@ Batched (one MLIP forward over B replicas) + enhanced-sampling ensembles:
     - BatchedUmbrella: batched umbrella sampling (harmonic windows)
     - BatchedGaMD: batched GaMD + ParGaMD weighted-ensemble
     - BatchedSMD: batched constant-velocity steered MD -> Jarzynski Delta-G
+    - BatchedEABF: batched extended-system ABF (eABF) -> CZAR PMF
     - REMD: temperature replica-exchange ridden on the batched NVT kernel
 """
 
@@ -25,10 +26,12 @@ from .npt_batched import BatchedNPT, BatchedNPTParams
 from .umbrella_batched import BatchedUmbrella
 from .gamd_batched import BatchedGaMD
 from .smd_batched import BatchedSMD
+from .eabf_batched import BatchedEABF, ExtendedABFParams
 from .remd import REMD, REMDParams
 from .hremd_rest2 import REST2, REST2Params
 
 __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'BatchedNPT', 'BatchedNPTParams',
-           'BatchedUmbrella', 'BatchedGaMD', 'BatchedSMD', 'REMD', 'REMDParams',
+           'BatchedUmbrella', 'BatchedGaMD', 'BatchedSMD',
+           'BatchedEABF', 'ExtendedABFParams', 'REMD', 'REMDParams',
            'REST2', 'REST2Params']
