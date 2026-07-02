@@ -46,6 +46,7 @@ from ase import Atoms
 from ...jobABC import JobABC
 from maple.function.timer import timer
 from maple.function.utility import Molecules
+from maple.function.dispatcher._batch_calc_utils import is_batch_calc, is_coupled
 
 from ..thermostat.langevin import LangevinThermostat
 from ..thermostat.vrescale import VRescaleThermostat
@@ -131,8 +132,6 @@ class BatchedNVT(JobABC):
     """Batched canonical (NVT) MD over B replicas with one forward per step."""
 
     _THERMOSTAT_CHOICES = {"langevin", "v-rescale", "nose-hoover", "nhc"}
-    # class names whose batch couples systems (per-system energies NOT independent)
-    _COUPLED_CALC_NAMES = {"AIMNet2BatchCalc", "MACEPolBatchCalc"}
 
     def __init__(self, output: str,
                  systems: Union[Molecules, List[Atoms]],
@@ -153,8 +152,7 @@ class BatchedNVT(JobABC):
         if calc is None:
             raise ValueError("BatchedNVT requires a batched calculator (Molecules.calc, "
                              "atoms[0].calc, or the calc= argument).")
-        if not (callable(getattr(calc, "prepare", None))
-                and callable(getattr(calc, "get_ef_gpu", None))
+        if not (is_batch_calc(calc)
                 and callable(getattr(calc, "step_cart_", None))):
             raise TypeError("BatchedNVT needs a batch calculator exposing "
                             "prepare()/get_ef_gpu()/step_cart_(). A plain ASE "
@@ -201,9 +199,9 @@ class BatchedNVT(JobABC):
         if B <= 1:
             return                                  # one system: coupling is moot
         name = type(calc).__name__
-        flag = getattr(calc, "batch_isolated", None)
-        coupled = (flag is False) or (name in cls._COUPLED_CALC_NAMES) or (
-            "AIMNet2" in name and "Decoupled" not in name)
+        # capability-driven coupling test (dispatcher/_batch_calc_utils): declarative
+        # SUPPORTS_COUPLING / coupling_mode, replacing the hardcoded class-name set.
+        coupled = (getattr(calc, "batch_isolated", None) is False) or is_coupled(calc)
         if coupled:
             raise ValueError(
                 f"BatchedNVT B={B}>1 requires a batch-ISOLATED calculator (per-system "

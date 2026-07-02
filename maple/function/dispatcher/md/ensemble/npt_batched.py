@@ -60,6 +60,7 @@ from ase.calculators.calculator import Calculator, all_changes
 from ...jobABC import JobABC
 from maple.function.timer import timer
 from maple.function.utility import Molecules
+from maple.function.dispatcher._batch_calc_utils import is_coupled
 
 from ..thermostat.vrescale import VRescaleThermostat
 from ..barostat.berendsen import BerendsenBarostat
@@ -161,7 +162,6 @@ class BatchedNPT(JobABC):
 
     _THERMOSTAT_CHOICES = {"v-rescale"}
     _BAROSTAT_CHOICES = {"berendsen", "c-rescale"}
-    _COUPLED_CALC_NAMES = {"AIMNet2BatchCalc", "MACEPolBatchCalc"}
 
     def __init__(self, output: str,
                  systems: Union[Molecules, List[Atoms]],
@@ -224,9 +224,9 @@ class BatchedNPT(JobABC):
         if B <= 1:
             return
         name = type(calc).__name__
-        flag = getattr(calc, "batch_isolated", None)
-        coupled = (flag is False) or (name in cls._COUPLED_CALC_NAMES) or (
-            "AIMNet2" in name and "Decoupled" not in name)
+        # capability-driven coupling test (dispatcher/_batch_calc_utils): declarative
+        # SUPPORTS_COUPLING / coupling_mode, replacing the hardcoded class-name set.
+        coupled = (getattr(calc, "batch_isolated", None) is False) or is_coupled(calc)
         if coupled:
             raise ValueError(
                 f"BatchedNPT B={B}>1 requires a batch-ISOLATED calculator; '{name}' "
