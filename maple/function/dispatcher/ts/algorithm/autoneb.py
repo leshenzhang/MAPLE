@@ -1481,6 +1481,8 @@ class AutoNEBBatch(JobABC):
         name = type(calc).__name__.lower()
         if "decoupl" in name or getattr(calc, "batch_decoupled", False) is True:
             return False                            # decoupled variants are safe
+        if bool(getattr(calc, "SUPPORTS_COUPLING", False)):  # declarative capability (BatchCalcABC)
+            return True
         if hasattr(calc, "coupling_mode"):          # MACEPolBatchCalc
             return True
         if "pol" in name or "nse" in name:          # polarizable / global charge-eq

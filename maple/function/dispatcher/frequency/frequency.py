@@ -545,10 +545,18 @@ class FrequencyBase(JobABC):
         """
         if self._batched_calc is not None:
             return self._batched_calc
-        if (calc is not None
-                and callable(getattr(calc, "prepare", None))
-                and callable(getattr(calc, "get_ef_gpu", None))):
+        from .._batch_calc_utils import is_batch_calc
+        if is_batch_calc(calc):
             return calc
+        # Non-UMA registered backend via the unified factory (opt-in by model
+        # name; UMA default path below unchanged / validated).
+        _name = str(getattr(self.params, "batch_model", None)
+                    or getattr(self.params, "model", None) or "").split("(")[0].strip().lower()
+        if _name and "uma" not in _name:
+            import torch as _torch
+            from maple.function.calculator.batch_calculator_base import make_batch_calc
+            return make_batch_calc(_name, model_path=self._batch_model_path,
+                                   device=self._batch_device, dtype=_torch.float64)
         if self._batch_model_path is not None:
             import torch as _torch
             from maple.function.calculator.uma._uma_batch_calculator import UMABatchCalc

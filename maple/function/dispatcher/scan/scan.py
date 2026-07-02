@@ -376,6 +376,18 @@ class Scan(JobABC):
         if calc is not None:
             return calc
         model_path = self.params.get("batch_model_path")
+        # Non-UMA registered backend via the unified factory (opt-in by model
+        # name). The UMA default path below is unchanged (validated). A caller
+        # names a non-UMA backend via params['batch_model'] / params['model'].
+        _name = str(self.params.get("batch_model") or self.params.get("model") or "").split("(")[0].strip().lower()
+        if _name and "uma" not in _name:
+            import torch as _t
+            from maple.function.calculator.batch_calculator_base import make_batch_calc
+            return make_batch_calc(
+                _name, model_path=model_path,
+                device=self.params.get("batch_device", "cuda"),
+                dtype=self.params.get("batch_dtype", _t.float64),
+                **(self.params.get("batch_model_options") or {}))
         if model_path is None:
             raise ValueError(
                 "batched=True requires params['batched_calc'] (a prepared batched "
