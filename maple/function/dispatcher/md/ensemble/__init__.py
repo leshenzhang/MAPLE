@@ -60,7 +60,6 @@ __all__ = ['NVE', 'NVT', 'NPT', 'BatchedMD', 'BatchedNVT', 'BatchedNVTParams',
            'PopulationAnnealing', 'PopulationAnnealingParams',
            'systematic_resample', 'residual_resample', 'resample_indices',
            'reduced_free_energy_increment',
-           'TPS', 'TPSParams', 'OrderParameter', 'committor_fraction']
            'TPS', 'TPSParams', 'OrderParameter', 'committor_fraction',
            'ForwardFluxSampling', 'FFSParams',
            'count_interface_crossings', 'ffs_rate']
