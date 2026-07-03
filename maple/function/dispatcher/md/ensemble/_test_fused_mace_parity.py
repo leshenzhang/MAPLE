@@ -10,10 +10,22 @@ even under a real MLIP.
           stale before B-154).
 
 Run under cxtorch on an A100 (sitecustomize.py stubs the broken torchvision).
+
+THRESHOLD: with a REAL MLIP, fused (on-device fp64 tensor ops) vs non-fused (per-
+replica numpy roundtrip) agree only to MACHINE PRECISION, not exact bits -- the OU
+substep is bit-identical (fused-loop GATE0) but the surrounding VV drift/kick rounds
+differently on-device (FMA) vs in numpy, accumulating ~machine-eps/step that does NOT
+grow (a real algorithmic difference -- e.g. a stale buffer -- would blow up by orders
+of magnitude, cf. the pre-fix PA d(lnZ)=0.111).  So the gate is ``dc < TOL`` with TOL
+= 1e-10 A (>> machine-eps accumulation ~1e-15, << any real divergence).  Matches the
+B-152/B-153 A100 acceptance of nvt fused dpos=1.55e-15 as "bit-identical".  The toy-
+calc compat gate keeps its exact-0 assert because trivial forces round identically.
 """
 import os
 import numpy as np
 import torch
+
+TOL = 1e-10   # machine-precision parity gate for a real MLIP (see module docstring)
 
 from ase.build import molecule
 
@@ -46,9 +58,9 @@ def gate_a_nvt(steps=200, B=4, seed=42):
                          paras=dict(base, steps=steps, fused_loop=fused)).run()
         outs[fused] = _coord(bc)
     dc = float(np.max(np.abs(outs[True] - outs[False])))
-    print(f"[GATE A nvt-MACE] B={B} steps={steps}  fused ON vs OFF  max|dcoord|={dc:.3e} A")
-    assert dc == 0.0, f"MACE BatchedNVT fused not bit-identical (dcoord={dc})"
-    print("[GATE A] PASS  (real-MLIP fused nvt bit-identical)")
+    print(f"[GATE A nvt-MACE] B={B} steps={steps}  fused ON vs OFF  max|dcoord|={dc:.3e} A  (tol {TOL:.0e})")
+    assert dc < TOL, f"MACE BatchedNVT fused diverges beyond machine precision (dcoord={dc} >= {TOL})"
+    print("[GATE A] PASS  (real-MLIP fused nvt parity to machine precision)")
 
 
 def gate_b_remd(steps=2000, N=6, seed=7):
@@ -64,14 +76,22 @@ def gate_b_remd(steps=2000, N=6, seed=7):
         accs[fused] = int(np.sum(sim._n_accept))
     dc = float(np.max(np.abs(outs[True] - outs[False])))
     print(f"[GATE B remd-MACE] N={N} steps={steps}  swaps OFF={accs[False]} ON={accs[True]}  "
-          f"fused ON vs OFF max|dcoord|={dc:.3e} A")
+          f"fused ON vs OFF max|dcoord|={dc:.3e} A  (tol {TOL:.0e})")
     assert accs[False] > 0, "REMD gate saw no swaps -- relabel path not exercised"
-    assert dc == 0.0 and accs[True] == accs[False], f"MACE REMD fused not bit-identical (dcoord={dc})"
-    print("[GATE B] PASS  (real-MLIP fused REMD bit-identical through swaps)")
+    assert accs[True] == accs[False], f"MACE REMD swap-accept count diverged (ON={accs[True]} OFF={accs[False]})"
+    assert dc < TOL, f"MACE REMD fused diverges beyond machine precision (dcoord={dc} >= {TOL})"
+    print("[GATE B] PASS  (real-MLIP fused REMD parity through swaps to machine precision)")
 
 
 if __name__ == "__main__":
     print("fused MACE-parity  torch", torch.__version__, "cuda", torch.cuda.is_available(), "dev", DEV)
-    gate_a_nvt()
-    gate_b_remd()
+    fails = []
+    for name, fn in (("A", gate_a_nvt), ("B", gate_b_remd)):   # independent: run both
+        try:
+            fn()
+        except AssertionError as e:
+            fails.append(f"GATE {name}: {e}")
+            print(f"[GATE {name}] FAIL  {e}")
+    if fails:
+        raise SystemExit("FUSED-MACE-PARITY FAIL:\n" + "\n".join(fails))
     print("\n[FUSED-MACE-PARITY] ALL GATES PASS")
