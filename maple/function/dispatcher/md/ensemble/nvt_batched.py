@@ -129,9 +129,14 @@ class BatchedNVTParams:
     # projection stays on the (bit-identical) numpy path (fires every remove_com_every
     # steps only, not the per-step bottleneck). VALIDATED opt-in (B-153): on-GPU (A100)
     # parity BIT-IDENTICAL + throughput 1.06x@B1 / 2.09x@B8 / 5.04x@B32 / 11.32x@B128 for
-    # fixed-B NVT. Default OFF because it does NOT yet handle the WE-recycling re-prepare
-    # path (buffers sized at prepare() go stale on walker relocation -> shape error);
-    # per the accuracy-unchanged adoption rule it stays opt-in until that fix lands.
+    # fixed-B NVT. B-154: the resampling / temperature-swap ensembles now REFRESH the
+    # device buffers when B or a replica's target T changes -- WE (_rebuild), PA
+    # (_set_node_temperature), REMD (_apply_ladder + accepted swaps) -- so fused is
+    # bit-identical there too (gate _test_fused_resample_compat.py); FFS + REST2/eABF/
+    # TI/metaD/gamd/smd are fused-safe (constant B + constant T). Still default OFF
+    # (opt-in): flipping the default needs a full A100 ES-suite fused regression plus a
+    # B=1 production-hardware perf confirm (B=1 is ~0.79x on a consumer GPU, ~1.06x on
+    # A100; B>=8 is a clear win) -- deferred to an explicit adoption decision.
     fused_loop:           bool  = False
     # --- HMR (mass-only; supported) ---
     hmr:           str   = ""               # ""/off => no-op; on/true => 3.0; or a number
