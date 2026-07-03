@@ -330,6 +330,15 @@ class PopulationAnnealing(BatchedNVT):
         self._cur_T = float(T)
         for th in self._thermostats:
             th.set_temperature(self._cur_T)
+        # fused-loop path: set_temperature retuned each thermostat's ._c2 (noise scale
+        # ~ sqrt(kT)); the on-device _c2_dev built at _prepare_buffers() is now stale
+        # for the new rung T and would SILENTLY inject the wrong noise amplitude (no
+        # crash -- B is constant -- but a biased free-energy ladder). Re-pull c2 into
+        # _c2_dev from the just-retuned thermostats (also picks up any resample reorder
+        # of _thermostats). c1 is T-independent so it never needs a refresh. Guard
+        # mirrors _prepare_buffers; no-op unless fused Langevin is active.
+        if getattr(self, "_fused", False) and self.params.thermostat == "langevin":
+            self._refresh_c2_dev()
 
     # ============================================================= resample step
     def _reindex(self, idx, v_std):

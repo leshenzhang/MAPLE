@@ -171,6 +171,13 @@ class REMD(BatchedNVT):
                 self.v[b] = self.v[b] * scale
             self._thermostats[b].set_temperature(T_i)
         self.temps = self.ladder.copy()
+        # fused-loop path: the ladder just retuned each replica's ._c2 (per-replica T);
+        # _prepare_buffers built _c2_dev at the uniform T_min, so it is stale. Re-pull
+        # the per-replica c2 into _c2_dev (else the fused OU injects the T_min noise
+        # amplitude for every replica -> wrong ladder). c1 is T-independent. Guard
+        # mirrors _prepare_buffers; no-op unless fused Langevin is active.
+        if getattr(self, "_fused", False) and self.params.thermostat == "langevin":
+            self._refresh_c2_dev()
 
     # ============================================================= swap attempt
     def _attempt_swaps(self, v, F, E, langevin: bool):
@@ -208,6 +215,15 @@ class REMD(BatchedNVT):
                 v_std[b] = v_std[b] * (Ta / Tb) ** 0.5           # b now targets Ta
                 self._thermostats[a].set_temperature(temps[a])
                 self._thermostats[b].set_temperature(temps[b])
+                self._swap_relabeled = True
+
+        # fused-loop path: an accepted swap relabeled two replicas' target T, so their
+        # ._c2 changed -> re-pull _c2_dev from the thermostats (no-op if nothing swapped
+        # or fused Langevin is not active). c1 is T-independent so it needs no refresh.
+        if getattr(self, "_swap_relabeled", False) and \
+           getattr(self, "_fused", False) and self.params.thermostat == "langevin":
+            self._refresh_c2_dev()
+            self._swap_relabeled = False
 
         return (v_std - half) if langevin else v_std
 

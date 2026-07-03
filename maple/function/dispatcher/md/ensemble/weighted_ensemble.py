@@ -389,6 +389,15 @@ class WeightedEnsemble(BatchedNVT):
             self._set_v_real(v, b, np.asarray(vstd_list[b]))
         self.v = v
 
+        # fused-loop path: _prepare_buffers() sized the on-device Langevin coeff/noise
+        # buffers (_c1_dev/_c2_dev/_noise_np) at (B_old, nmax); a resample changed B, so
+        # rebuild them for the new walker set (else _apply_thermostat_fused shape-
+        # mismatches on _c1_dev*v -> B-153). Mirrors the _prepare_buffers guard exactly;
+        # no-op unless fused Langevin is active. _build reads the just-rebuilt
+        # B/nmax_dof/_thermostats/n_b, so the coeffs match the new walkers.
+        if getattr(self, "_fused", False) and self.params.thermostat == "langevin":
+            self._build_langevin_coeffs_dev()
+
     # ============================================================= resample step
     def _resample(self, it, step, v, F, use_carried):
         """Bin the walkers on xi(x), (optionally) recycle target-state crossings for
