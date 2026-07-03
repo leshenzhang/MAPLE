@@ -133,11 +133,13 @@ class BatchedNVTParams:
     # device buffers when B or a replica's target T changes -- WE (_rebuild), PA
     # (_set_node_temperature), REMD (_apply_ladder + accepted swaps) -- so fused is
     # bit-identical there too (gate _test_fused_resample_compat.py); FFS + REST2/eABF/
-    # TI/metaD/gamd/smd are fused-safe (constant B + constant T). Still default OFF
-    # (opt-in): flipping the default needs a full A100 ES-suite fused regression plus a
-    # B=1 production-hardware perf confirm (B=1 is ~0.79x on a consumer GPU, ~1.06x on
-    # A100; B>=8 is a clear win) -- deferred to an explicit adoption decision.
-    fused_loop:           bool  = False
+    # TI/metaD/gamd/smd are fused-safe (constant B + constant T). B-156: DEFAULT ON
+    # (USER adoption) -- both adoption criteria met: (1) speed up (A100 B=1 1.10x /
+    # B=8 2.08x / B=32 4.91x / B=128 11.08x), (2) accuracy unchanged (A100 real-MLIP
+    # canon-vs-canon fused==non-fused to machine precision: nvt 2.7e-15, REMD-70-swaps
+    # 3.9e-13; toy calc exact-0). Only Langevin routes fused; v-rescale/NHC keep the
+    # numpy substep. Set fused_loop=False to force the legacy per-replica path.
+    fused_loop:           bool  = True
     # --- HMR (mass-only; supported) ---
     hmr:           str   = ""               # ""/off => no-op; on/true => 3.0; or a number
     hmr_factor:    Optional[float] = None
