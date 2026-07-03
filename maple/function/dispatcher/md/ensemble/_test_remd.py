@@ -76,6 +76,12 @@ def run_parity(steps=120, seed=42, N=4, t_min=300.0, t_max=493.0):
     for b in range(N):
         bn.v[b] = bn.v[b] * (float(ladder[b]) / t_min) ** 0.5
         bn._thermostats[b].set_temperature(float(ladder[b]))
+    # mirror REMD._apply_ladder: with fused_loop default ON (B-156), the per-replica
+    # ladder retuned each thermostat's ._c2, so the on-device _c2_dev (built at t_min in
+    # _prepare_buffers) must be refreshed here too -- REMD does this inside _apply_ladder;
+    # this hand-rolled reference must match it or it runs the stale t_min noise amplitude.
+    if getattr(bn, "_fused", False) and bn.params.thermostat == "langevin":
+        bn._refresh_c2_dev()
     bn._run_langevin(); bn._finalize()
     pos_ref = bc.coord.detach().to("cpu").numpy().copy()
     v_ref = bn.v.detach().to("cpu").numpy().copy()
