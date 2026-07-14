@@ -446,6 +446,7 @@ class BatchCalcABC:
             if not owners:
                 continue
             g_rows = torch.tensor([ptr[i] + a for i in owners], dtype=torch.long, device=device)
+            own_idx = torch.tensor(owners, dtype=torch.long, device=device)
             for c in range(3):
                 k = 3 * a + c
                 cp = coord0.clone(); cp[g_rows, c] += delta
@@ -455,7 +456,19 @@ class BatchCalcABC:
                 col = (-(Fp - Fm) / (2.0 * delta))          # (N,3) = dF/dx_k rows
                 col = col * mv_atom[:, None]                 # zero non-movable rows
                 col_pad = self._pad_forces(col)              # (B, nmax)
-                H[:, :, k] = col_pad
+                # OWNER-MASKED column write. Column k belongs ONLY to the molecules
+                # that own+move local atom a. A non-owner (atom a frozen there, or the
+                # molecule has < a+1 atoms) was NEVER perturbed, so its Fp-Fm is 0 in
+                # exact arithmetic -- but Fp/Fm are two INDEPENDENT forwards, so in fp
+                # they differ by ~1e-9 and the 1/(2*delta) division amplifies that by
+                # ~500x into ~1e-6. Writing the whole column (H[:, :, k] = col_pad)
+                # leaked that FD noise into the frozen / padding columns, which the
+                # PHVA contract requires to be EXACTLY 0 ("the remaining atoms carry
+                # infinite masses"). Measured 3.29e-6 Ha/A^2 on heterogeneous batches
+                # (aimnet2_decoupled); 0 after this masking. Owner columns are
+                # bit-identical to before -- non-owner columns simply stay at their
+                # zero-initialized value.
+                H[own_idx, :, k] = col_pad[own_idx]
         H = 0.5 * (H + H.transpose(1, 2))                    # symmetrize
         E_ha, F_ha = self._to_hartree(E0.to(dtype), F_pad)
         _, H_ha = self._to_hartree(E0.to(dtype), H)          # H uses same eV->Ha scale
