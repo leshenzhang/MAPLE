@@ -51,6 +51,7 @@ from ase import Atoms
 from ..batch_calculator_base import (  # noqa: E402
     BatchCalcABC,
     EV2HARTREE,
+    raise_if_environment_error,
     register_batch_calculator,
 )
 
@@ -117,6 +118,7 @@ class MACEBatchCalc(BatchCalcABC):
 
         # ---- model-specific runtime state ONLY (base.__init__ set the generic layout).
         self._batch_native = None     # set by probe: True if model accepts B>1
+        self._batch_probe_error = None  # why the probe said "not batchable" (diagnosis)
         self._hess_mode = None        # 'analytic' | 'fd'
         self.node_attrs = None        # one-hot species (built in _build_topology)
         self.cand_i = None            # block-diagonal intra-mol candidate pairs
@@ -131,7 +133,12 @@ class MACEBatchCalc(BatchCalcABC):
 
         try:
             self._probe_batch_native()
-        except Exception:
+        except Exception as exc:
+            # An environment failure must not be silently downgraded to "unknown"
+            # here either -- but at CONSTRUCTION time the device may legitimately be
+            # busy, so defer: leave _batch_native unresolved and let prepare() (which
+            # must give a verdict) surface it.
+            raise_if_environment_error(exc)
             self._batch_native = None      # resolve lazily
 
     # =====================================================================
@@ -145,16 +152,20 @@ class MACEBatchCalc(BatchCalcABC):
         """
         B = len(atoms_list)
         if self._batch_native is None:
-            try:
-                self._probe_batch_native()
-            except Exception:
-                self._batch_native = False
+            # NOTE: no bare except here. _probe_batch_native() re-raises
+            # environment/hardware failures (CUDA arch mismatch, OOM, driver) so they
+            # surface as themselves instead of being mistranslated into the
+            # "trace-locked" RuntimeError below -- that mistranslation is exactly how
+            # an sm_80-only build on a V100 made every MACE model look unbatchable.
+            self._probe_batch_native()
         if B > 1 and self._batch_native is False:
+            why = (f" Probe failure: {self._batch_probe_error}."
+                   if self._batch_probe_error else "")
             raise RuntimeError(
                 f"Standard MACE model '{self._model_name}' was traced single-graph "
                 "(B=1-locked: per-graph scatter dim_size frozen to 1), so it cannot ingest "
                 "a multi-graph batch. Re-export the model batch-generic, or run molecules "
-                "one at a time. (This is the same trace-lock that affects MACE-POL.)")
+                f"one at a time. (This is the same trace-lock that affects MACE-POL.){why}")
         super().prepare(atoms_list, fixed_nmax)
 
     # -------------------------------------------------------- topology hook
@@ -492,13 +503,23 @@ class MACEBatchCalc(BatchCalcABC):
         return coord, na, ei, sh, bt, pt
 
     def _probe_batch_native(self):
-        """Verify the traced model accepts a B=2 batch (not single-graph trace-locked)."""
+        """Verify the traced model accepts a B=2 batch (not single-graph trace-locked).
+
+        Exception triage (see batch_calculator_base.is_environment_error): a CUDA
+        arch mismatch / OOM / driver failure says NOTHING about how the model was
+        traced, so it PROPAGATES. Only a genuine model/shape/trace failure sets
+        ``_batch_native = False``. The previous bare ``except Exception`` mislabeled
+        an sm_80-only torch build on a V100 ("no kernel image is available") as
+        "model is trace-locked", producing a confidently wrong diagnosis.
+        """
         coord, na, ei, sh, bt, pt = self._two_atom_graph(2)
         try:
             E = self.model(coord, na, ei, sh, bt, pt)
             self._batch_native = (E.reshape(-1).numel() in (2, 4))   # (B,) or (N,)
-        except Exception:
-            self._batch_native = False
+        except Exception as exc:
+            raise_if_environment_error(exc)          # hardware/driver -> caller sees it
+            self._batch_probe_error = f"{type(exc).__name__}: {exc}"
+            self._batch_native = False               # genuine single-graph trace lock
 
     def _probe_double_backward(self):
         coord, na, ei, sh, bt, pt = self._two_atom_graph(1)

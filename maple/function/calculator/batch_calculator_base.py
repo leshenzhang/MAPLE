@@ -201,6 +201,61 @@ def _resolve_device(device) -> torch.device:
     return torch.device("cuda" if (want_cuda and torch.cuda.is_available()) else "cpu")
 
 
+# --- environment vs model-capability exception triage (shared) ---------------
+# Capability probes ("can this traced model ingest B>1?", "does it double-backward?")
+# run the model inside try/except. A BARE ``except Exception`` there conflates two
+# categories with opposite correct responses:
+#   * ENVIRONMENT / HARDWARE failure (CUDA kernel-arch mismatch, OOM, driver, no
+#     device) -- says NOTHING about the model. Swallowing it mislabels a perfectly
+#     batchable model as "trace-locked" and reports a wrong diagnosis to the user.
+#     Observed: on a V100 (sm_70) an sm_80-only torch build raises "no kernel image
+#     is available for execution on the device" -> every MACE model was falsely
+#     reported B=1-trace-locked. MUST propagate.
+#   * MODEL / TRACE limitation (per-graph scatter dim_size frozen to 1, shape
+#     mismatch on a B>1 graph) -- the real signal the probe is looking for.
+_ENV_ERROR_MARKERS = (
+    "no kernel image",            # binary has no cubin for this SM (arch mismatch)
+    "out of memory",              # CUDA / host OOM
+    "cuda error",                 # generic driver/runtime failure
+    "cuda driver",
+    "cuda runtime",
+    "no cuda-capable device",
+    "cudnn",
+    "cublas",
+    "device-side assert",
+    "invalid device",
+    "peer mapping",
+    "initialization error",
+)
+
+
+def is_environment_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a hardware/driver/OOM failure, NOT a model limitation.
+
+    Conservative by design: only exceptions that either are a known OOM type or
+    carry an unambiguous environment marker are classified as environment. Anything
+    else (shape/scatter/trace errors) stays a model-capability signal, so the
+    trace-lock detection keeps working exactly as before.
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    oom = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom is not None and isinstance(exc, oom):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _ENV_ERROR_MARKERS)
+
+
+def raise_if_environment_error(exc: BaseException) -> None:
+    """Re-raise ``exc`` when it is an environment/hardware failure (see above).
+
+    Use inside capability probes:  ``except Exception as e: raise_if_environment_error(e)``
+    then treat the surviving exception as the model limitation being probed for.
+    """
+    if is_environment_error(exc):
+        raise exc
+
+
 class BatchCalcABC:
     """Protocol base for GPU-batched calculators. Subclass overrides the model
     surface (``_build_topology`` + ``_forward`` + class attrs); the rest is here.
