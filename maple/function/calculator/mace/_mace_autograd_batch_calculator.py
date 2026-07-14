@@ -445,7 +445,8 @@ class MACEAutogradBatchCalc(BatchCalcABC):
         F_eV = self._scatter_forces((-g).detach().to(dtype))
         return (E_eV.detach().to(dtype) * EV2HARTREE, F_eV * EV2HARTREE)
 
-    def get_efh_gpu(self, movable_masks=None):
+    def get_efh_gpu(self, movable_masks=None, mode=None, delta: float = 2e-3,
+                    chunk_size=None):
         """Energy + forces + per-structure Hessian.
 
         ``movable_masks`` (mirrors ANIBatchCalc / UMABatchCalc / AIMNet2BatchCalc):
@@ -456,6 +457,14 @@ class MACEAutogradBatchCalc(BatchCalcABC):
         For the autograd path this is a MOVABLE-AUTOGRAD partial Hessian: only the
         3m movable columns are seeded (1 forward + 1 + 3m backward), NOT the FD
         6m-forward path.
+
+        ``mode`` / ``delta`` / ``chunk_size`` complete the documented BatchCalcABC
+        signature (this override used to DROP them -> get_efh_gpu(mode=...) raised
+        TypeError). mode=None -> self.hessian_mode (UNCHANGED default behavior);
+        'numerical'/'fd' forces the FD Hessian with step ``delta``;
+        'autograd'/'analytic' forces the seeded analytic Hessian and raises rather
+        than silently downgrading. ``chunk_size`` overrides the ctor's
+        hessian_chunk_size for the analytic path.
         """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
@@ -464,20 +473,32 @@ class MACEAutogradBatchCalc(BatchCalcABC):
                     torch.zeros((0, 0), dtype=dtype, device=device),
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
+        req = None if mode is None else str(mode).lower()
+        if req in ("numerical", "fd"):
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
+        if req in ("autograd", "analytic"):
+            cs = self._hessian_chunk_size if chunk_size is None else chunk_size
+            return self._efh_analytic(movable_masks, chunk_size=cs)
+        if req is not None:
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; expected one "
+                f"of {self.SUPPORTED_HESSIAN_MODES} (or None to use hessian_mode).")
+
         # OLD path (default + oracle): 6N central finite-difference Hessian.
         if self.hessian_mode == "numerical":
-            return self._efh_fd(movable_masks=movable_masks)
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
         # OPT-IN autograd double-backward Hessian. Try (optional) vmap first, then
         # the row-loop, then hard-fall-back to the FD oracle on ANY failure.
-        if self._hessian_chunk_size is not None:
+        cs = self._hessian_chunk_size if chunk_size is None else chunk_size
+        if cs is not None:
             try:
-                return self._efh_analytic(movable_masks, chunk_size=self._hessian_chunk_size)
+                return self._efh_analytic(movable_masks, chunk_size=cs)
             except Exception:
                 pass
         try:
             return self._efh_analytic(movable_masks)
         except Exception:
-            return self._efh_fd(movable_masks=movable_masks)
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
 
     # =====================================================================
     # partial-Hessian (movable-atom subspace) helpers -- mirror ANIBatchCalc

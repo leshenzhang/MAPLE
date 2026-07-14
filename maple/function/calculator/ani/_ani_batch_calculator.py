@@ -327,7 +327,8 @@ class ANIBatchCalc(BatchCalcABC):
     # Hartree-native so BatchCalcABC.get_ef_gpu (with the _to_hartree no-op)
     # reproduces the old output byte-for-byte -> inherited (deleted here).
     # =====================================================================
-    def get_efh_gpu(self, movable_masks=None):
+    def get_efh_gpu(self, movable_masks=None, mode=None, delta: float = 2e-3,
+                    chunk_size=None):
         """Energy + forces + per-structure Hessian.
 
         Mode dispatch (OPT-IN): default 'numerical' = the central-FD Hessian
@@ -335,6 +336,14 @@ class ANIBatchCalc(BatchCalcABC):
         optional vmap chunk first), hard-falling back to FD on any failure.
         ``movable_masks`` (mirrors UMA/MACE) restricts the perturbed/responding DOFs
         to a per-structure movable-atom subspace (None = full Hessian).
+
+        ``mode`` / ``delta`` / ``chunk_size`` complete the documented BatchCalcABC
+        signature (this override used to DROP them -> get_efh_gpu(mode=...) raised
+        TypeError). mode=None -> self.hessian_mode (UNCHANGED default behavior);
+        'numerical'/'fd' forces the FD Hessian with step ``delta``;
+        'autograd'/'analytic' forces the seeded analytic Hessian and raises rather
+        than silently downgrading. ``chunk_size`` overrides the ctor's
+        hessian_chunk_size for the analytic path.
         """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
@@ -343,17 +352,31 @@ class ANIBatchCalc(BatchCalcABC):
                     torch.zeros((0, 0), dtype=dtype, device=device),
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
+
+        req = None if mode is None else str(mode).lower()
+        if req in ("numerical", "fd"):
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
+        if req in ("autograd", "analytic"):
+            cs = self._hessian_chunk_size if chunk_size is None else chunk_size
+            return self._efh_analytic(movable_masks, chunk_size=cs)
+        if req is not None:
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; expected one "
+                f"of {self.SUPPORTED_HESSIAN_MODES} (or None to use hessian_mode).")
+
+        # mode=None -> the ctor-knob path (unchanged).
         if self.hessian_mode == "numerical":
-            return self._efh_fd(movable_masks=movable_masks)
-        if self._hessian_chunk_size is not None:
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
+        cs = self._hessian_chunk_size if chunk_size is None else chunk_size
+        if cs is not None:
             try:
-                return self._efh_analytic(movable_masks, chunk_size=self._hessian_chunk_size)
+                return self._efh_analytic(movable_masks, chunk_size=cs)
             except Exception:
                 pass
         try:
             return self._efh_analytic(movable_masks)
         except Exception:
-            return self._efh_fd(movable_masks=movable_masks)
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
 
     # =====================================================================
     # partial-Hessian (movable-atom subspace) helpers -- mirror MACEBatchCalc

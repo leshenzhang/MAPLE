@@ -373,14 +373,30 @@ class MACEBatchCalc(BatchCalcABC):
     # get_ef_gpu is the generic forward->pad->convert pattern -> inherited from
     # BatchCalcABC (deleted here); _forward returns native eV and the base converts.
     # =====================================================================
-    def get_efh_gpu(self, movable_masks=None):
+    def get_efh_gpu(self, movable_masks=None, mode=None, delta: float = 2e-3,
+                    chunk_size=None):
         """Energy + forces + per-structure Hessian. ``movable_masks`` (mirrors
         UMABatchCalc): None = full Hessian (byte-identical current behavior); a
         per-structure spec restricts the perturbed/responding DOFs to a movable-atom
         subspace -> only movable rows/cols filled, frozen atoms still exert forces
         (exact FixAtoms-constrained block). Applies to both the seeded analytic and
-        the FD fallback path identically. Mode is auto-selected by probing whether the
-        traced model supports double-backward (analytic) with FD fallback."""
+        the FD fallback path identically.
+
+        ``mode`` / ``delta`` / ``chunk_size`` are the documented BatchCalcABC contract
+        (this override used to DROP them -> get_efh_gpu(mode=...) raised TypeError,
+        a Liskov violation against the base). They are honored, not ignored:
+          * mode=None (default)      -- auto-select: probe double-backward, use the
+                                        seeded analytic Hessian if the traced model
+                                        supports it, else the FD fallback. UNCHANGED
+                                        default behavior (bit-identical).
+          * mode='autograd'/'analytic' -- force the seeded analytic Hessian; raise if
+                                        the traced model cannot double-backward
+                                        (explicitly asking for a mode and silently
+                                        getting a different one is the bug class this
+                                        library exists to prevent).
+          * mode='numerical'/'fd'    -- force the central-FD Hessian with step ``delta``.
+        ``chunk_size`` is the vmap seed-batch budget of the analytic path.
+        """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
@@ -388,6 +404,19 @@ class MACEBatchCalc(BatchCalcABC):
                     torch.zeros((0, 0), dtype=dtype, device=device),
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
+
+        req = None if mode is None else str(mode).lower()
+        if req in ("numerical", "fd"):
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
+        if req in ("autograd", "analytic"):
+            # explicit request -> no silent downgrade to FD
+            return self._efh_analytic(movable_masks, chunk_size=chunk_size)
+        if req is not None:
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; "
+                f"expected one of {self.SUPPORTED_HESSIAN_MODES} (or None to auto-select).")
+
+        # mode=None -> the auto-select path (unchanged).
         if self._hess_mode is None:
             try:
                 self._probe_double_backward()
@@ -395,10 +424,13 @@ class MACEBatchCalc(BatchCalcABC):
                 self._hess_mode = 'fd'
         if self._hess_mode == 'analytic':
             try:
-                return self._efh_analytic(movable_masks)
+                return self._efh_analytic(movable_masks, chunk_size=chunk_size)
             except Exception:
+                # graceful degradation is intentional here (FD is the oracle); unlike
+                # the batch-native probe, this emits no wrong DIAGNOSIS, only a slower
+                # but equally valid path.
                 self._hess_mode = 'fd'
-        return self._efh_fd(movable_masks=movable_masks)
+        return self._efh_fd(movable_masks=movable_masks, delta=delta)
 
     def isolation_check(self, perturb: float = 0.05) -> float:
         """Perturb-one byte-isolation probe: returns max cross-molecule force leak (Ha/A).

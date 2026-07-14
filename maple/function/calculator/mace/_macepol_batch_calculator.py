@@ -407,13 +407,24 @@ class MACEPolBatchCalc(BatchCalcABC):
         F_eV = self._pad_forces(F_all_eV.detach().to(dtype))
         return (E_eV.detach() * EV2HARTREE, F_eV * EV2HARTREE)
 
-    def get_efh_gpu(self, movable_masks=None):
+    def get_efh_gpu(self, movable_masks=None, mode=None, delta: float = 2e-3,
+                    chunk_size=None):
         """Energy + forces + per-structure Hessian. ``movable_masks`` (mirrors
         UMABatchCalc): None = full Hessian (byte-identical current behavior); a
         per-structure spec restricts the Hessian to a movable-atom subspace -> only
         movable rows/cols filled (frozen atoms still exert forces). Threaded through
         all three paths: sequential (single-calc full Hessian masked to the subspace),
-        approx seeded-analytic, and approx batched-FD."""
+        approx seeded-analytic, and approx batched-FD.
+
+        ``mode`` / ``delta`` / ``chunk_size`` are the documented BatchCalcABC contract
+        (this override used to DROP them -> get_efh_gpu(mode=...) raised TypeError).
+        They are honored: mode=None auto-selects (analytic if the model
+        double-backwards, else FD -- UNCHANGED default); 'numerical'/'fd' forces the
+        central-FD Hessian with step ``delta``; 'autograd'/'analytic' forces the
+        seeded analytic Hessian and raises rather than silently downgrading.
+        The ``coupling_mode='sequential'`` path delegates to the single-structure
+        MACEPolCalculator's analytic Hessian, for which mode/delta do not apply.
+        """
         B = self._atoms_B
         device, dtype = self.device, self.dtype
         if B == 0:
@@ -424,7 +435,21 @@ class MACEPolBatchCalc(BatchCalcABC):
         if self.coupling_mode == "raise" and B > 1:
             raise RuntimeError("coupling_mode='raise'; call with 'sequential' or 'approx'.")
         if self.coupling_mode == "sequential":
+            # exact per-molecule analytic Hessian from the single calc: mode/delta are
+            # not knobs of that path (no FD, no seeding budget).
             return self._efh_sequential(movable_masks)
+
+        req = None if mode is None else str(mode).lower()
+        if req in ("numerical", "fd"):
+            return self._efh_fd(movable_masks=movable_masks, delta=delta)
+        if req in ("autograd", "analytic"):
+            return self._efh_analytic(movable_masks, chunk_size=chunk_size)
+        if req is not None:
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; "
+                f"expected one of {self.SUPPORTED_HESSIAN_MODES} (or None to auto-select).")
+
+        # mode=None -> the auto-select path (unchanged).
         if self._hess_mode is None:
             try:
                 self._probe_double_backward()
@@ -432,10 +457,10 @@ class MACEPolBatchCalc(BatchCalcABC):
                 self._hess_mode = 'fd'
         if self._hess_mode == 'analytic':
             try:
-                return self._efh_analytic(movable_masks)
+                return self._efh_analytic(movable_masks, chunk_size=chunk_size)
             except Exception:
                 self._hess_mode = 'fd'
-        return self._efh_fd(movable_masks=movable_masks)
+        return self._efh_fd(movable_masks=movable_masks, delta=delta)
 
     # =====================================================================
     # sequential (correct) fallback -- loops the single MACEPolCalculator

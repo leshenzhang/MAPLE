@@ -687,7 +687,8 @@ class UMABatchCalc(BatchCalcABC):
         )
 
     # ------------------------------------------------------------ get_efh_gpu
-    def get_efh_gpu(self, movable_masks=None, base_ef=None):
+    def get_efh_gpu(self, movable_masks=None, mode=None, delta=None, chunk_size=None,
+                    base_ef=None):
         """Energy + forces + per-structure NUMERICAL Hessian (batched central FD).
 
         Returns
@@ -735,9 +736,40 @@ class UMABatchCalc(BatchCalcABC):
         responsible for guaranteeing ``self.coord`` is unchanged since ``base_ef`` was
         measured. Honored only on the numerical FD path (the default + oracle); the
         autograd path ignores it and recomputes.
+
+        ``mode`` / ``delta`` / ``chunk_size`` complete the documented BatchCalcABC
+        signature (this override used to DROP them -> get_efh_gpu(mode=...) raised
+        TypeError). All three are None-sentinel: when None the constructor's knob is
+        used and behavior is BIT-IDENTICAL to before.
+          * mode=None -> self.hessian_mode ('numerical' default, with the documented
+            autograd->numerical hard-fallback). mode='numerical'/'fd' forces FD;
+            mode='autograd'/'analytic' forces the double-backward Hessian and RAISES
+            instead of silently downgrading (an explicit request is not a hint).
+          * delta -> the central-FD step (else self._delta from hessian_delta). The
+            Hessian-plan cache key covers _delta (c3af78d), so changing it here
+            correctly rebuilds the plan instead of reusing a stale one.
+          * chunk_size -> the FD replica-packing budget in ATOMS (else
+            self._h_max_atoms from hessian_max_atoms). UMA's Hessian is FD-based, so
+            this is its analogue of the base's vmap seed budget; chunking only changes
+            how many isolated replicas share a forward, never a force value
+            (parity-preserving by construction).
         """
+        # Per-call overrides of the ctor knobs. Both are components of the
+        # Hessian-plan cache key, so a change correctly invalidates the cached plan.
+        if delta is not None:
+            self._delta = float(delta)
+        if chunk_size is not None:
+            self._h_max_atoms = int(chunk_size)
+
+        req = None if mode is None else str(mode).lower()
+        if req in ("autograd", "analytic"):
+            return self._efh_gpu_autograd(movable_masks)   # explicit -> no silent fallback
+        if req is not None and req not in ("numerical", "fd"):
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; expected one "
+                f"of {self.SUPPORTED_HESSIAN_MODES} (or None to use hessian_mode).")
         # OPT-IN autograd Hessian; on any error fall through to the numerical oracle.
-        if self.hessian_mode == "autograd":
+        if req is None and self.hessian_mode == "autograd":
             try:
                 return self._efh_gpu_autograd(movable_masks)
             except Exception:
