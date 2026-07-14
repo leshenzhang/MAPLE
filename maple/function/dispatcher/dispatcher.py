@@ -85,7 +85,21 @@ def resolve_batched_calc(params, atoms_list, attached_calc=None):
          own local model dir. UMA keeps its dedicated fallback: derive the SAME
          UMA checkpoint the engine's single calc uses, so a plain '#model=uma(...)'
          multi-structure job needs NO extra params (the normal job-interface path).
+
+    CAPABILITY GATE: the resolved calc is then checked against the job's ``#solv``
+    request. No batch backend applies an implicit-solvent correction, so a solvated
+    multi-structure OPT/TS/IRC job must FAIL FAST here rather than silently running in
+    the gas phase (see _batch_calc_utils.reject_batched_implicit_solvent). Same
+    fail-fast pattern as the PBC gate in BatchCalcABC.prepare and the coupled-calc B=1
+    routing.
     """
+    from ._batch_calc_utils import reject_batched_implicit_solvent
+    calc = _build_batched_calc(params, atoms_list, attached_calc=attached_calc)
+    return reject_batched_implicit_solvent(params, calc, context="batched job")
+
+
+def _build_batched_calc(params, atoms_list, attached_calc=None):
+    """Resolution body for resolve_batched_calc (see its docstring); ungated."""
     calc = params.get("batched_calc")
     if calc is not None:
         return calc

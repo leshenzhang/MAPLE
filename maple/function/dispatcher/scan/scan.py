@@ -371,7 +371,17 @@ class Scan(JobABC):
         optional ``batch_device``/``batch_dtype``/``batch_task``). Keeping it
         injectable means Scan never hard-depends on UMA and the serial path keeps
         no torch/fairchem import.
+
+        Gated on ``#solv``: no batch backend applies an implicit-solvent correction,
+        so a solvated batched scan fails fast instead of silently running gas-phase
+        (shared gate, mirrors dispatcher.resolve_batched_calc).
         """
+        from .._batch_calc_utils import reject_batched_implicit_solvent
+        calc = self._build_batched_calc()
+        return reject_batched_implicit_solvent(self.params, calc, context="batched scan")
+
+    def _build_batched_calc(self):
+        """Resolution body for _resolve_batched_calc (see its docstring); ungated."""
         calc = self.params.get("batched_calc")
         if calc is not None:
             return calc

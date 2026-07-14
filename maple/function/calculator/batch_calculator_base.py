@@ -220,6 +220,14 @@ class BatchCalcABC:
     # False => this potential can only run one structure at a time (coupled);
     # dispatchers gate a B>1 batch on this instead of by class name.
     BATCHABLE: bool = True
+    # False => the batched path applies NO implicit-solvent correction, so a job that
+    # asked for #solv(method=gbsa, implicit=...) must NOT be silently routed here (it
+    # would return gas-phase numbers AND bypass the single-structure path's
+    # reject_implicit_solvent_derivatives gate). Every batch backend is gas-phase-only
+    # today; the dispatcher-layer gate (dispatcher/_batch_calc_utils.py ::
+    # reject_batched_implicit_solvent) fails fast on False and lets a future
+    # solvent-capable batch backend through by flipping this to True.
+    SUPPORTS_IMPLICIT_SOLVENT: bool = False
 
     def __init__(self, device="cuda", dtype: torch.dtype = torch.float64):
         self.device = _resolve_device(device)

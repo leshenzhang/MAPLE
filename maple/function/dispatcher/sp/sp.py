@@ -23,6 +23,9 @@ class SinglePoint(JobABC):
         # Initialize params
         self.params = self._init_params(SPParams, paras, ("sp", "SP"))
         self.verbose = self.params.verbose
+        # Raw job params (SPParams only carries 'verbose'): kept so the batched path
+        # can see the job's '#solv' request and refuse to silently drop it.
+        self._raw_params = paras if isinstance(paras, dict) else {}
 
         # Per-frame results (Hartree / Hartree.A^-1), populated by _run_trajectory.
         self.energies_hartree: List[float] = []
@@ -117,6 +120,11 @@ class SinglePoint(JobABC):
         UMABatchCalc / AIMNet2BatchCalc / MACE*BatchCalc). All frames share one
         calculator in the engine flow, so atoms[0] is representative. Returns
         ``None`` for plain ASE calculators -> serial fallback.
+
+        Gated on ``#solv``: a batch calc applies no implicit-solvent correction, so a
+        solvated trajectory SP that reaches the batched branch fails fast instead of
+        silently reporting gas-phase energies (shared gate, mirrors
+        dispatcher.resolve_batched_calc).
         """
         if not self.atoms:
             return None
@@ -124,7 +132,9 @@ class SinglePoint(JobABC):
         if (calc is not None
                 and callable(getattr(calc, "prepare", None))
                 and callable(getattr(calc, "get_ef_gpu", None))):
-            return calc
+            from .._batch_calc_utils import reject_batched_implicit_solvent
+            return reject_batched_implicit_solvent(
+                self._raw_params, calc, context="batched trajectory single-point")
         return None
 
     def _compute_batched(self, calc) -> List[float]:
