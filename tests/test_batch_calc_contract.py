@@ -152,6 +152,312 @@ def test_pbc_capable_accepts_and_homogeneous_gate():
     raise AssertionError("expected NotImplementedError on heterogeneous PBC")
 
 
+def test_uma_hessian_plan_cache_key_covers_fd_step():
+    """Regression guard for c3af78d (stale-Hessian-plan bug).
+
+    ``UMABatchCalc`` caches the block-diagonal FD-Hessian plan across get_efh_gpu()
+    calls. The plan BAKES IN the FD step (pert_val = s*delta, fac = +-1/(2*delta)),
+    the chunk budget (h_max) and the FD discretization (central/forward). If the
+    cache key were the movable mask alone, changing any of those on a live
+    calculator would silently reuse the OLD plan -> a Hessian computed with the
+    WRONG delta (no error, wrong numbers).
+
+    Key-level test (CPU, no checkpoint): the key must change when _delta,
+    _h_max_atoms or _fd_mode changes, and must be stable otherwise.
+    """
+    from maple.function.calculator.uma._uma_batch_calculator import UMABatchCalc
+
+    # Stub instance: _movable_key only needs _atoms_B / _n_b (for _resolve_movable)
+    # plus the three plan-defining knobs. No model, no GPU.
+    c = object.__new__(UMABatchCalc)
+    c._atoms_B = 2
+    c._n_b = torch.tensor([3, 2], dtype=torch.int64)
+    c._delta = 2e-3
+    c._h_max_atoms = 4096
+    c._fd_mode = "central"
+
+    k0 = c._movable_key(None)
+    assert c._movable_key(None) == k0, "key must be stable when nothing changes"
+
+    c._delta = 1e-3
+    k_delta = c._movable_key(None)
+    assert k_delta != k0, ("FD step is NOT in the Hessian-plan cache key -> a delta "
+                           "change would silently reuse the stale plan (c3af78d)")
+
+    c._delta = 2e-3
+    c._h_max_atoms = 2048
+    k_hmax = c._movable_key(None)
+    assert k_hmax != k0, "chunk budget (h_max) is not in the Hessian-plan cache key"
+
+    c._h_max_atoms = 4096
+    c._fd_mode = "forward"
+    k_fd = c._movable_key(None)
+    assert k_fd != k0, "FD discretization (central/forward) is not in the cache key"
+
+    # movable mask still discriminates (the pre-c3af78d key's only component)
+    c._fd_mode = "central"
+    assert c._movable_key([[0, 1], [0]]) != c._movable_key(None)
+
+
+# =========================================================================== #
+# BUG-2 regression: _efh_fd must write each Hessian column ONLY to the molecules
+# that own+move that DOF (owner mask), else FD noise leaks into frozen/padding.
+# =========================================================================== #
+@register_batch_calculator
+class _CrossTalkHarmonic(_HarmonicBatch):
+    """Harmonic + a deterministic BATCH-GLOBAL force term.
+
+    Stands in for the floating-point reduction noise of a real batched MLIP forward.
+    In a block-diagonal batch, perturbing molecule i must not change molecule j's
+    forces -- mathematically. Numerically it does: Fp and Fm are two INDEPENDENT
+    forwards, so a real backend's untouched molecules differ by ~1e-9, which the
+    central-difference 1/(2*delta) then amplifies ~500x into ~1e-6 (measured
+    3.29e-6 Ha/A^2 on aimnet2_decoupled).
+
+    Reproducing that fp noise deterministically is impossible, so this stub makes the
+    SAME structural leak explicit and large: every atom's force carries EPS*sum(coord),
+    so displacing ANY atom by +/-delta shifts EVERY molecule's forces by 2*EPS*delta ->
+    FD column entry -EPS for every molecule in the batch, owner or not. The buggy
+    ``H[:, :, k] = col_pad`` wrote that into the non-owners' frozen/padding columns;
+    the owner-masked write leaves them at exactly 0.
+    """
+    MODEL_NAMES = ("_crosstalk_harmonic_contract_test",)
+    EPS = 1e-3   # >> any tolerance: the assertions below are EXACT-zero assertions
+
+    def _forward(self, coord, need_graph):
+        E, F_all, leaf = super()._forward(coord, need_graph)
+        src = leaf if (need_graph and leaf is not None) else coord
+        return E, F_all + self.EPS * src.sum(), leaf
+
+
+def _hetero_batch():
+    """Heterogeneous batch: different atom counts AND different movable sets.
+
+    mols    = [H2O (3 atoms), H2 (2 atoms)]      -> nmax_dof = 9, mol1 has 1 padding atom
+    movable = [[0, 1, 2],     [0]]
+    So for mol1 (H2):
+      * local atom 1 exists but is FROZEN  -> columns k=3,4,5 are frozen columns
+      * local atom 2 does not exist        -> columns k=6,7,8 are padding columns
+    Both are swept (mol0 owns+moves atoms 1 and 2), so both are written by _efh_fd --
+    exactly the two leak channels the A5 controls isolated.
+    """
+    from ase import Atoms
+    mols = [Atoms("H2O", positions=np.random.RandomState(7).randn(3, 3)),
+            Atoms("H2", positions=np.random.RandomState(8).randn(2, 3))]
+    return mols, [[0, 1, 2], [0]]
+
+
+def test_fd_hessian_columns_owner_masked_frozen_exactly_zero():
+    """BUG-2: frozen + padding Hessian columns of a NON-OWNER molecule are EXACTLY 0.
+
+    The PHVA contract (and the paper's "the remaining atoms carry infinite masses")
+    requires the frozen block to decouple exactly, not approximately. Pre-fix this
+    asserted-zero region held _CrossTalkHarmonic.EPS (and ~3.29e-6 Ha/A^2 with a real
+    backend); post-fix it is bitwise 0.
+    """
+    mols, mov = _hetero_batch()
+    c = _CrossTalkHarmonic(device="cpu", dtype=torch.float64)
+    c.prepare(mols)
+    _, _, H, P = c.get_efh_gpu(movable_masks=mov, mode="numerical")
+    assert int(P[1]) == 1, "mol1 (H2) should carry exactly 1 padding atom"
+
+    # mol1: only local atom 0 is movable -> everything outside its (3x3) block is
+    # frozen (atom 1) or padding (atom 2) and MUST be exactly zero.
+    frozen_and_padding_rows = H[1][3:, :].abs().max()
+    frozen_and_padding_cols = H[1][:, 3:].abs().max()
+    assert float(frozen_and_padding_rows) == 0.0, (
+        f"FD noise leaked into mol1's frozen/padding ROWS: {float(frozen_and_padding_rows):.3e} "
+        "(_efh_fd wrote column k for a molecule that does not own+move that DOF)")
+    assert float(frozen_and_padding_cols) == 0.0, (
+        f"FD noise leaked into mol1's frozen/padding COLS: {float(frozen_and_padding_cols):.3e}")
+
+    # ...and the leak is real in this stub: the owner (mol0) DOES see the cross-talk,
+    # so the test would catch a fix that simply zeroed the whole Hessian.
+    assert float(H[0].abs().max()) > 0.0
+
+
+def test_fd_hessian_movable_block_unchanged_by_owner_mask():
+    """BUG-2 zero-regression: the owner mask must not perturb the MOVABLE block.
+
+    Non-owner columns were noise and become 0; owner columns are untouched. On the
+    plain harmonic PES the movable block is analytically K*I, so this pins the
+    numbers the owner-mask fix must NOT change.
+    """
+    mols, mov = _hetero_batch()
+    c = _HarmonicBatch(device="cpu", dtype=torch.float64)
+    c.prepare(mols)
+    _, _, H, _ = c.get_efh_gpu(movable_masks=mov, mode="numerical")
+    kHa = _K * EV2HARTREE
+    # mol0: all 3 atoms movable -> full 9x9 block = K*I
+    assert torch.allclose(H[0][:9, :9], kHa * torch.eye(9, dtype=torch.float64), atol=1e-6)
+    # mol1: only atom 0 movable -> its 3x3 movable block = K*I, rest exactly 0
+    assert torch.allclose(H[1][:3, :3], kHa * torch.eye(3, dtype=torch.float64), atol=1e-6)
+    assert float(H[1][3:, :].abs().max()) == 0.0 and float(H[1][:, 3:].abs().max()) == 0.0
+
+
+# =========================================================================== #
+# BUG-1 regression: the batched path must not silently drop implicit solvent.
+# =========================================================================== #
+def test_batched_implicit_solvent_fails_fast():
+    """BUG-1: '#solv(method=gbsa, implicit=water)' + a gas-phase batch calc -> raise.
+
+    Pre-fix, resolve_batched_calc ignored params['solv'] entirely: a batched
+    OPT/TS/IRC/SCAN ran in the GAS PHASE (614.34 Ha off the solvated oracle) AND
+    bypassed the single-structure path's solvent+derivatives NotImplementedError.
+    """
+    from maple.function.dispatcher.dispatcher import resolve_batched_calc
+    from maple.function.dispatcher._batch_calc_utils import (
+        implicit_solvent_requested, reject_batched_implicit_solvent)
+
+    gas_calc = _HarmonicBatch(device="cpu", dtype=torch.float64)
+    solvated = {"solv": {"method": "gbsa", "implicit": "water", "experimental": True},
+                "batched_calc": gas_calc}
+
+    assert implicit_solvent_requested(solvated) is True
+    assert gas_calc.SUPPORTS_IMPLICIT_SOLVENT is False
+    try:
+        resolve_batched_calc(solvated, [], attached_calc=None)
+    except NotImplementedError as exc:
+        assert "gas" in str(exc).lower() or "solvat" in str(exc).lower(), exc
+    else:
+        raise AssertionError(
+            "batched path accepted an implicit-solvent job -> it would silently return "
+            "gas-phase numbers (BUG-1)")
+
+    # no #solv -> unchanged (zero regression on every gas-phase batched job)
+    assert resolve_batched_calc({"batched_calc": gas_calc}, []) is gas_calc
+    # explicit solvation adds real atoms; it is NOT the implicit path and is not gated
+    assert implicit_solvent_requested({"solv": {"explicit": "water"}}) is False
+    # 'none' sentinels are not a request
+    assert implicit_solvent_requested({"solv": {"method": "none", "implicit": "none"}}) is False
+
+    # a future solvent-capable batch backend passes the gate (capability, not hard-code)
+    class _SolvatedBatch(_HarmonicBatch):
+        SUPPORTS_IMPLICIT_SOLVENT = True
+    ok = _SolvatedBatch(device="cpu", dtype=torch.float64)
+    assert reject_batched_implicit_solvent(solvated, ok) is ok
+
+
+# =========================================================================== #
+# BUG-3 regression: a CUDA-arch/OOM failure must NOT be reported as "trace-locked".
+# =========================================================================== #
+def test_probe_batch_native_env_error_propagates_not_trace_locked():
+    """BUG-3: _probe_batch_native's bare `except Exception` mislabeled hardware faults.
+
+    On a V100 (sm_70) with an sm_80-only torch build, model(...) raises "no kernel image
+    is available for execution on the device". The bare except turned that into
+    ``_batch_native = False`` and prepare() then blamed the MODEL ("traced single-graph").
+    Environment errors must propagate; only genuine model/trace errors set the flag.
+    """
+    from maple.function.calculator.batch_calculator_base import is_environment_error
+    from maple.function.calculator.mace._mace_batch_calculator import MACEBatchCalc
+
+    cuda_arch = RuntimeError(
+        "CUDA error: no kernel image is available for execution on the device")
+    trace_lock = RuntimeError(
+        "The size of tensor a (2) must match the size of tensor b (1) at dimension 0")
+    assert is_environment_error(cuda_arch) is True
+    assert is_environment_error(trace_lock) is False
+
+    def _probe_with(exc):
+        """Drive the real _probe_batch_native with a model that raises `exc`."""
+        c = object.__new__(MACEBatchCalc)          # no checkpoint, no GPU
+        c._batch_native = None
+        c._batch_probe_error = None
+        c._two_atom_graph = lambda b: (None,) * 6
+        def _boom(*a, **kw):
+            raise exc
+        c.model = _boom
+        return c
+
+    # (a) environment / hardware -> propagates as ITSELF, verdict left unresolved
+    c = _probe_with(cuda_arch)
+    try:
+        c._probe_batch_native()
+    except RuntimeError as exc:
+        assert "no kernel image" in str(exc)
+    else:
+        raise AssertionError("CUDA arch failure was swallowed and mislabeled (BUG-3)")
+    assert c._batch_native is None, (
+        "a hardware failure must NOT be recorded as 'model is trace-locked'")
+
+    # (b) genuine model/trace failure -> classified trace-locked, reason retained
+    c = _probe_with(trace_lock)
+    c._probe_batch_native()                        # must not raise
+    assert c._batch_native is False
+    assert "must match the size" in (c._batch_probe_error or "")
+
+
+# =========================================================================== #
+# BUG-4 regression: get_efh_gpu overrides must honor the base mode/delta/chunk_size.
+# =========================================================================== #
+def test_get_efh_gpu_signature_conformance_all_backends():
+    """BUG-4 (Liskov): every backend accepts the documented base signature.
+
+    MACEBatchCalc / MACEPolBatchCalc (and ANI / MACE-autograd / UMA) had narrowed the
+    override to ``get_efh_gpu(self, movable_masks=None)``, so ``get_efh_gpu(mode=...)``
+    -- the documented dispatch of BatchCalcABC -- raised TypeError.
+    """
+    import inspect
+    _import_batch_backends()
+    required = {"movable_masks", "mode", "delta", "chunk_size"}
+    for cls in {id(c): c for c in _BATCH_REGISTRY.values()}.values():
+        params = inspect.signature(cls.get_efh_gpu).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            continue                                # **kw absorbs the contract
+        missing = required - set(params)
+        assert not missing, (
+            f"{cls.__name__}.get_efh_gpu drops {sorted(missing)} from the BatchCalcABC "
+            "contract -> get_efh_gpu(mode=...) raises TypeError (BUG-4)")
+
+
+def test_mace_get_efh_gpu_forwards_mode_and_delta():
+    """BUG-4: mode/delta/chunk_size are FORWARDED, not accepted-and-ignored.
+
+    Accepting the kwargs but ignoring them would silently return an analytic Hessian to
+    a caller who asked for numerical (or the default delta to one who asked for 1e-4) --
+    the same silent-divergence class as the bugs above. Driven on bare instances (no
+    checkpoint) with the two Hessian bodies stubbed out.
+    """
+    from maple.function.calculator.mace._mace_batch_calculator import MACEBatchCalc
+    from maple.function.calculator.mace._macepol_batch_calculator import MACEPolBatchCalc
+
+    for cls, extra in ((MACEBatchCalc, {}),
+                       (MACEPolBatchCalc, {"coupling_mode": "approx"})):
+        c = object.__new__(cls)
+        c._atoms_B = 1
+        c._hess_mode = "fd"
+        for k, v in extra.items():
+            setattr(c, k, v)
+        seen = {}
+        c._efh_fd = lambda movable_masks=None, delta=None: seen.update(
+            path="fd", movable_masks=movable_masks, delta=delta) or "FD"
+        c._efh_analytic = lambda movable_masks=None, chunk_size=None: seen.update(
+            path="analytic", movable_masks=movable_masks, chunk_size=chunk_size) or "AG"
+
+        # explicit numerical + custom delta -> FD body, delta threaded through
+        assert cls.get_efh_gpu(c, movable_masks=[[0]], mode="numerical", delta=7e-4) == "FD"
+        assert seen == {"path": "fd", "movable_masks": [[0]], "delta": 7e-4}, (cls, seen)
+
+        # explicit autograd + chunk -> analytic body (no silent downgrade to FD)
+        seen.clear()
+        assert cls.get_efh_gpu(c, mode="autograd", chunk_size=8) == "AG"
+        assert seen == {"path": "analytic", "movable_masks": None, "chunk_size": 8}, (cls, seen)
+
+        # default (mode=None) still routes by the internal knob -> unchanged behavior
+        seen.clear()
+        assert cls.get_efh_gpu(c) == "FD"
+        assert seen["path"] == "fd" and seen["delta"] == 2e-3, (cls, seen)
+
+        # a typo must not silently pick a path
+        try:
+            cls.get_efh_gpu(c, mode="analytical")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{cls.__name__}: unknown mode silently accepted")
+
+
 if __name__ == "__main__":
     test_all_backends_import_and_register()
     test_capability_contract_declared()
@@ -159,6 +465,15 @@ if __name__ == "__main__":
     test_partial_hessian_movable_mask()
     test_pbc_fail_fast()
     test_pbc_capable_accepts_and_homogeneous_gate()
+    test_uma_hessian_plan_cache_key_covers_fd_step()
+    test_fd_hessian_columns_owner_masked_frozen_exactly_zero()
+    test_fd_hessian_movable_block_unchanged_by_owner_mask()
+    test_batched_implicit_solvent_fails_fast()
+    test_probe_batch_native_env_error_propagates_not_trace_locked()
+    test_get_efh_gpu_signature_conformance_all_backends()
+    test_mace_get_efh_gpu_forwards_mode_and_delta()
     n = len({id(c) for c in _BATCH_REGISTRY.values()})
     print(f"batch-calc contract tests PASS: {n} registered backends contract-compliant "
-          f"+ base plumbing + PBC fail-fast")
+          f"+ base plumbing + PBC fail-fast + UMA Hessian-plan cache key "
+          f"+ BUG-1 solvent gate + BUG-2 owner-masked FD Hessian columns "
+          f"+ BUG-3 env-vs-trace probe triage + BUG-4 get_efh_gpu signature/forwarding")
