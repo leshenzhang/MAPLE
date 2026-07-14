@@ -542,7 +542,21 @@ class FrequencyBase(JobABC):
           1. an explicit prebuilt batched calc in params['batched_calc'];
           2. the attached calc already implements prepare()+get_ef_gpu();
           3. build a UMABatchCalc from params['batch_model_path'].
+
+        Gated on ``#solv``: no batch backend applies an implicit-solvent correction, so a
+        solvated batched PHVA fails fast instead of silently returning a GAS-PHASE Hessian
+        (shared gate, mirrors dispatcher.resolve_batched_calc). This is the strictest of
+        the four acquisition points: the single-structure path rejects "implicit solvent +
+        Hessian" outright, so a silent gas-phase Hessian here would be a pure regression
+        in safety.
         """
+        from .._batch_calc_utils import reject_batched_implicit_solvent
+        return reject_batched_implicit_solvent(
+            self._raw_params, self._build_batched_calc(calc),
+            context="batched partial (PHVA) Hessian")
+
+    def _build_batched_calc(self, calc):
+        """Resolution body for _resolve_batched_calc (see its docstring); ungated."""
         if self._batched_calc is not None:
             return self._batched_calc
         from .._batch_calc_utils import is_batch_calc
@@ -1511,6 +1525,9 @@ class Frequency:
         self.output = output
         self.atoms = atoms
         self.params = params if params is not None else FrequencyParams()
+        # Raw job params (FrequencyParams does not carry 'solv'): kept so the batched
+        # PHVA path can see the job's '#solv' request and refuse to silently drop it.
+        self._raw_params = paras if isinstance(paras, dict) else {}
         if isinstance(paras, dict):
             user = _select_subdict(paras, ("freq", "frequency", "frequency_analysis"))
             _update_dataclass_from_dict(self.params, user)

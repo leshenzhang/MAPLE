@@ -93,7 +93,14 @@ def reject_batched_implicit_solvent(params, calc, *, context="batched job"):
     Capability-gated, not hard-coded: a batch backend that genuinely applies the solvent
     correction declares ``SUPPORTS_IMPLICIT_SOLVENT = True`` and passes through.
     Returns ``calc`` so callers can write ``return reject_batched_implicit_solvent(...)``.
+
+    ``calc is None`` means "no batched calculator -> run the SERIAL path", which applies
+    the solvent correction correctly (and raises on solvent+derivatives). That is the
+    right outcome for a solvated job, so it passes through ungated -- gating it would
+    break the serial fallback instead of protecting it.
     """
+    if calc is None:
+        return None
     if not implicit_solvent_requested(params):
         return calc
     if supports_implicit_solvent(calc):

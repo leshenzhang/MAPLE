@@ -352,6 +352,12 @@ def test_batched_implicit_solvent_fails_fast():
     ok = _SolvatedBatch(device="cpu", dtype=torch.float64)
     assert reject_batched_implicit_solvent(solvated, ok) is ok
 
+    # calc=None means "fall back to SERIAL", which applies the solvent correctly (and
+    # rejects solvent+derivatives). It must pass through ungated -- gating it would break
+    # the serial fallback rather than protect it (frequency._resolve_batched_calc can
+    # legitimately return None).
+    assert reject_batched_implicit_solvent(solvated, None) is None
+
 
 # =========================================================================== #
 # BUG-3 regression: a CUDA-arch/OOM failure must NOT be reported as "trace-locked".
