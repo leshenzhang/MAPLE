@@ -203,8 +203,20 @@ def test_uma_hessian_plan_cache_key_covers_fd_step():
 # BUG-2 regression: _efh_fd must write each Hessian column ONLY to the molecules
 # that own+move that DOF (owner mask), else FD noise leaks into frozen/padding.
 # =========================================================================== #
-@register_batch_calculator
-class _CrossTalkHarmonic(_HarmonicBatch):
+class _HarmonicF64(_HarmonicBatch):
+    """f64 harmonic stub (NOT registered -- used directly by the BUG-2 tests).
+
+    BatchCalcABC.MODEL_DTYPE defaults to float32, so the plain _HarmonicBatch runs its
+    forward in f32: its central-difference Hessian then carries ~1e-6 Ha/A^2 of pure
+    rounding noise (f32 force error ~1e-7 eV/A amplified by 1/(2*delta) = 250). That is
+    the same order as the leak BUG-2 is about, so the BUG-2 assertions must not be made
+    against it. Running the stub in f64 removes the noise source entirely (rather than
+    loosening a tolerance to hide it), making the movable block exact to ~1e-12.
+    """
+    MODEL_DTYPE = torch.float64
+
+
+class _CrossTalkHarmonic(_HarmonicF64):
     """Harmonic + a deterministic BATCH-GLOBAL force term.
 
     Stands in for the floating-point reduction noise of a real batched MLIP forward.
@@ -284,14 +296,14 @@ def test_fd_hessian_movable_block_unchanged_by_owner_mask():
     numbers the owner-mask fix must NOT change.
     """
     mols, mov = _hetero_batch()
-    c = _HarmonicBatch(device="cpu", dtype=torch.float64)
+    c = _HarmonicF64(device="cpu", dtype=torch.float64)
     c.prepare(mols)
     _, _, H, _ = c.get_efh_gpu(movable_masks=mov, mode="numerical")
     kHa = _K * EV2HARTREE
     # mol0: all 3 atoms movable -> full 9x9 block = K*I
-    assert torch.allclose(H[0][:9, :9], kHa * torch.eye(9, dtype=torch.float64), atol=1e-6)
+    assert torch.allclose(H[0][:9, :9], kHa * torch.eye(9, dtype=torch.float64), atol=1e-9)
     # mol1: only atom 0 movable -> its 3x3 movable block = K*I, rest exactly 0
-    assert torch.allclose(H[1][:3, :3], kHa * torch.eye(3, dtype=torch.float64), atol=1e-6)
+    assert torch.allclose(H[1][:3, :3], kHa * torch.eye(3, dtype=torch.float64), atol=1e-9)
     assert float(H[1][3:, :].abs().max()) == 0.0 and float(H[1][:, 3:].abs().max()) == 0.0
 
 
@@ -306,15 +318,13 @@ def test_batched_implicit_solvent_fails_fast():
     bypassed the single-structure path's solvent+derivatives NotImplementedError.
     """
     from maple.function.dispatcher.dispatcher import resolve_batched_calc
-    from maple.function.dispatcher._batch_calc_utils import (
-        implicit_solvent_requested, reject_batched_implicit_solvent)
 
     gas_calc = _HarmonicBatch(device="cpu", dtype=torch.float64)
     solvated = {"solv": {"method": "gbsa", "implicit": "water", "experimental": True},
                 "batched_calc": gas_calc}
 
-    assert implicit_solvent_requested(solvated) is True
-    assert gas_calc.SUPPORTS_IMPLICIT_SOLVENT is False
+    # THE behavioral assertion (this is what fails on the buggy tree -- keep it first, so
+    # the test detects the BUG rather than merely the absence of the new helper module).
     try:
         resolve_batched_calc(solvated, [], attached_calc=None)
     except NotImplementedError as exc:
@@ -326,6 +336,11 @@ def test_batched_implicit_solvent_fails_fast():
 
     # no #solv -> unchanged (zero regression on every gas-phase batched job)
     assert resolve_batched_calc({"batched_calc": gas_calc}, []) is gas_calc
+
+    from maple.function.dispatcher._batch_calc_utils import (
+        implicit_solvent_requested, reject_batched_implicit_solvent)
+    assert implicit_solvent_requested(solvated) is True
+    assert gas_calc.SUPPORTS_IMPLICIT_SOLVENT is False
     # explicit solvation adds real atoms; it is NOT the implicit path and is not gated
     assert implicit_solvent_requested({"solv": {"explicit": "water"}}) is False
     # 'none' sentinels are not a request
@@ -349,15 +364,12 @@ def test_probe_batch_native_env_error_propagates_not_trace_locked():
     ``_batch_native = False`` and prepare() then blamed the MODEL ("traced single-graph").
     Environment errors must propagate; only genuine model/trace errors set the flag.
     """
-    from maple.function.calculator.batch_calculator_base import is_environment_error
     from maple.function.calculator.mace._mace_batch_calculator import MACEBatchCalc
 
     cuda_arch = RuntimeError(
         "CUDA error: no kernel image is available for execution on the device")
     trace_lock = RuntimeError(
         "The size of tensor a (2) must match the size of tensor b (1) at dimension 0")
-    assert is_environment_error(cuda_arch) is True
-    assert is_environment_error(trace_lock) is False
 
     def _probe_with(exc):
         """Drive the real _probe_batch_native with a model that raises `exc`."""
@@ -386,6 +398,13 @@ def test_probe_batch_native_env_error_propagates_not_trace_locked():
     c._probe_batch_native()                        # must not raise
     assert c._batch_native is False
     assert "must match the size" in (c._batch_probe_error or "")
+
+    # the shared classifier itself (checked last: the assertions above are the ones that
+    # must fail on the buggy tree, and they do so behaviorally, not by ImportError)
+    from maple.function.calculator.batch_calculator_base import is_environment_error
+    assert is_environment_error(cuda_arch) is True
+    assert is_environment_error(trace_lock) is False
+    assert is_environment_error(RuntimeError("CUDA out of memory. Tried to allocate...")) is True
 
 
 # =========================================================================== #
