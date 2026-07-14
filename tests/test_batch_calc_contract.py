@@ -470,6 +470,8 @@ def test_hessian_helper_overrides_accept_the_kwargs_get_efh_gpu_passes():
             c = object.__new__(cls)
             c._atoms_B = 1
             c._hess_mode = "fd"
+            c.device = torch.device("cpu")      # set by the real ctor (base.__init__)
+            c.dtype = torch.float64
             c.coupling_mode = "approx"          # macepol-only knob; harmless elsewhere
             c._efh_fd = lambda **kw: "FD"
             c._efh_analytic = lambda *a, **kw: "AG"
@@ -504,6 +506,8 @@ def test_mace_get_efh_gpu_forwards_mode_and_delta():
         c = object.__new__(cls)
         c._atoms_B = 1
         c._hess_mode = "fd"
+        c.device = torch.device("cpu")          # set by the real ctor (base.__init__)
+        c.dtype = torch.float64
         for k, v in extra.items():
             setattr(c, k, v)
         seen = {}
