@@ -439,17 +439,27 @@ class MACEPolBatchCalc(BatchCalcABC):
             # not knobs of that path (no FD, no seeding budget).
             return self._efh_sequential(movable_masks)
 
+        # See MACEBatchCalc: this class's _efh_analytic is a hand-written seeded
+        # double-backward with NO chunk budget. Passing chunk_size down would raise
+        # TypeError inside the `except Exception` below and silently downgrade the
+        # analytic Hessian to FD (a ~4e-4 Ha/A^2 shift on macepols). Reject it loudly.
+        if chunk_size is not None:
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: chunk_size is not supported by this "
+                "backend's analytic Hessian (hand-written seeded double-backward, no vmap "
+                "chunking). Use chunk_size=None.")
+
         req = None if mode is None else str(mode).lower()
         if req in ("numerical", "fd"):
             return self._efh_fd(movable_masks=movable_masks, delta=delta)
         if req in ("autograd", "analytic"):
-            return self._efh_analytic(movable_masks, chunk_size=chunk_size)
+            return self._efh_analytic(movable_masks)      # explicit -> no silent downgrade
         if req is not None:
             raise ValueError(
                 f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; "
                 f"expected one of {self.SUPPORTED_HESSIAN_MODES} (or None to auto-select).")
 
-        # mode=None -> the auto-select path (unchanged).
+        # mode=None -> the auto-select path (BIT-IDENTICAL to pre-fix).
         if self._hess_mode is None:
             try:
                 self._probe_double_backward()
@@ -457,7 +467,7 @@ class MACEPolBatchCalc(BatchCalcABC):
                 self._hess_mode = 'fd'
         if self._hess_mode == 'analytic':
             try:
-                return self._efh_analytic(movable_masks, chunk_size=chunk_size)
+                return self._efh_analytic(movable_masks)
             except Exception:
                 self._hess_mode = 'fd'
         return self._efh_fd(movable_masks=movable_masks, delta=delta)

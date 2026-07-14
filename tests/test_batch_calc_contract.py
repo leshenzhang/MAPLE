@@ -411,6 +411,58 @@ def test_get_efh_gpu_signature_conformance_all_backends():
             "contract -> get_efh_gpu(mode=...) raises TypeError (BUG-4)")
 
 
+def test_hessian_helper_overrides_accept_the_kwargs_get_efh_gpu_passes():
+    """The Hessian bodies must accept what get_efh_gpu hands them -- by KEYWORD.
+
+    Two live hazards this pins down:
+
+    1. A backend whose ``_efh_analytic`` lacks ``chunk_size`` will raise TypeError if
+       get_efh_gpu forwards it -- and because the analytic call sits inside
+       ``except Exception: self._hess_mode = 'fd'``, that TypeError is SWALLOWED and the
+       Hessian silently degrades from analytic to finite-difference. That is a silent
+       numerical change (9.06e-07 Ha/A^2 on toy_maceomol, 3.96e-04 on macepols), not a
+       crash. It happened during this very bugfix round and was caught only by the
+       pre/post zero-regression gate. MACE / MACE-POL therefore reject chunk_size in
+       get_efh_gpu instead of forwarding it.
+
+    2. The ``_efh_fd`` overrides declare (delta, movable_masks) -- the REVERSE positional
+       order of the base's (movable_masks, delta). Every caller must therefore pass these
+       BY KEYWORD; a positional call silently swaps the FD step with the movable mask.
+    """
+    import inspect
+    _import_batch_backends()
+    for cls in {id(c): c for c in _BATCH_REGISTRY.values()}.values():
+        fd = inspect.signature(cls._efh_fd).parameters
+        assert {"movable_masks", "delta"} <= set(fd), (
+            f"{cls.__name__}._efh_fd must accept movable_masks + delta by keyword")
+
+        ag = inspect.signature(cls._efh_analytic).parameters
+        assert "movable_masks" in ag, f"{cls.__name__}._efh_analytic needs movable_masks"
+
+        # If the analytic body has no chunk budget, get_efh_gpu must NOT forward one.
+        if "chunk_size" not in ag and not any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in ag.values()):
+            c = object.__new__(cls)
+            c._atoms_B = 1
+            c._hess_mode = "fd"
+            c.coupling_mode = "approx"          # macepol-only knob; harmless elsewhere
+            c._efh_fd = lambda **kw: "FD"
+            c._efh_analytic = lambda *a, **kw: "AG"
+            try:
+                cls.get_efh_gpu(c, chunk_size=8)
+            except ValueError:
+                pass                             # rejected loudly: correct
+            except TypeError as exc:
+                raise AssertionError(
+                    f"{cls.__name__}: get_efh_gpu forwards chunk_size to an _efh_analytic "
+                    f"that cannot take it ({exc}); inside the analytic try/except this "
+                    "silently downgrades the Hessian to FD") from None
+            else:
+                raise AssertionError(
+                    f"{cls.__name__}: get_efh_gpu accepted chunk_size although its "
+                    "_efh_analytic has no chunk budget -> the knob is silently ignored")
+
+
 def test_mace_get_efh_gpu_forwards_mode_and_delta():
     """BUG-4: mode/delta/chunk_size are FORWARDED, not accepted-and-ignored.
 
@@ -439,15 +491,30 @@ def test_mace_get_efh_gpu_forwards_mode_and_delta():
         assert cls.get_efh_gpu(c, movable_masks=[[0]], mode="numerical", delta=7e-4) == "FD"
         assert seen == {"path": "fd", "movable_masks": [[0]], "delta": 7e-4}, (cls, seen)
 
-        # explicit autograd + chunk -> analytic body (no silent downgrade to FD)
+        # explicit autograd -> analytic body (no silent downgrade to FD)
         seen.clear()
-        assert cls.get_efh_gpu(c, mode="autograd", chunk_size=8) == "AG"
-        assert seen == {"path": "analytic", "movable_masks": None, "chunk_size": 8}, (cls, seen)
+        assert cls.get_efh_gpu(c, mode="autograd") == "AG"
+        assert seen["path"] == "analytic", (cls, seen)
 
         # default (mode=None) still routes by the internal knob -> unchanged behavior
         seen.clear()
         assert cls.get_efh_gpu(c) == "FD"
         assert seen["path"] == "fd" and seen["delta"] == 2e-3, (cls, seen)
+
+        # chunk_size: these two backends' analytic Hessian is a hand-written seeded
+        # double-backward with NO vmap chunking, so _efh_analytic does not accept it.
+        # It must be REJECTED LOUDLY. Passing it down would raise TypeError inside the
+        # analytic try/except and silently downgrade the Hessian to FD -- a real
+        # regression (9.06e-07 Ha/A^2 on toy_maceomol, 3.96e-04 on macepols) that the
+        # pre/post zero-regression gate caught during this bugfix round.
+        try:
+            cls.get_efh_gpu(c, chunk_size=8)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"{cls.__name__}: chunk_size silently accepted -> risks a silent "
+                "analytic->FD downgrade")
 
         # a typo must not silently pick a path
         try:
@@ -471,6 +538,7 @@ if __name__ == "__main__":
     test_batched_implicit_solvent_fails_fast()
     test_probe_batch_native_env_error_propagates_not_trace_locked()
     test_get_efh_gpu_signature_conformance_all_backends()
+    test_hessian_helper_overrides_accept_the_kwargs_get_efh_gpu_passes()
     test_mace_get_efh_gpu_forwards_mode_and_delta()
     n = len({id(c) for c in _BATCH_REGISTRY.values()})
     print(f"batch-calc contract tests PASS: {n} registered backends contract-compliant "

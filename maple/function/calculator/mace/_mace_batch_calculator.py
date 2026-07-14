@@ -405,18 +405,29 @@ class MACEBatchCalc(BatchCalcABC):
                     torch.zeros((0, 0, 0), dtype=dtype, device=device),
                     torch.zeros((0,), dtype=torch.int64, device=device))
 
+        # This class's _efh_analytic is a hand-written seeded double-backward (no vmap),
+        # so it has NO chunk budget. Reject an explicit chunk_size loudly rather than
+        # ignoring it -- and NEVER pass it down: doing so raises TypeError inside the
+        # `except Exception` below, which would silently downgrade the analytic Hessian
+        # to FD (a ~9e-7 Ha/A^2 shift on toy_maceomol -- caught by the pre/post
+        # zero-regression gate).
+        if chunk_size is not None:
+            raise ValueError(
+                f"{type(self).__name__}.get_efh_gpu: chunk_size is not supported by this "
+                "backend's analytic Hessian (hand-written seeded double-backward, no vmap "
+                "chunking). Use chunk_size=None.")
+
         req = None if mode is None else str(mode).lower()
         if req in ("numerical", "fd"):
             return self._efh_fd(movable_masks=movable_masks, delta=delta)
         if req in ("autograd", "analytic"):
-            # explicit request -> no silent downgrade to FD
-            return self._efh_analytic(movable_masks, chunk_size=chunk_size)
+            return self._efh_analytic(movable_masks)      # explicit -> no silent downgrade
         if req is not None:
             raise ValueError(
                 f"{type(self).__name__}.get_efh_gpu: unknown mode {mode!r}; "
                 f"expected one of {self.SUPPORTED_HESSIAN_MODES} (or None to auto-select).")
 
-        # mode=None -> the auto-select path (unchanged).
+        # mode=None -> the auto-select path (BIT-IDENTICAL to pre-fix).
         if self._hess_mode is None:
             try:
                 self._probe_double_backward()
@@ -424,7 +435,7 @@ class MACEBatchCalc(BatchCalcABC):
                 self._hess_mode = 'fd'
         if self._hess_mode == 'analytic':
             try:
-                return self._efh_analytic(movable_masks, chunk_size=chunk_size)
+                return self._efh_analytic(movable_masks)
             except Exception:
                 # graceful degradation is intentional here (FD is the oracle); unlike
                 # the batch-native probe, this emits no wrong DIAGNOSIS, only a slower
