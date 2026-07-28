@@ -554,15 +554,25 @@ def probe_core(args, cases, out):
 
 
 def _summ_core(rows):
-    print(f"{'R(A)':>6} {'n':>4} {'<m_core>':>9} {'<frac>':>7} {'med rel_dlam':>13} "
-          f"{'min ovl':>9} {'nimag_ok':>9} {'GE ratio':>9}", flush=True)
+    # Cases whose FULL Hessian is not a clean index-1 saddle cannot judge a partial
+    # Hessian -- they are SKIPPED from the accuracy columns (a gate that fires on an
+    # inapplicable case is a broken gate), and counted separately.
+    print(f"{'R(A)':>6} {'n':>4} {'skip':>5} {'<m_core>':>9} {'<frac>':>7} "
+          f"{'med rel_dlam':>13} {'med ovl':>9} {'min ovl':>9} {'ovl>=0.99':>10} "
+          f"{'nimag_ok':>9} {'GE ratio':>9}", flush=True)
     for R in sorted(set(r["radius"] for r in rows)):
-        rs = [r for r in rows if r["radius"] == R]
-        print(f"{R:>6} {len(rs):>4} {np.mean([r['m_core'] for r in rs]):>9.1f} "
+        allr = [r for r in rows if r["radius"] == R]
+        rs = [r for r in allr if r["nimag_full"] == 1]
+        if not rs:
+            continue
+        print(f"{R:>6} {len(rs):>4} {len(allr) - len(rs):>5} "
+              f"{np.mean([r['m_core'] for r in rs]):>9.1f} "
               f"{np.mean([r['frac_core'] for r in rs]):>7.2f} "
               f"{np.median([r['rel_d_lam'] for r in rs]):>13.3e} "
+              f"{np.median([r['mode0_overlap'] for r in rs]):>9.5f} "
               f"{min(r['mode0_overlap'] for r in rs):>9.5f} "
-              f"{sum(r['nimag_full'] == r['nimag_core'] for r in rs)}/{len(rs):<7} "
+              f"{sum(r['mode0_overlap'] >= 0.99 for r in rs)}/{len(rs):<9} "
+              f"{sum(r['nimag_core'] == 1 for r in rs)}/{len(rs):<7} "
               f"{sum(r['ge'] for r in rs) / sum(r['ge_full'] for r in rs):>9.3f}",
               flush=True)
 
