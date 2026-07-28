@@ -130,6 +130,8 @@ class MACEBatchCalc(BatchCalcABC):
         self._cell = None
         self._cell_inv = None
         self._shift_combos = None
+        self._cand_cell = None            # R3-7: per-candidate-pair cell gather (PBC)
+        self._cand_cell_inv = None
 
         try:
             self._probe_batch_native()
@@ -222,10 +224,23 @@ class MACEBatchCalc(BatchCalcABC):
             self._shift_combos = torch.tensor(
                 [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
                 dtype=self.mdtype, device=device)                                    # (27,3)
+            # R3-7 opt (2026-07-28; mirrors the already-validated MaceOffBatchCalc
+            # change in cca9aa9): _build_edges_pbc gathers self._cell[cand_rep] /
+            # self._cell_inv[cand_rep] EVERY forward, but cand_rep and the cell are
+            # both loop-invariant -- _cell/_cell_inv are written ONLY here (this
+            # class has no NPT hook: no set_cells_/rescale_isotropic_, verified by
+            # grep), and cand_rep is fixed by the topology. Precompute the
+            # per-candidate-pair gather ONCE (byte-identical result).
+            self._cand_cell = (self._cell[self.cand_rep]
+                               if self.cand_rep.numel() > 0 else None)
+            self._cand_cell_inv = (self._cell_inv[self.cand_rep]
+                                   if self.cand_rep.numel() > 0 else None)
         else:
             self._cell = None
             self._cell_inv = None
             self._shift_combos = None
+            self._cand_cell = None
+            self._cand_cell_inv = None
 
     # step_cart_ / set_coords_ / backup_coords / restore_coords / _resolve_movable are
     # identical to BatchCalcABC's -> inherited (deleted here).
@@ -277,9 +292,9 @@ class MACEBatchCalc(BatchCalcABC):
         (j->i, -shift) for every kept image. Cutoff = strict ``d < r_max`` (matscipy).
         """
         device = self.device
-        ci, cj, rep = self.cand_i, self.cand_j, self.cand_rep
-        cellp = self._cell[rep]                                     # (P,3,3)
-        invp = self._cell_inv[rep]                                  # (P,3,3)
+        ci, cj = self.cand_i, self.cand_j
+        cellp = self._cand_cell         # (P,3,3)  R3-7: precomputed self._cell[cand_rep]
+        invp = self._cand_cell_inv      # (P,3,3)  R3-7: precomputed self._cell_inv[cand_rep]
         rij0 = coord[cj] - coord[ci]                                # (P,3)  (r_j - r_i)
         # nearest-image base cell in fractional space (handles unwrapped drift).
         n0 = torch.round(torch.einsum("pc,pck->pk", rij0, invp))    # (P,3)
