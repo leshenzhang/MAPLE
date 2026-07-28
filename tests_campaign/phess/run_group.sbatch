@@ -11,6 +11,8 @@
 # One GPU allocation runs several configs back to back -- far kinder to a
 # congested queue than one job per config.
 set -u
+set -o pipefail          # a failing python must not be hidden by a downstream pipe
+FAILED=0
 ROOT=/ibex/user/xiaox/zls/ai-gpu/opt2026/phess
 FORK=$ROOT/MAPLE
 export PATH=/home/wangc0i/miniconda3/envs/cxtorch/bin:${PATH}
@@ -35,10 +37,19 @@ for it in "${ITEMS[@]}"; do
   python $FORK/tests_campaign/phess/phess_prod.py \
     --fork $FORK --model $MODEL --pkl $PKL --out-dir $ROOT/out \
     --tag $TAG --replicate $REP --n $NCASE --max-iter $MAXIT $ARGS
-  echo "RC_${TAG}_r${REP}=$?"
+  rc=$?
+  echo "RC_${TAG}_r${REP}=$rc"
+  # Artifact gate: rc==0 is NOT evidence of success. The JSON must exist AND
+  # carry a non-zero gradient-equivalent count.
+  J=$ROOT/out/${TAG}_r${REP}.json
+  if [ $rc -ne 0 ] || [ ! -s "$J" ] || ! grep -q '"ge_total"' "$J"; then
+    echo "ARTIFACT_GATE_FAIL ${TAG}_r${REP} rc=$rc json=$J"
+    FAILED=$((FAILED+1))
+  fi
 done
 
 kill $SAMPLER 2>/dev/null
 awk -F, '{g+=$1; m+=$3; n++; if($1>mx)mx=$1} END{if(n)printf "GPUUTIL samples=%d mean_gpu=%.1f%% max_gpu=%.0f%% mean_memMB=%.0f\n",n,g/n,mx,m/n}' \
   $ROOT/logs/gpuutil_${SLURM_JOB_ID}.log
-echo PHESS_GROUP_DONE
+echo "PHESS_GROUP_DONE failed_configs=$FAILED"
+exit $FAILED

@@ -22,15 +22,37 @@ import numpy as np
 
 
 def load(d):
-    runs = {}
+    """Load run JSONs, REJECTING any that did not actually produce data.
+
+    A finished Slurm job / rc==0 is not evidence: a config whose gradient budget
+    is zero, that has no final geometries, or whose saddle gate measured zero
+    cases is a FAILURE and must not silently enter the tables as if it passed.
+    """
+    runs, rejected = {}, []
     for p in sorted(glob.glob(os.path.join(d, "*_r*.json"))):
         try:
             j = json.load(open(p))
-        except Exception:
+        except Exception as e:
+            rejected.append((os.path.basename(p), f"unreadable: {e}"))
             continue
         if "tag" not in j:
             continue
+        why = []
+        if not j.get("log", {}).get("ge_total"):
+            why.append("ge_total==0")
+        if sum(1 for g in j.get("final_geoms", []) if g is not None) == 0:
+            why.append("0 final geometries")
+        if len(j.get("saddle", [])) == 0:
+            why.append("saddle gate measured 0 cases")
+        if why:
+            rejected.append((os.path.basename(p), "; ".join(why)))
+            continue
         runs.setdefault(j["tag"], {})[j["replicate"]] = j
+    if rejected:
+        print("## REJECTED artifacts (treated as FAIL, excluded from all tables)")
+        for name, why in rejected:
+            print(f"   {name}: {why}")
+        print()
     return runs
 
 

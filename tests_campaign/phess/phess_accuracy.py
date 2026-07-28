@@ -623,9 +623,19 @@ def main():
         {"fd": probe_fd, "update": probe_update, "lanczos": probe_lanczos,
          "core": probe_core, "synth": probe_synth}[p](args, cases, out)
 
+    # EMPTINESS GATE: a probe that produced ZERO rows is a FAILURE, not a pass.
+    # (An import/env/data problem silently yields an empty table that otherwise
+    # looks like a clean run; exit non-zero so the job is FAILED, not COMPLETED.)
+    empty = [p for p in args.probe if not out.get(p)]
     path = os.path.join(args.out_dir, f"{args.tag}.json")
+    out["meta"]["empty_probes"] = empty
     json.dump(out, open(path, "w"), indent=1)
     print(f"\n[acc] wrote {path}", flush=True)
+    for p in args.probe:
+        print(f"[acc] probe {p}: {len(out.get(p, []))} rows", flush=True)
+    if empty:
+        print(f"PHESS_ACC_FAIL empty_probes={empty}", flush=True)
+        sys.exit(2)
     print("PHESS_ACC_DONE", flush=True)
 
 

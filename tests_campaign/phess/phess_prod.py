@@ -238,6 +238,21 @@ def main():
     print(f"[prod] ge_total={ge} ge_iter={log.get('ge_iter')} ge_hess={log.get('ge_hess')} "
           f"ge_hvp={log.get('ge_hvp')} s_per_ge={res['s_per_ge']}", flush=True)
     print(f"[prod] wrote {path}", flush=True)
+    # ARTIFACT GATE: exit code 0 is not evidence of a run. Demand a non-zero
+    # gradient budget, at least one final geometry, and (unless explicitly
+    # skipped) at least one saddle measurement -- otherwise FAIL loudly.
+    n_geom = sum(1 for g in geoms if g is not None)
+    bad = []
+    if not ge:
+        bad.append("ge_total==0")
+    if n_geom == 0:
+        bad.append("no final geometries")
+    if not args.skip_saddle and not sad:
+        bad.append("saddle gate produced 0 cases")
+    if bad:
+        print(f"PHESS_PROD_FAIL {args.tag}_r{args.replicate}: {'; '.join(bad)}", flush=True)
+        sys.exit(2)
+    print(f"[prod] geoms={n_geom}/{len(cases)} saddle_cases={len(sad)}", flush=True)
     print("PHESS_PROD_DONE", flush=True)
 
 
