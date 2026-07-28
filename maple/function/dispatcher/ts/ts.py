@@ -206,6 +206,13 @@ class TransitionState(JobABC):
             auto_batch=bool(p.get('auto_batch', False)),
             auto_batch_cap=int(p.get('auto_batch_cap', 256)),
             vram_safety=float(p.get('vram_safety', 0.8)),
+            # [8] host-side diagnostics policy (default lean/endpoints; 'full'
+            # restores the legacy byte-identical log/trajectory).
+            log_mode=p.get('log_mode'),
+            traj_mode=p.get('traj_mode'),
+            # [9] streaming-pool refill cost control.
+            refill_min=int(p.get('refill_min', 1)),
+            refill_partial_hessian=bool(p.get('refill_partial_hessian', True)),
         )
         bprfo.run(mols, pool_queue=p.get('pool_queue'), B_target=p.get('B_target'),
                   auto_batch=p.get('auto_batch'))
