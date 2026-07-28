@@ -42,7 +42,11 @@ def spread_pct(vals):
 
 def gkey(r):
     mode = r.get("params", {}).get("mode") or r.get("params", {}).get("arm") or ""
-    return (r["bench"], r["dispatcher"], r["backend"], r["B"], mode)
+    # FIX-1: hessian_mode is part of the identity of a group. grad-equivalents
+    # are not commensurable across Hessian modes, so runs that differ in it must
+    # never land in the same group (and never be ratioed against each other).
+    return (r["bench"], r["dispatcher"], r["backend"], r["B"], mode,
+            r.get("hessian_mode"))
 
 
 def collect(rundir):
@@ -60,8 +64,8 @@ def collect(rundir):
     return runs
 
 
-METRICS = ["wall_s", "s_per_grad_equiv", "grad_equiv_total", "gpu_util_mean",
-           "gpu_util_peak", "vram_reserved_MB"]
+METRICS = ["wall_s", "s_per_grad_equiv", "grad_equiv_total", "forward_calls",
+           "gpu_util_mean", "gpu_util_peak", "vram_reserved_MB"]
 SCI = ["success_rate", "barrier_MAE_eV", "median_TS_RMSD_A", "pct_1imag"]
 
 
@@ -73,6 +77,7 @@ def summarize(runs):
     for k in sorted(groups, key=str):
         g = groups[k]
         row = dict(bench=k[0], dispatcher=k[1], backend=k[2], B=k[3], mode=k[4],
+                   hessian_mode=k[5],
                    n_reps=len(g), reps=[r["rep"] for r in g],
                    nodes=[r["env"].get("node") for r in g],
                    files=[r["_file"] for r in g])
@@ -81,6 +86,9 @@ def summarize(runs):
             row[m + "_mean"] = float(np.mean(vals)) if vals else None
             row[m + "_per_rep"] = vals
             row[m + "_spread_pct"] = spread_pct(vals)
+        row["sampler_source"] = sorted({(r.get("gpu_sampler_source")
+                                         or r.get("extra", {}).get("sampler_source")
+                                         or "unknown") for r in g})
         for m in SCI:
             vals = [r.get("science", {}).get(m) for r in g
                     if r.get("science", {}).get(m) is not None]
@@ -134,17 +142,39 @@ def pair_autoneb(runs):
 
 
 def compare(rows, baseline):
-    bmap = {(r["bench"], r["dispatcher"], r["backend"], r["B"], r["mode"]): r
-            for r in baseline["groups"]}
+    # match on everything EXCEPT hessian_mode first, so a mode change is reported
+    # as INCOMPARABLE rather than silently NO_BASELINE
+    bmap = {}
+    for r in baseline["groups"]:
+        bmap.setdefault((r["bench"], r["dispatcher"], r["backend"], r["B"],
+                         r["mode"]), []).append(r)
     out = []
     for r in rows:
         k = (r["bench"], r["dispatcher"], r["backend"], r["B"], r["mode"])
-        b = bmap.get(k)
-        if not b:
+        cands = bmap.get(k, [])
+        if not cands:
             out.append(dict(key=str(k), verdict="NO_BASELINE"))
             continue
-        rec = dict(key=str(k))
-        for m in ("wall_s", "s_per_grad_equiv"):
+        same_mode = [b for b in cands if b.get("hessian_mode") == r.get("hessian_mode")]
+        b = same_mode[0] if same_mode else cands[0]
+        mode_match = bool(same_mode)
+        rec = dict(key=str(k), hessian_mode=r.get("hessian_mode"),
+                   baseline_hessian_mode=b.get("hessian_mode"),
+                   hessian_mode_match=mode_match)
+        # FIX-1: wall_s and forward_calls stay valid across Hessian modes;
+        # s_per_grad_equiv does NOT (different denominator definition).
+        for m in ("wall_s", "forward_calls", "s_per_grad_equiv"):
+            if m == "s_per_grad_equiv" and not mode_match:
+                rec[m] = dict(verdict="INCOMPARABLE",
+                              reason=("hessian_mode differs (%s vs baseline %s): a "
+                                      "numerical FD Hessian spends 2*3N counted "
+                                      "forwards per structure while an autograd "
+                                      "Hessian spends 1 forward + an uncounted "
+                                      "double-backward -> the denominators are not "
+                                      "the same quantity. Compare wall_s / "
+                                      "forward_calls instead."
+                                      % (r.get("hessian_mode"), b.get("hessian_mode"))))
+                continue
             cm, bm = r.get(m + "_mean"), b.get(m + "_mean")
             sp = b.get(m + "_spread_pct") or 0.0
             if cm is None or bm is None or bm == 0:
@@ -171,14 +201,16 @@ def main():
     print(f"[aggregate] {len(runs)} runs -> {len(rows)} groups")
     for r in rows:
         print(f"  {r['bench']:<15} {r['dispatcher']:<9} {r['backend']:<6} B={r['B']:<4} "
-              f"{r['mode']:<10} reps={r['n_reps']} wall={r['wall_s_mean']} "
-              f"(spread {r['wall_s_spread_pct']}%) s/gE={r['s_per_grad_equiv_mean']}")
+              f"{r['mode']:<10} hess={str(r['hessian_mode']):<10} reps={r['n_reps']} "
+              f"wall={r['wall_s_mean']} (spread {r['wall_s_spread_pct']}%) "
+              f"s/gE={r['s_per_grad_equiv_mean']}")
     if b3:
         print(f"  [B3 paired] {json.dumps({k: v for k, v in b3.items() if k != 'note'})}")
     if a.csv:
-        cols = ["bench", "dispatcher", "backend", "B", "mode", "n_reps",
+        cols = ["bench", "dispatcher", "backend", "B", "mode", "hessian_mode", "n_reps",
                 "wall_s_mean", "wall_s_spread_pct", "s_per_grad_equiv_mean",
                 "s_per_grad_equiv_spread_pct", "grad_equiv_total_mean",
+                "forward_calls_mean", "sampler_source",
                 "gpu_util_mean_mean", "gpu_util_peak_mean", "vram_reserved_MB_mean",
                 "sci_success_rate_mean", "sci_barrier_MAE_eV_mean",
                 "sci_median_TS_RMSD_A_mean", "sci_pct_1imag_mean"]

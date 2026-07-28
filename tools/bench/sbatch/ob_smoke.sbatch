@@ -25,6 +25,7 @@ $RM --dispatcher pipeline --backend uma --B 2 --N 4 --reps 1 --n-images 5 --neb-
 $RM --dispatcher forward  --backend uma --B 1,8 --reps 1 --iters 3 --outdir $OUT/smoke --tag smoke
 $RM --dispatcher hessian  --backend uma --B 2 --reps 1 --hess-iters 1 --outdir $OUT/smoke --tag smoke
 $RM --dispatcher parity   --backend uma --reps 1 --outdir $OUT/smoke --tag smoke
+$RM --dispatcher counter  --backend uma --reps 1 --outdir $OUT/smoke --tag smoke
 $RM --dispatcher autoneb  --backend uma --arm batched --rxn-count 2 --B-single 2 --aneb-maxiter 10 --reps 1 --outdir $OUT/smoke --tag smoke
 $RM --dispatcher autoneb  --backend uma --arm serial  --rxn-count 2 --serial-budget-s 240 --aneb-maxiter 10 --reps 1 --outdir $OUT/smoke --tag smoke
 echo SMOKE_DONE rc=$?

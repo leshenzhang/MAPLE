@@ -13,7 +13,12 @@ forward   raw get_ef_gpu micro-benchmark (prepare+forward per timed iteration,
 hessian   get_efh_gpu segment timing, per mode (numerical FD / autograd).
 autoneb   B3 arms: --arm serial (single-reaction AutoNEB oracle, per-rxn budget
           via SIGALRM, incremental flush) | --arm batched (AutoNEBBatch).
-parity    canon-vs-canon floors + gate negative-control self-test (PASS/FAIL/SKIP).
+parity    canon-vs-canon floors + gate negative-control self-test. Two-tier:
+          PASS / NUMERICALLY_DIFFERENT (escalates to same-saddle+science) /
+          REGRESSION / SKIP.
+counter   EMISSION self-test: pins GradCounter against known answers (B=1 -> 1,
+          B=16 -> 16, FD Hessian -> the analytic 2*3N form) for every backend in
+          the registry. A backend that FAILs here may not publish s/grad-equiv.
 
 Examples
 --------
@@ -35,8 +40,9 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bench.core import (HA2EV, GPUSampler, GradCounter, build_backend, dump,
-                        kabsch_rmsd, load_ts1x, n_imag_batch, run_record)
+from bench.core import (HA2EV, GPUSampler, GradCounter, build_backend,
+                        counter_self_test, dump, kabsch_rmsd, load_ts1x,
+                        n_imag_batch, run_record)
 
 
 def _cuda_sync():
@@ -153,6 +159,7 @@ def run_pipeline(args, B, rep):
     rec = run_record(
         bench="pipeline_ts", dispatcher="pipeline", backend=args.backend, B=B,
         N=len(data), rep=rep, tag=tag,
+        hessian_mode=getattr(calc, "hessian_mode", "n/a"),
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     n_images=args.n_images, neb_maxiter=args.neb_maxiter,
                     dyneb=args.dyneb, recalc=args.recalc, n_chunks=nchunk,
@@ -196,7 +203,7 @@ def run_forward(args, B, rep):
     pk_resv, pk_alloc = _peaks()
     rec = run_record(
         bench="raw_forward", dispatcher="forward", backend=args.backend, B=B,
-        N=B, rep=rep, tag=tag,
+        N=B, rep=rep, tag=tag, hessian_mode="none",
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     iters=args.iters, loop="prepare+get_ef_gpu (a3/B5 convention)",
                     geometry="ts1x DFT TS structures"),
@@ -235,6 +242,7 @@ def run_hessian(args, B, rep, mode):
     except Exception as e:
         rec = run_record(bench="hessian_segment", dispatcher="hessian",
                          backend=args.backend, B=B, N=B, rep=rep, tag=tag,
+                         hessian_mode=mode,
                          params=dict(mode=mode, error=f"{type(e).__name__}: {str(e)[:200]}"),
                          wall_s=0.0, grad_equiv_total=0, forward_calls=0,
                          extra=dict(status="FAILED"))
@@ -242,7 +250,7 @@ def run_hessian(args, B, rep, mode):
         return dump(rec, args.outdir, tag)
     rec = run_record(
         bench="hessian_segment", dispatcher="hessian", backend=args.backend, B=B,
-        N=B, rep=rep, tag=tag,
+        N=B, rep=rep, tag=tag, hessian_mode=mode,
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     mode=mode, iters=args.hess_iters,
                     note=("grad-equiv counts calc._forward only; the autograd Hessian's "
@@ -387,6 +395,7 @@ def run_autoneb(args, rep):
     rec = run_record(
         bench="autoneb_B3", dispatcher="autoneb", backend=args.backend,
         B=(1 if args.arm == "serial" else args.B_single), N=len(data), rep=rep, tag=tag,
+        hessian_mode="none",
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     arm=args.arm, rxn_start=args.rxn_start, rxn_count=args.rxn_count,
                     serial_budget_s=(args.serial_budget_s if args.arm == "serial" else None),
@@ -412,14 +421,64 @@ def run_parity(args, rep):
     st = pg.self_test(build, mols)
     wall = time.time() - t0
     rec = run_record(bench="parity_gate", dispatcher="parity", backend=args.backend,
-                     B=4, N=4, rep=rep, tag=tag,
+                     B=4, N=4, rep=rep, tag=tag, hessian_mode="numerical",
                      params=dict(model=os.path.basename(args.model)),
                      wall_s=wall, grad_equiv_total=0, forward_calls=0,
                      extra=dict(self_test=st))
     print(f"[{tag}] gate self-test verdict = {st['verdict']} "
-          f"(clean_pass={st['clean_pass']}, injected_fail={st['injected_1e-3A_fail']}, "
-          f"ss_clean={st['same_saddle_clean']}, ss_inj={st['same_saddle_injected_3e-2A']})",
-          flush=True)
+          f"(clean_pass={st['clean_pass']}, injected_fired={st['injected_1e-3A_fired']}"
+          f"->{st['injected_tier']}, ss_clean={st['same_saddle_clean']}, "
+          f"ss_inj={st['same_saddle_injected_3e-2A']}, "
+          f"tiers={st['tier_classifier']['verdict']})", flush=True)
+    return dump(rec, args.outdir, tag)
+
+
+# --------------------------------------------------------------------- counter
+def run_counter(args, rep):
+    """FIX-2 EMISSION self-test: does GradCounter see EVERY forward path?
+
+    Runs known-answer cases per backend in the registry. A backend whose count
+    does not match an analytic form is reported FAIL and its s/grad-equiv numbers
+    must not be published.
+    """
+    data = load_ts1x(args.pkl, 16)
+    base = [d["TS"] for d in data]
+    mols_fn = lambda B: [base[i % len(base)].copy() for i in range(B)]
+    backends = [b.strip() for b in args.counter_backends.split(",") if b.strip()]
+    results = {}
+    for name in backends:
+        model = args.model
+        if name == "mace_traced":
+            model = os.environ.get("TOY_MACE", "")
+        elif name == "mace_autograd":
+            model = os.environ.get("MACEOFF_RAW", "")
+        if not model or not os.path.exists(model):
+            results[name] = dict(name="counter_self_test", backend=name,
+                                 verdict="SKIP",
+                                 note=f"no model file for backend '{name}' "
+                                      f"(path='{model}')")
+            print(f"[counter] {name}: SKIP (no model)", flush=True)
+            continue
+        modes = (("numerical", "autograd") if name == "uma" else ("numerical",))
+        build = (lambda m=model, n=name: (lambda **kw: build_backend(n, m, **kw)))()
+        r = counter_self_test(build, mols_fn, name, hessian_modes=modes)
+        results[name] = r
+        print(f"[counter] {name}: {r['verdict']}", flush=True)
+        for c in r["cases"]:
+            print(f"    {c['name']:<24} {c['status']:<6} "
+                  f"measured={c.get('measured')} expected={c.get('expected') or c.get('analytic_forms')}",
+                  flush=True)
+    verdicts = [v["verdict"] for v in results.values()]
+    overall = ("FAIL" if "FAIL" in verdicts
+               else ("SKIP" if all(v == "SKIP" for v in verdicts) else "OK"))
+    tag = f"{args.tag}_counter_r{rep}"
+    rec = run_record(bench="counter_self_test", dispatcher="counter",
+                     backend=",".join(backends), B=0, N=0, rep=rep, tag=tag,
+                     hessian_mode="mixed(by design)",
+                     params=dict(backends=backends),
+                     wall_s=0.0, grad_equiv_total=0, forward_calls=0,
+                     extra=dict(overall=overall, per_backend=results))
+    print(f"[{tag}] counter self-test overall = {overall}", flush=True)
     return dump(rec, args.outdir, tag)
 
 
@@ -427,7 +486,8 @@ def run_parity(args, rep):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dispatcher", required=True,
-                   choices=["pipeline", "forward", "hessian", "autoneb", "parity"])
+                   choices=["pipeline", "forward", "hessian", "autoneb", "parity",
+                            "counter"])
     p.add_argument("--backend", default="uma")
     p.add_argument("--model", default=os.environ.get("MODEL"))
     p.add_argument("--pkl", default=os.environ.get("PKL"))
@@ -455,6 +515,9 @@ def main():
     p.add_argument("--B-single", type=int, default=8, help="autoneb batched chunk width")
     p.add_argument("--aneb-nimages", type=int, default=7)
     p.add_argument("--aneb-maxiter", type=int, default=100)
+    # counter self-test knobs
+    p.add_argument("--counter-backends", default="uma,mace_traced,mace_autograd",
+                   help="registry backends to pin the GradCounter against")
     args = p.parse_args()
     args.dyneb = bool(args.dyneb)
     os.makedirs(args.outdir, exist_ok=True)
@@ -475,6 +538,8 @@ def main():
             run_autoneb(args, rep)
         elif args.dispatcher == "parity":
             run_parity(args, rep)
+        elif args.dispatcher == "counter":
+            run_counter(args, rep)
     print("RUN_MATRIX_OK", flush=True)
 
 

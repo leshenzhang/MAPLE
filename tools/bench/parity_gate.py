@@ -6,10 +6,28 @@ Contract (OPT_CAMPAIGN iron rules 2/3/6):
     constant. threshold = max(3 * canon_floor, abs_min).
   * same-saddle: energy invariant + TS-RMSD + n_imag. Speed without same-saddle
     is not a result.
-  * Every check returns PASS / FAIL / SKIP. Not-applicable (quantity missing,
-    backend lacks Hessian, empty input) is SKIP -- never PASS.
+  * Not-applicable (quantity missing, backend lacks Hessian, empty input) is SKIP
+    -- never PASS.
   * self_test() proves the gate can both pass a clean pair AND catch an injected
     degradation. A gate that fires 100% or 0% of the time is broken.
+
+FIX-3 -- TWO-TIER verdicts instead of a single FAIL
+---------------------------------------------------
+An optimization that changes summation order (cuEq kernels, torch.compile,
+constant-tensor pre-allocation, a different chunking of the same reduction) moves
+E/F/H by a fp32/kernel-order amount that can exceed 3x the canon floor while being
+the SAME science. A flat FAIL would report those as bugs (A3's whole workstream).
+
+  PASS                  <= threshold (3x canon floor, or the abs floor)
+  NUMERICALLY_DIFFERENT  > threshold but <= ESCALATE_FACTOR x threshold
+                         -> NOT a verdict on its own: the run MUST be escalated
+                            to the same-saddle gate + success% / TS-RMSD. It is a
+                            request for more evidence, not an accusation.
+  REGRESSION            > ESCALATE_FACTOR x threshold, OR in the escalation band
+                         with the same-saddle / science evidence also failing.
+
+`classify()` is the single place that maps (value, threshold) -> tier, and
+`resolve()` folds in the escalation evidence.
 """
 import numpy as np
 
@@ -17,6 +35,7 @@ from .core import kabsch_rmsd
 
 ABS_MIN = dict(dE=1e-10, dF=1e-9, dH=1e-7)          # Ha / Ha A^-1 / Ha A^-2
 SS_DEFAULT = dict(dE_Ha=1e-6, rmsd_A=5e-3)          # same-saddle absolute floors
+ESCALATE_FACTOR = 10.0                              # PASS < 1x <= NUM_DIFF <= 10x < REGRESSION
 
 
 def _npy(t):
@@ -49,14 +68,31 @@ def canon_floor(build_fn, mols, with_hessian=True):
     return fl, a
 
 
+def classify(value, threshold, escalate_factor=ESCALATE_FACTOR):
+    """(value, threshold) -> PASS | NUMERICALLY_DIFFERENT | REGRESSION | SKIP."""
+    if value is None or threshold is None:
+        return "SKIP"
+    if value <= threshold:
+        return "PASS"
+    if value <= escalate_factor * threshold:
+        return "NUMERICALLY_DIFFERENT"
+    return "REGRESSION"
+
+
 def _check(name, value, floor, abs_min):
     if value is None:
         return dict(name=name, status="SKIP", value=None, threshold=None,
                     note="quantity not available for this backend/run")
     thr = max(3.0 * (floor if floor is not None else 0.0), abs_min)
-    return dict(name=name, status=("PASS" if value <= thr else "FAIL"),
-                value=float(value), threshold=float(thr),
-                canon_floor=(None if floor is None else float(floor)))
+    st = classify(value, thr)
+    out = dict(name=name, status=st, value=float(value), threshold=float(thr),
+               ratio_to_threshold=float(value / thr) if thr else None,
+               canon_floor=(None if floor is None else float(floor)))
+    if st == "NUMERICALLY_DIFFERENT":
+        out["note"] = ("within %gx of threshold -- kernel/summation-order class; "
+                       "MUST escalate to the same-saddle + science gate before any "
+                       "verdict" % ESCALATE_FACTOR)
+    return out
 
 
 def gate_efh(ref, cand, floors):
@@ -106,21 +142,106 @@ def gate_same_saddle(ref_pos, cand_pos, ref_E, cand_E, ref_nimag, cand_nimag,
 
 
 def overall(checks):
+    """Worst tier across checks (SKIP only if nothing was applicable)."""
     st = [c["status"] for c in checks]
-    if "FAIL" in st:
-        return "FAIL"
+    for tier in ("REGRESSION", "NUMERICALLY_DIFFERENT"):
+        if tier in st:
+            return tier
+    if "FAIL" in st:            # legacy label, treated as REGRESSION
+        return "REGRESSION"
     if all(s == "SKIP" for s in st):
         return "SKIP"
     return "PASS"
 
 
-def self_test(build_fn, mols, rng_seed=0):
-    """Negative control: clean canon pair must PASS; injected degradation must FAIL.
+def resolve(efh_checks, same_saddle=None, science=None, science_gate=None):
+    """Fold escalation evidence into a final verdict (FIX-3).
 
-    Injection 1 (efh gate): 1e-3 A gaussian position noise -> dE/dF/dH must fire.
+    efh_checks   list from gate_efh
+    same_saddle  dict from gate_same_saddle (or None -> that evidence is SKIP)
+    science      dict with observed success_rate / median_TS_RMSD_A (or None)
+    science_gate dict with the reference values + tolerances, e.g.
+                 {"success_rate_min": 0.85, "median_TS_RMSD_A_max": 0.08}
+
+    Rules
+    -----
+    * PASS stays PASS.
+    * REGRESSION (>10x threshold) stays REGRESSION regardless of evidence.
+    * NUMERICALLY_DIFFERENT is resolved by the escalation evidence:
+        same-saddle PASS and science within gate  -> ACCEPTED_NUMERICALLY_DIFFERENT
+        same-saddle FAIL or science outside gate  -> REGRESSION
+        no evidence available                     -> UNRESOLVED (never PASS)
+    """
+    base = overall(efh_checks)
+    ev = dict(same_saddle=(same_saddle or {}).get("status", "SKIP"),
+              science_checked=False, science_ok=None)
+    if science and science_gate:
+        ok = True
+        if "success_rate_min" in science_gate and science.get("success_rate") is not None:
+            ok = ok and science["success_rate"] >= science_gate["success_rate_min"]
+        if ("median_TS_RMSD_A_max" in science_gate
+                and science.get("median_TS_RMSD_A") is not None):
+            ok = ok and science["median_TS_RMSD_A"] <= science_gate["median_TS_RMSD_A_max"]
+        ev["science_checked"] = True
+        ev["science_ok"] = bool(ok)
+
+    if base in ("PASS", "SKIP", "REGRESSION"):
+        return dict(verdict=base, tier_from_residuals=base, evidence=ev)
+
+    # base == NUMERICALLY_DIFFERENT -> must be resolved by evidence
+    if ev["same_saddle"] == "SKIP" and not ev["science_checked"]:
+        v = "UNRESOLVED"
+    elif ev["same_saddle"] in ("FAIL", "REGRESSION") or ev["science_ok"] is False:
+        v = "REGRESSION"
+    elif ev["same_saddle"] == "PASS" or ev["science_ok"] is True:
+        v = "ACCEPTED_NUMERICALLY_DIFFERENT"
+    else:
+        v = "UNRESOLVED"
+    return dict(verdict=v, tier_from_residuals=base, evidence=ev)
+
+
+def _tier_self_test():
+    """Synthetic known-answer check of the two-tier classifier (FIX-3).
+
+    Deterministic and backend-free: the escalation band is a property of
+    classify(), so it is pinned directly instead of hoping a random injection
+    lands in a 1x-10x window.
+    """
+    thr = 1e-6
+    cases = [
+        (0.5e-6, "PASS"), (1.0e-6, "PASS"),
+        (3.0e-6, "NUMERICALLY_DIFFERENT"), (1.0e-5, "NUMERICALLY_DIFFERENT"),
+        (1.1e-5, "REGRESSION"), (1.0e-3, "REGRESSION"),
+        (None, "SKIP"),
+    ]
+    rows = [dict(value=v, expected=e, got=classify(v, thr)) for v, e in cases]
+    ok = all(r["got"] == r["expected"] for r in rows)
+    # resolve(): a NUMERICALLY_DIFFERENT residual must NOT become PASS by itself
+    nd = [dict(name="forces", status="NUMERICALLY_DIFFERENT", value=3e-6, threshold=thr)]
+    res_no_ev = resolve(nd)["verdict"]
+    res_ss_ok = resolve(nd, same_saddle=dict(status="PASS"))["verdict"]
+    res_ss_bad = resolve(nd, same_saddle=dict(status="FAIL"))["verdict"]
+    res_sci_bad = resolve(nd, same_saddle=dict(status="PASS"),
+                          science=dict(success_rate=0.40),
+                          science_gate=dict(success_rate_min=0.85))["verdict"]
+    ok = (ok and res_no_ev == "UNRESOLVED"
+          and res_ss_ok == "ACCEPTED_NUMERICALLY_DIFFERENT"
+          and res_ss_bad == "REGRESSION" and res_sci_bad == "REGRESSION")
+    return dict(name="tier_classifier_self_test", verdict=("OK" if ok else "BROKEN"),
+                threshold=thr, classify_cases=rows,
+                resolve_no_evidence=res_no_ev, resolve_same_saddle_pass=res_ss_ok,
+                resolve_same_saddle_fail=res_ss_bad,
+                resolve_science_fail=res_sci_bad)
+
+
+def self_test(build_fn, mols, rng_seed=0):
+    """Negative control: clean canon pair must PASS; injected degradation must fire.
+
+    Injection 1 (efh gate): 1e-3 A gaussian position noise -> dE/dF/dH must leave PASS.
     Injection 2 (same-saddle): 3e-2 A noise -> TS-RMSD leg must fire.
+    Plus the synthetic two-tier classifier check (_tier_self_test).
     verdict OK only if the gate neither fires on clean (100%-trigger = broken)
-    nor stays silent on injected (0%-trigger = broken).
+    nor stays silent on injected (0%-trigger = broken), and the tiers behave.
     """
     rng = np.random.default_rng(rng_seed)
     floors, ref = canon_floor(build_fn, mols)
@@ -133,7 +254,7 @@ def self_test(build_fn, mols, rng_seed=0):
         m.positions = m.positions + rng.normal(0, 1e-3, m.positions.shape)
     inj = compute_efh(build_fn(), noisy)
     inj_checks = gate_efh(ref, inj, floors)
-    inj_caught = overall(inj_checks) == "FAIL"
+    inj_caught = overall(inj_checks) in ("NUMERICALLY_DIFFERENT", "REGRESSION", "FAIL")
 
     big = [m.copy() for m in mols]
     for m in big:
@@ -142,14 +263,19 @@ def self_test(build_fn, mols, rng_seed=0):
                                 clean["E"], clean["E"], None, None, floors.get("dE"))
     ss_inj = gate_same_saddle([m.positions for m in mols], [m.positions for m in big],
                               None, None, None, None, floors.get("dE"))
-    ss_ok = ss_clean["status"] == "PASS" and ss_inj["status"] == "FAIL"
+    ss_ok = ss_clean["status"] == "PASS" and ss_inj["status"] in ("FAIL", "REGRESSION")
 
-    verdict = "OK" if (clean_ok and inj_caught and ss_ok) else "BROKEN"
+    tier = _tier_self_test()
+    verdict = ("OK" if (clean_ok and inj_caught and ss_ok
+                        and tier["verdict"] == "OK") else "BROKEN")
     return {"name": "gate_self_test", "verdict": verdict,
             "canon_floors": floors,
             "clean_pass": clean_ok, "clean_checks": clean_checks,
-            "injected_1e-3A_fail": inj_caught, "injected_checks": inj_checks,
+            "injected_1e-3A_fired": inj_caught, "injected_checks": inj_checks,
+            "injected_tier": overall(inj_checks),
             "same_saddle_clean": ss_clean["status"],
             "same_saddle_injected_3e-2A": ss_inj["status"],
-            "note": ("gate catches 1e-3 A degradation and passes clean canon pair"
+            "tier_classifier": tier,
+            "note": ("gate catches 1e-3 A degradation, passes clean canon pair, and "
+                     "the PASS / NUMERICALLY_DIFFERENT / REGRESSION tiers behave"
                      if verdict == "OK" else "GATE BROKEN - see checks")}
