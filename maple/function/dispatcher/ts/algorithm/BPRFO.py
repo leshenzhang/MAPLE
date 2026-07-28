@@ -165,6 +165,9 @@ class BatchPRFO:
                  initial_hessian: str = "identity",   # [5] 'identity'(default)|'lindh'
                  hessian_recalc_adapt: bool = False,  # [6] recalc when ||g|| < ||g0||/n
                  recalc_adapt_n: float = 10.0,        # [6] the 'n'
+                 hessian_recalc_quality: bool = False,  # [10] recalc on measured staleness
+                 recalc_quality_tol: float = 0.5,     # [10] median ||y-Hs||/||y|| trigger
+                 recalc_quality_max: int = 64,        # [10] hard cadence cap for [10]
                  conv_check_interval: int = 1):       # [7] check convergence + verbose-log every K iters
         self.trust_init = trust_init
         self.trust_min = trust_min
@@ -242,6 +245,21 @@ class BatchPRFO:
             raise ValueError("initial_hessian must be 'identity' or 'lindh'.")
         self.hessian_recalc_adapt = bool(hessian_recalc_adapt)
         self.recalc_adapt_n = float(recalc_adapt_n)
+        # [10] Quality-driven recalc (A2-phess 2026-07-28). A FIXED RecalcFC cadence
+        # spends 6n+1 force evaluations per structure whether or not the quasi-Newton
+        # Hessian has actually gone stale. The secant residual
+        #     q = ||y - H s|| / ||y||,   y = g_new - g_prev,  s = accepted step
+        # is the amount of curvature the working Hessian FAILED to predict over the
+        # step just taken; it is built from quantities the update already computes, so
+        # evaluating it costs ZERO force evaluations. Fire an exact recalc when the
+        # batch median q exceeds recalc_quality_tol (with recalc_quality_max as a hard
+        # cadence ceiling so a pathological batch still re-seeds). Default OFF.
+        self.hessian_recalc_quality = bool(hessian_recalc_quality)
+        self.recalc_quality_tol = float(recalc_quality_tol)
+        self.recalc_quality_max = max(1, int(recalc_quality_max))
+        self._last_qres = None          # (B,) secant residual of the last accepted step
+        self._qres_hist = []            # diagnostics: batch-median q per iteration
+        self._iters_since_recalc = 0
         self.conv_check_interval = max(1, int(conv_check_interval))
         if (self.initial_hessian == "lindh" or self.ts_hessian_inject) \
                 and lindh_initial_hessian is None:
@@ -457,6 +475,9 @@ class BatchPRFO:
         self._ge_iter = 0
         self._ge_hess = 0
         self._ge_hvp = 0
+        self._last_qres = None
+        self._qres_hist = []
+        self._iters_since_recalc = 0
 
         self._init_xyz_paths(B0)
         self._symbols_per_batch = _symbols_flat(atoms_list)
@@ -560,12 +581,30 @@ class BatchPRFO:
                         self._w(f"[Iter {outer_it}] adaptive recalc: <|g|>={cur:.3e} < "
                                 f"g0/n^{self._adapt_level} ({thr:.3e})\n")
 
-                if self.hessian_recalc_adapt:
+                # [10] quality-driven recalc: fire when the working Hessian failed to
+                # predict the curvature of the last accepted step (median secant
+                # residual over the batch), with a hard cadence ceiling.
+                qual_fire = False
+                if self.hessian_recalc_quality and self._last_qres is not None:
+                    qmed = float(self._last_qres.median().item())
+                    self._qres_hist.append(qmed)
+                    qual_fire = ((qmed > self.recalc_quality_tol)
+                                 or (self._iters_since_recalc >= self.recalc_quality_max))
+                    if qual_fire:
+                        self._w(f"[Iter {outer_it}] quality recalc: median ||y-Hs||/||y||"
+                                f"={qmed:.3f} (tol={self.recalc_quality_tol}, "
+                                f"iters_since={self._iters_since_recalc})\n")
+
+                if self.hessian_recalc_quality:
+                    need_recalc = ((outer_it == 1) or forced or qual_fire)
+                elif self.hessian_recalc_adapt:
                     need_recalc = ((outer_it == 1) or forced or adapt_fire)
                 else:
                     need_recalc = ((outer_it == 1)
                                    or ((outer_it - 1) % self.recalc == 0)
                                    or forced)
+                self._iters_since_recalc = (0 if need_recalc
+                                            else self._iters_since_recalc + 1)
 
             if E_old_is_set:
                 pass  # iterative path already produced E_old / H_cart / g_cart above
@@ -680,6 +719,24 @@ class BatchPRFO:
 
             # Thread the committed E forward for FIX #1 (FORWARD-A of the next iter).
             self._reuse_E = E_fin
+
+            # [10] Secant residual q = ||y - H s|| / ||y|| of the step just taken,
+            # measured BEFORE the update is applied (that is the staleness the step
+            # actually exposed). Zero force evaluations. Structures that did not move
+            # keep their previous q (a rejected step reveals nothing new).
+            # Gated by the flag so that with hessian_recalc_quality=False NOT ONE extra
+            # op runs -> the legacy configs stay byte- and timing-identical.
+            if self.hessian_recalc_quality and self._H_work is not None \
+                    and self._g_cart_prev is not None:
+                _s = last_step * self._real_mask_f
+                _y = (g_new_cart - self._g_cart_prev) * self._real_mask_f
+                _Hs = torch.einsum("bij,bj->bi", self._H_work, _s)
+                _q = (_y - _Hs).norm(dim=-1) / _y.norm(dim=-1).clamp(min=1e-12)
+                _moved = (_s.norm(dim=-1) > 1e-10) & step_accepted
+                if self._last_qres is None or self._last_qres.shape != _q.shape:
+                    self._last_qres = torch.where(_moved, _q, torch.zeros_like(_q))
+                else:
+                    self._last_qres = torch.where(_moved, _q, self._last_qres)
 
             # Bofill update: apply ONLY if we didn't just recalculate AND at least one step was accepted
             if not need_recalc and step_accepted.any():
@@ -816,6 +873,9 @@ class BatchPRFO:
                     self._H_work = self._H_work[survive_local]
                 if self._g_cart_prev is not None:
                     self._g_cart_prev = self._g_cart_prev[survive_local]
+                # [10] keep the secant-residual buffer in lockstep with the batch
+                if self._last_qres is not None:
+                    self._last_qres = self._last_qres[survive_local]
                 # FIX #1: keep the threaded committed-E aligned with the shrunk batch
                 # (survivors' geometry is unchanged, so the sliced value stays valid
                 # for the next FORWARD-A). A refill below sets _force_recalc_next=True,
@@ -976,6 +1036,9 @@ class BatchPRFO:
         self._w(f"# grad_equiv: ge_iter={self._ge_iter} ge_hess={self._ge_hess} "
                 f"ge_hvp={self._ge_hvp} "
                 f"ge_total={self._ge_iter + self._ge_hess + self._ge_hvp}\n")
+        if self._qres_hist:
+            _qh = ",".join(f"{q:.3f}" for q in self._qres_hist)
+            self._w(f"# secant_residual_median_per_iter: {_qh}\n")
         if self._audit_reuse:
             self._w(f"# forward_reuse_audit: max|dE|={self._audit_max_dE:.3e} Ha "
                     f"max|dg|={self._audit_max_dF:.3e} Ha/A\n")

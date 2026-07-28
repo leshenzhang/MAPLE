@@ -141,6 +141,8 @@ def main():
     ap.add_argument("--lobpcg-max", type=int, default=6)
     ap.add_argument("--precond", default="model", choices=["model", "none"])
     ap.add_argument("--adapt", action="store_true")
+    ap.add_argument("--quality", action="store_true")
+    ap.add_argument("--quality-tol", type=float, default=0.5)
     ap.add_argument("--initial-hessian", default="identity")
     ap.add_argument("--ts-inject", action="store_true")
     ap.add_argument("--replicate", type=int, default=1)
@@ -173,7 +175,9 @@ def main():
               hessian_update=args.hessian_update, hessian_mode=args.hessian_mode,
               initial_hessian=args.initial_hessian,
               ts_hessian_inject=args.ts_inject,
-              hessian_recalc_adapt=args.adapt)
+              hessian_recalc_adapt=args.adapt,
+              hessian_recalc_quality=args.quality,
+              recalc_quality_tol=args.quality_tol)
     if args.hessian_mode == "iterative":
         kw.update(iter_lanczos_m=args.lanczos_m, iter_warm_start=args.warm_start,
                   iter_solver=args.iter_solver, iter_lobpcg_max=args.lobpcg_max,
@@ -218,7 +222,9 @@ def main():
                     warm_start=args.warm_start, lanczos_m=args.lanczos_m,
                     iter_solver=args.iter_solver, lobpcg_max=args.lobpcg_max,
                     precond=args.precond,
-                    adapt=args.adapt, initial_hessian=args.initial_hessian,
+                    adapt=args.adapt, quality=args.quality,
+                    quality_tol=args.quality_tol,
+                    initial_hessian=args.initial_hessian,
                     ts_inject=args.ts_inject),
         env=dict(device=dev, torch=torch.__version__,
                  gpu=(torch.cuda.get_device_name(0) if dev == "cuda" else "cpu")),

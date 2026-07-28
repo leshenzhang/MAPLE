@@ -257,10 +257,16 @@ def probe_update(args, cases, out):
             y = gs[k] - gs[k - 1]
             ref_mw = mass_weight(Hs[k], masses)
             for kind in args.updates:
+                # secant residual q = ||y - H s|| / ||y|| measured with the PRE-update
+                # Hessian: the zero-cost staleness signal that drives the
+                # hessian_recalc_quality trigger. Recorded next to the TRUE error so
+                # the gate can be calibrated (and falsified) on real data.
+                q = float(np.linalg.norm(y - H_upd[kind] @ s)
+                          / max(np.linalg.norm(y), 1e-12))
                 H_upd[kind] = _apply_update(kind, H_upd[kind], s, y)
                 m = compare(ref_mw, mass_weight(H_upd[kind], masses))
                 m.update(case=c["idx"], natoms=len(c["Z"]), update=kind, k=k,
-                         step_norm=float(np.linalg.norm(s)))
+                         step_norm=float(np.linalg.norm(s)), secant_resid=q)
                 rows.append(m)
         print(f"[update] case {c['idx']} n={len(c['Z'])} frames={len(frames)}", flush=True)
     out["update"] = rows
@@ -268,8 +274,21 @@ def probe_update(args, cases, out):
 
 
 def _summ_update(rows, kinds):
+    # correlation between the zero-cost staleness signal and the true eigen error
+    for kind in kinds:
+        rs = [r for r in rows if r["update"] == kind]
+        if len(rs) > 3:
+            q = np.array([r["secant_resid"] for r in rs])
+            e = np.array([r["rel_d_lam0"] for r in rs])
+            o = np.array([1.0 - r["mode0_overlap"] for r in rs])
+            with np.errstate(invalid="ignore"):
+                cq = float(np.corrcoef(q, e)[0, 1])
+                co = float(np.corrcoef(q, o)[0, 1])
+            print(f"[calib] {kind}: corr(secant_resid, rel_dlam0)={cq:.3f}  "
+                  f"corr(secant_resid, 1-overlap)={co:.3f}  "
+                  f"q med={np.median(q):.3f} p90={np.percentile(q, 90):.3f}", flush=True)
     print(f"{'update':>8} {'k':>3} {'n':>4} {'med rel_dlam0':>14} {'min ovl':>9} "
-          f"{'nimag_ok':>9} {'med fro_rel':>12}", flush=True)
+          f"{'nimag_ok':>9} {'med fro_rel':>12} {'med q':>8}", flush=True)
     ks = sorted(set(r["k"] for r in rows))
     for kind in kinds:
         for k in ks:
@@ -280,7 +299,8 @@ def _summ_update(rows, kinds):
                   f"{np.median([r['rel_d_lam0'] for r in rs]):>14.3e} "
                   f"{min(r['mode0_overlap'] for r in rs):>9.5f} "
                   f"{sum(r['nimag_ref'] == r['nimag_tst'] for r in rs)}/{len(rs):<7} "
-                  f"{np.median([r['fro_rel'] for r in rs]):>12.3e}", flush=True)
+                  f"{np.median([r['fro_rel'] for r in rs]):>12.3e} "
+                  f"{np.median([r['secant_resid'] for r in rs]):>8.3f}", flush=True)
 
 
 # --------------------------------------------------------------------------- probe: lanczos
