@@ -152,7 +152,11 @@ class BatchPRFO:
                  initial_hessian: str = "identity",   # [5] 'identity'(default)|'lindh'
                  hessian_recalc_adapt: bool = False,  # [6] recalc when ||g|| < ||g0||/n
                  recalc_adapt_n: float = 10.0,        # [6] the 'n'
-                 conv_check_interval: int = 1):       # [7] check convergence + verbose-log every K iters
+                 conv_check_interval: int = 1,        # [7] check convergence + verbose-log every K iters
+                 log_mode: Optional[str] = None,      # [8] 'lean'(default)|'full' legacy log
+                 traj_mode: Optional[str] = None,     # [8] 'endpoints'(default)|'full' legacy xyz
+                 refill_min: int = 1,                 # [9] pool refill hysteresis (1 = legacy)
+                 refill_partial_hessian: bool = True):  # [9] newcomer-only refill recalc
         self.trust_init = trust_init
         self.trust_min = trust_min
         self.trust_max = trust_max
@@ -199,6 +203,24 @@ class BatchPRFO:
         self.hessian_recalc_adapt = bool(hessian_recalc_adapt)
         self.recalc_adapt_n = float(recalc_adapt_n)
         self.conv_check_interval = max(1, int(conv_check_interval))
+        # ---- [8] host-side diagnostics policy (A1-hostopt 2026-07-28). Default
+        # LEAN: skip the per-attempt iteration-head line, the per-iter ORCA cycle
+        # table, and the per-accept xyz trajectory dump -- each costs D2H copies +
+        # python string/file work every iteration and serializes the GPU stream.
+        # 'full' (or env MAPLE_BPRFO_LOG/MAPLE_BPRFO_TRAJ=full) restores the
+        # byte-identical legacy diagnostics = the oracle. The OPTIMIZATION MATH is
+        # identical in both modes; 'endpoints' still writes init + final frame per
+        # structure, so the converged TS geometry is always on disk.
+        lm = (log_mode if log_mode is not None
+              else os.environ.get("MAPLE_BPRFO_LOG", "lean")).lower()
+        if lm not in {"lean", "full"}:
+            raise ValueError("log_mode must be 'lean' or 'full'.")
+        self._log_full = (lm == "full")
+        tm = (traj_mode if traj_mode is not None
+              else os.environ.get("MAPLE_BPRFO_TRAJ", "endpoints")).lower()
+        if tm not in {"endpoints", "full"}:
+            raise ValueError("traj_mode must be 'endpoints' or 'full'.")
+        self._traj_full = (tm == "full")
         if (self.initial_hessian == "lindh" or self.ts_hessian_inject) \
                 and lindh_initial_hessian is None:
             raise ImportError(
@@ -237,6 +259,7 @@ class BatchPRFO:
         # (real_mask float view + its symmetric outer product) instead of every iter.
         self._real_mask_f = None
         self._mask_ij = None
+        self._has_pad = None
         self._D = None
         # Per-structure convergence thresholds, built ONCE per topology in
         # _rebuild_topology (they only change when the batch shrinks/refills)
@@ -254,6 +277,10 @@ class BatchPRFO:
 
         # --- vectorized-mu diagnostics ---
         self._mu_unbracketed = 0          # # of (structure,call) left un-bracketed after 60 iters
+        # [8] on-GPU accumulators for the per-iter diagnostics counters, so lean
+        # mode never syncs for them (folded back into the ints at end of run()).
+        self._mu_unbr_t = None
+        self._neg_guard_t = None
 
         # --- outer/inner robustness (per-structure straggler control) ---
         # Counters live as (B,) tensors allocated in run(); these are the policy knobs.
@@ -278,6 +305,16 @@ class BatchPRFO:
         self._B_target = None              # live target (set in run())
         self._next_orig = 0                # next free ORIGINAL index for refilled guesses
         self._pool_refilled = 0            # diagnostics: total guesses pulled from queue
+        # [9] pool-refill cost control (A1-hostopt): refill_min batches refills
+        # (avoid a prepare()+topology rebuild+forced recalc for every single leaver)
+        # and refill_partial_hessian restricts the refill-forced exact-Hessian
+        # recalc to the k NEWCOMERS (survivors keep their Bofill-updated working
+        # Hessian, exactly as they would WITHOUT pooling). refill_min=1 +
+        # refill_partial_hessian=False = the legacy pool behavior.
+        self.refill_min = max(1, int(refill_min))
+        self.refill_partial_hessian = bool(refill_partial_hessian)
+        self._refill_new_count = 0         # newcomers appended by the LAST refill
+        self._recalc_full_pending = False  # a straggler restart demands a FULL recalc
 
         # ---- VRAM-adaptive pool B_target (OPT-IN; default OFF). When auto_batch is
         # on (or a pool is given with B_target=None), the refill target is sized each
@@ -393,6 +430,9 @@ class BatchPRFO:
         self._lanczos_steps = 0
         self._lanczos_unconverged = 0
         self._neg_guard_hits = 0
+        # [8] on-GPU diagnostics accumulators (no per-iter host sync in lean mode)
+        self._mu_unbr_t = torch.zeros((), dtype=torch.long, device=device)
+        self._neg_guard_t = torch.zeros((), dtype=torch.long, device=device)
 
         # reset forward-reuse state + diagnostics for this run
         self._reuse_E = None
@@ -503,20 +543,48 @@ class BatchPRFO:
                                 f"g0/n^{self._adapt_level} ({thr:.3e})\n")
 
                 if self.hessian_recalc_adapt:
-                    need_recalc = ((outer_it == 1) or forced or adapt_fire)
+                    cadence_due = ((outer_it == 1) or adapt_fire)
                 else:
-                    need_recalc = ((outer_it == 1)
-                                   or ((outer_it - 1) % self.recalc == 0)
-                                   or forced)
+                    cadence_due = ((outer_it == 1)
+                                   or ((outer_it - 1) % self.recalc == 0))
+                need_recalc = cadence_due or forced
 
             if E_old_is_set:
                 pass  # iterative path already produced E_old / H_cart / g_cart above
             elif need_recalc:
                 self._recalc_count = self._recalc_count + 1
-                # Pull EFH (true or numerical) from calculator; pad to nmax.
-                # A real forward (the Hessian base point) -- reuse is NOT applicable.
+                # [9] PARTIAL (newcomer-only) refill recalc: when the ONLY reason for
+                # this recalc is a streaming-pool refill (not the cadence, not iter 1,
+                # not a straggler restart), the survivors' Bofill-updated working
+                # Hessian is still the H they would have carried WITHOUT pooling --
+                # recomputing the full-batch FD Hessian for them both wastes ~B/k
+                # of the FD forwards AND perturbs their trajectory vs the unpooled
+                # run. Restrict the FD columns to the k newcomers (movable_masks:
+                # [] = survivor contributes no columns, full = newcomer) and merge:
+                # newcomer rows <- exact FD, survivor rows <- working Hessian. The
+                # base E/F forward still covers the WHOLE batch, so the gradient is
+                # exact for everyone. OPT-OUT: refill_partial_hessian=False restores
+                # the legacy full-batch refill recalc.
+                _kpart = 0
+                if (self.refill_partial_hessian and forced
+                        and self._refill_new_count > 0
+                        and not self._recalc_full_pending
+                        and not cadence_due
+                        and self._H_work is not None
+                        and self._H_work.shape[0] == len(atoms_list)
+                        and self._refill_new_count < len(atoms_list)):
+                    _kpart = int(self._refill_new_count)
+                self._refill_new_count = 0
+                self._recalc_full_pending = False
+
                 self._fwd_calls += 1
-                E_old, F_tmp, H_tmp, _ = calc.get_efh_gpu()
+                if _kpart > 0:
+                    _nsurv = len(atoms_list) - _kpart
+                    _mv = ([[] for _ in range(_nsurv)]
+                           + [list(range(len(a))) for a in atoms_list[_nsurv:]])
+                    E_old, F_tmp, H_tmp, _ = calc.get_efh_gpu(movable_masks=_mv)
+                else:
+                    E_old, F_tmp, H_tmp, _ = calc.get_efh_gpu()
                 E_old = E_old.to(dtype=DTYPE)
                 F_tmp = F_tmp.to(dtype=DTYPE)
                 H_tmp = 0.5 * (H_tmp + H_tmp.transpose(-1, -2)).to(dtype=DTYPE)
@@ -536,6 +604,14 @@ class BatchPRFO:
                 # Build Cartesian H and g
                 H_cart, g_cart = self._build_cartesian_hg(F_use, H_use, real_mask)
 
+                # [9] merge on a partial refill recalc: survivors keep their working
+                # (Bofill-updated) Hessian; newcomers take the exact FD block.
+                if _kpart > 0:
+                    _newrow = torch.zeros(len(atoms_list), dtype=torch.bool,
+                                          device=H_cart.device)
+                    _newrow[len(atoms_list) - _kpart:] = True
+                    H_cart = torch.where(_newrow.view(-1, 1, 1), H_cart, self._H_work)
+
                 # Store exact Hessian and gradient
                 self._H_work = H_cart.clone()
                 self._g_cart_prev = g_cart.clone()
@@ -543,7 +619,8 @@ class BatchPRFO:
                 if self._g0_norm_mean is None:
                     self._g0_norm_mean = float(g_cart.norm(dim=-1).mean().item())
 
-                self._w(f"[Iter {outer_it}] Recalculated exact Hessian\n")
+                self._w(f"[Iter {outer_it}] Recalculated exact Hessian"
+                        + (f" (partial: {_kpart} refill newcomer(s))\n" if _kpart else "\n"))
 
             else:
                 # Non-recalc step: use working Hessian; get current EF.
@@ -613,12 +690,17 @@ class BatchPRFO:
             # Thread the committed E forward for FIX #1 (FORWARD-A of the next iter).
             self._reuse_E = E_fin
 
-            # Bofill update: apply ONLY if we didn't just recalculate AND at least one step was accepted
-            if not need_recalc and step_accepted.any():
-                self._w(
-                    f"[Iter {outer_it}] Applying {self.hessian_update.upper()} "
-                    f"update to {step_accepted.sum().item()} batches\n"
-                )
+            # Bofill update: apply ONLY if we didn't just recalculate AND at least one
+            # step was accepted. [8] The batched update functions no-op rows outside
+            # their update mask (maskless where-guarded math), so the host-side
+            # `step_accepted.any()` gate is only needed to skip the call entirely; in
+            # lean mode call unconditionally (identical H, one device sync less).
+            if not need_recalc and (self._log_full is False or step_accepted.any()):
+                if self._log_full:
+                    self._w(
+                        f"[Iter {outer_it}] Applying {self.hessian_update.upper()} "
+                        f"update to {step_accepted.sum().item()} batches\n"
+                    )
                 update_fn = (
                     self._bfgs_update_batched
                     if self.hessian_update == "bfgs"
@@ -668,7 +750,15 @@ class BatchPRFO:
             restartable = stuck & (self._restart_count < self._max_restarts)
             evict = stuck & (self._restart_count >= self._max_restarts)
 
-            if bool(restartable.any()):
+            # [8] ONE stacked D2H sync for all outer-loop branch decisions (legacy:
+            # restartable.any() + evict.any() + the nonzero/cpu of the shrink path
+            # each synced separately, 3-5 syncs per iteration).
+            _ctrl = torch.stack([restartable.any(), evict.any(),
+                                 (done | evict).any()]).tolist()
+            has_restart, has_evict, has_leaving = (bool(_ctrl[0]), bool(_ctrl[1]),
+                                                   bool(_ctrl[2]))
+
+            if has_restart:
                 # Bounded inner restart: kick trust back up + force a fresh exact Hessian
                 # so the structure escapes the pinned/oscillating basin (does NOT touch others).
                 trust_r = torch.where(restartable,
@@ -677,48 +767,81 @@ class BatchPRFO:
                 self._pin_streak = torch.where(restartable, zero_l, self._pin_streak)
                 self._restart_count = self._restart_count + restartable.to(self._restart_count.dtype)
                 self._force_recalc_next = True
+                # [9] a restarted straggler needs a FULL fresh Hessian -> the next
+                # recalc must not be downgraded to a newcomer-only partial one.
+                self._recalc_full_pending = True
                 self._w(f"[Iter {outer_it}] Restart {int(restartable.sum().item())} straggler(s): "
                         f"trust->{self.trust_init}, force fresh Hessian\n")
 
             # Evicted stragglers leave the batch flagged (NOT silently wrong).
             final_done = done | evict
-            if bool(evict.any()):
+            if has_evict:
                 self._w(f"[Iter {outer_it}] Evicting {int(evict.sum().item())} unrecoverable "
                         f"straggler(s) after {self._max_restarts} restarts\n")
 
-            # Record per-original-index exit status before slicing.
-            leaving = final_done.nonzero(as_tuple=False).flatten().cpu().tolist()
-            done_cpu = done.detach().cpu()
-            for i_local in leaving:
-                oi = int(self._orig_index[i_local].item())
-                self._final_status[oi] = "converged" if bool(done_cpu[i_local]) else "evicted_straggler"
+            # Record per-original-index exit status before slicing. [8] Only touch
+            # the host when something actually leaves (has_leaving from the single
+            # ctrl sync above); one batched D2H for done+orig_index instead of a
+            # nonzero + per-row .item() chain every iteration.
+            if has_leaving:
+                _fd_np = torch.stack([final_done, done]).cpu().numpy()
+                _oi_np = self._orig_index.cpu().numpy()
+                leaving = np.nonzero(_fd_np[0])[0].tolist()
+                for i_local in leaving:
+                    self._final_status[int(_oi_np[i_local])] = (
+                        "converged" if bool(_fd_np[1][i_local]) else "evicted_straggler")
+                # [8] endpoints traj mode: the leaving structures' final geometry is
+                # written HERE (their coords are final; survivors keep evolving).
+                if not self._traj_full:
+                    self._dump_xyz_locals(calc, leaving, tag=f"final iter={outer_it}")
+            else:
+                leaving = []
 
-            # Dynamic batch shrinking (on-GPU mask drives the shrink).
-            survive_local = (~final_done).nonzero(as_tuple=False).flatten()
+            # Dynamic batch shrinking (on-GPU mask drives the shrink). [8] The
+            # nonzero() forces a device sync, so build survive_local ONLY when the
+            # single ctrl sync above says something left OR pooling may refill; the
+            # steady-state iteration (nothing converged, no pool) now runs the whole
+            # tail of the outer loop without any extra sync. n_surv is host-derived
+            # (B - len(leaving)) -- identical to survive_local.numel().
+            pooling = (self._pool_queue is not None and self._B_target is not None)
+            n_surv = final_done.numel() - len(leaving)
+            need_survive = has_leaving or pooling or (
+                self._auto_batch and self._pool_queue is not None)
+            if need_survive:
+                survive_local = (~final_done).nonzero(as_tuple=False).flatten()
+                survive_list = survive_local.cpu().tolist()
+            else:
+                survive_local = None
+                survive_list = None
 
             # VRAM-adaptive refill target: recompute B_target from the CURRENT atom-count
             # mix (surviving structures + pending queue) so the refill fills the GPU as
             # the queue's size distribution drifts. Cheap (a mean over python ints). No-op
             # unless auto_batch is on; the fixed-B path keeps self._B_target unchanged.
             if self._auto_batch and self._pool_queue is not None:
-                survivors = [atoms_list[i] for i in survive_local.cpu().tolist()]
+                survivors = [atoms_list[i] for i in survive_list]
                 self._B_target = self._compute_b_target(survivors)
 
             # Streaming pool: after the shrink, the active batch can be refilled from
             # `self._pool_queue` back up to `self._B_target` (keeps the GPU saturated).
             # Pooling disabled (queue/target None) => want_refill is always False =>
             # this whole block reduces EXACTLY to the original shrink-only behavior.
-            pooling = (self._pool_queue is not None and self._B_target is not None)
-            n_room = (self._B_target - int(survive_local.numel())) if pooling else 0
-            want_refill = pooling and (n_room > 0) and (len(self._pool_queue) > 0)
+            n_room = (self._B_target - n_surv) if pooling else 0
+            # [9] refill hysteresis: only refill once room >= refill_min (or the
+            # queue is about to drain), so a single leaver does not trigger a
+            # prepare() + topology rebuild + forced recalc every iteration.
+            # refill_min=1 reduces exactly to the legacy condition.
+            want_refill = (pooling and (n_room > 0) and (len(self._pool_queue) > 0)
+                           and ((n_room >= self.refill_min)
+                                or (len(self._pool_queue) <= n_room)))
 
-            if (survive_local.numel() < final_done.numel()) or want_refill:
+            if has_leaving or want_refill:
                 # Commit current geometries back into the (pre-slice) atoms objects so
                 # survivors keep their optimized coords across the prepare() rebuild.
                 self._sync_atoms_from_calc(calc, atoms_list)
 
                 # ---- Slice survivors (every per-structure state in lockstep) ----
-                atoms_list = [atoms_list[i] for i in survive_local.cpu().tolist()]
+                atoms_list = [atoms_list[i] for i in survive_list]
                 self._orig_index = self._orig_index[survive_local]
 
                 trust_r = trust_r[survive_local]
@@ -860,7 +983,10 @@ class BatchPRFO:
                         # spectrum), and the need_recalc path skips the Bofill
                         # update + resets _g_cart_prev to the true exact gradient
                         # (a g_prev=0 Bofill would corrupt the curvature update).
+                        # [9] record k so the forced recalc can be restricted to
+                        # the k newcomers (refill_partial_hessian).
                         self._force_recalc_next = True
+                        self._refill_new_count = k
 
                 # ---- Rebuild calculator topology ONCE for the new active set ----
                 calc.prepare(atoms_list, fixed_nmax=self._nmax)
@@ -875,6 +1001,22 @@ class BatchPRFO:
 
         else:
             self._w("# Maximum iterations reached.\n")
+
+        # [8] endpoints traj mode: structures still active at loop exit (max_iter)
+        # write their final frame here (converged/evicted ones were dumped when
+        # they left the batch).
+        if (not self._traj_full) and self._orig_index is not None \
+                and self._orig_index.numel() > 0 and len(atoms_list) > 0:
+            self._dump_xyz_locals(calc, list(range(len(atoms_list))), tag="final max_iter")
+
+        # [8] fold the on-GPU diagnostics accumulators back into the legacy ints
+        # (ONE sync at end of run instead of one per iteration/attempt).
+        if self._mu_unbr_t is not None:
+            self._mu_unbracketed += int(self._mu_unbr_t.item())
+            self._mu_unbr_t = None
+        if self._neg_guard_t is not None:
+            self._neg_guard_hits += int(self._neg_guard_t.item())
+            self._neg_guard_t = None
 
         # Any structure still in the batch at loop exit hit the iteration cap.
         if self._orig_index is not None:
@@ -958,6 +1100,9 @@ class BatchPRFO:
         self._real_mask_f = self._real_mask.to(DTYPE)
         self._mask_ij = (self._real_mask.unsqueeze(-1)
                          & self._real_mask.unsqueeze(-2)).to(DTYPE)
+        # [8] host-cached pad flag: _mass_weight_hg's per-iter `pad_mask.any()`
+        # forced a device sync every outer iteration; padding only changes here.
+        self._has_pad = bool((~self._real_mask).any().item())
         mass = _masses_flat(atoms_list, self._nmax, device)
         self._D = 1.0 / torch.sqrt(torch.clamp(mass, min=1e-12))
 
@@ -1029,7 +1174,11 @@ class BatchPRFO:
         H_mw = D.unsqueeze(-1) * H * D.unsqueeze(-2)
 
         pad_mask = ~real_mask
-        if pad_mask.any():
+        # [8] _has_pad is the host-cached constant-per-topology value of
+        # pad_mask.any() (a per-iter device sync otherwise; fallback for callers
+        # that bypass _rebuild_topology keeps the legacy check).
+        _hp = getattr(self, "_has_pad", None)
+        if _hp if _hp is not None else pad_mask.any():
             # H_mw = D[...,None] * H * D[...,None,:] is a freshly allocated tensor
             # (element-wise products never alias an input/buffer), so the in-place
             # diagonal pad-penalty add below cannot corrupt anything reused later ->
@@ -1127,8 +1276,13 @@ class BatchPRFO:
 
     def _flag_neg_guard(self, it, neg_num):
         """[3] Count + log structures with NO negative Hessian eigenvalue (not yet in a
-        saddle region). Opt-in (mode_follow_guard); the .item() sync is gated by that flag."""
+        saddle region). Opt-in (mode_follow_guard). [8] lean mode accumulates the
+        count on-GPU (zero per-iter sync); full mode keeps the legacy .item()+log."""
         no_neg = (neg_num == 0)
+        if not self._log_full:
+            if self._neg_guard_t is not None:
+                self._neg_guard_t = self._neg_guard_t + no_neg.sum()
+            return
         c = int(no_neg.sum().item())
         if c > 0:
             self._neg_guard_hits += c
@@ -1362,19 +1516,25 @@ class BatchPRFO:
             if not pend.any():
                 break
 
-            # Build unconstrained steps
-            s_unc_minus = torch.zeros_like(gp)
-            s_unc_plus = torch.zeros_like(gp)
-
-            denom_m0 = -w.masked_select(minus_mask)
+            # Build unconstrained steps. [8] gather/where forms of the legacy
+            # masked_select + boolean index_put (data-dependent-shape ops -> one
+            # device sync EACH, 4 per attempt). minus_mask is one-hot per row and
+            # plus_mask its complement, so a row-gather + elementwise where computes
+            # the same values with zero syncs. -(-x) round-trips bit-exactly in
+            # IEEE (double sign flip), so the arithmetic is bitwise-identical.
+            zero_s = torch.zeros((), dtype=gp.dtype, device=gp.device)
+            tracked = self.tracked_mode_idx.view(B, 1)
+            w_t = w.gather(1, tracked)                       # (B,1) tracked eigenvalue
+            gp_t = gp.gather(1, tracked)                     # (B,1) tracked gradient comp
+            denom_m0 = -w_t
             denom_m0 = torch.where(denom_m0.abs() < 1e-10,
                                    torch.sign(denom_m0) * 1e-10, denom_m0)
-            s_unc_minus[minus_mask] = -(-gp[minus_mask]) / denom_m0
+            s_unc_minus = torch.where(minus_mask,
+                                      (-(-gp_t) / denom_m0).expand(-1, n), zero_s)
 
-            denom_p0 = w.masked_select(plus_mask)
-            denom_p0 = torch.where(denom_p0.abs() < 1e-10,
-                                   torch.sign(denom_p0) * 1e-10, denom_p0)
-            s_unc_plus[plus_mask] = -(gp[plus_mask]) / denom_p0
+            denom_p0 = torch.where(w.abs() < 1e-10,
+                                   torch.sign(w) * 1e-10, w)
+            s_unc_plus = torch.where(plus_mask, -gp / denom_p0, zero_s)
 
             norm2_minus = (s_unc_minus ** 2).sum(-1)
             norm2_plus  = (s_unc_plus ** 2).sum(-1)
@@ -1411,8 +1571,9 @@ class BatchPRFO:
             s_cart = self._D * s_mw
 
             # === OPTIMIZATION #5: Only compute for pending ===
-            s_try = torch.zeros_like(s_cart)
-            s_try[pend] = s_cart[pend]
+            # [8] where-form of the boolean index_put (sync-free, identical values)
+            s_try = torch.where(pend.unsqueeze(1), s_cart,
+                                torch.zeros((), dtype=s_cart.dtype, device=s_cart.device))
 
             # Trial evaluation. FIX #2: KEEP the trial forces (the legacy code dropped
             # them via `_`); for an accepted structure base+s_cart IS the committed
@@ -1431,9 +1592,12 @@ class BatchPRFO:
             model_change = (g_cart * s_try).sum(-1) + 0.5 * (s_try * Hs).sum(-1)
             actual_change = (E_new - E_old)
 
-            rho = torch.full_like(model_change, float("nan"))
+            # [8] where-form of the boolean-masked rho fill (sync-free): live lanes
+            # compute the identical quotient; dead lanes keep the NaN fill.
             ok = (model_change.abs() > 1e-16) & pend
-            rho[ok] = actual_change[ok] / model_change[ok]
+            safe_mc = torch.where(ok, model_change, torch.ones_like(model_change))
+            rho = torch.where(ok, actual_change / safe_mc,
+                              torch.full_like(model_change, float("nan")))
             last_rho = torch.where(pend, rho, last_rho)
 
             on_boundary = (norm_mw - trust_r).abs() <= (
@@ -1450,17 +1614,23 @@ class BatchPRFO:
             acc = pend & (~bad | force_accept)
             rej = pend & (~acc)
 
-            if acc.any():
-                s_commit = torch.zeros_like(s_cart)
-                s_commit[acc] = s_cart[acc]
-                calc.step_cart_(s_commit)
-                last_step[acc] = s_commit[acc]
-                step_accepted |= acc
-                # FIX #2: the accepted rows now sit at base+s_cart == the geometry the
-                # trial forward (above) evaluated -> record its E and g there so run()
-                # reuses them instead of FORWARD-B (g = -F*mask, the run() convention).
-                E_committed[acc] = E_new[acc]
-                g_committed[acc] = (-F_trial * self._real_mask_f)[acc]
+            # [8] sync-free commit: the legacy `if acc.any(): ...[acc] = ...` block
+            # cost one bool sync + 4 boolean index_puts (a nonzero/sync each) per
+            # attempt. where-forms write identical values; step_cart_ with all-zero
+            # rows adds 0.0 in place (bit-identical coords). Only the OPT-IN full
+            # trajectory dump still needs the host-side acc check.
+            acc1 = acc.unsqueeze(1)
+            s_commit = torch.where(acc1, s_cart,
+                                   torch.zeros((), dtype=s_cart.dtype, device=s_cart.device))
+            calc.step_cart_(s_commit)
+            last_step = torch.where(acc1, s_commit, last_step)
+            step_accepted = step_accepted | acc
+            # FIX #2: the accepted rows now sit at base+s_cart == the geometry the
+            # trial forward (above) evaluated -> record its E and g there so run()
+            # reuses them instead of FORWARD-B (g = -F*mask, the run() convention).
+            E_committed = torch.where(acc, E_new, E_committed)
+            g_committed = torch.where(acc1, -F_trial * self._real_mask_f, g_committed)
+            if self._traj_full and bool(acc.any()):
                 self._dump_xyz_subset(calc, acc, it)
 
             # ---- trust-radius update ----
@@ -1483,17 +1653,19 @@ class BatchPRFO:
                 trust_r = torch.where(
                     rej, torch.clamp(0.5 * trust_r, min=self.trust_min), trust_r)
 
-            if log:
+            if log and self._log_full:
                 self._w(self._fmt_iter_head(it, acc, rej, rho, trust_r, E_new))
             accepted |= acc
 
         # Update acceptance rate (exponential moving average). [7] gated by `log`; with the
         # default conv_check_interval=1 this fires every iter == legacy behavior.
+        # [8] the EMA feeds the adaptive-max-attempts policy, so it updates in BOTH
+        # log modes (one small .item() per outer iter); only the string is gated.
         if log:
             acceptance_this_iter = accepted.float().mean().item()
             self._recent_acceptance_rate = (
                 0.85 * self._recent_acceptance_rate + 0.15 * acceptance_this_iter)
-            if attempts_used < max_attempts:
+            if self._log_full and attempts_used < max_attempts:
                 self._w(f"  [Efficiency] Used {attempts_used}/{max_attempts} attempts\n")
 
         return trust_r, last_step, last_rho, step_accepted, E_committed, g_committed
@@ -1538,17 +1710,20 @@ class BatchPRFO:
             & (rms_dp <= dp_rms_th)
         )
 
-        self._w(self._fmt_orca_cycle_table(
-            it=it,
-            E=E_final.to(dtype=DTYPE),
-            rho=last_rho,
-            R=trust_r,
-            max_f=max_f, rms_f=rms_f,
-            max_dp=max_dp, rms_dp=rms_dp,
-            f_max_th=f_max_th, f_rms_th=f_rms_th,
-            dp_max_th=dp_max_th, dp_rms_th=dp_rms_th,
-            done=done
-        ))
+        # [8] the per-cycle ORCA table costs ~9 D2H copies + a python row loop per
+        # iteration; lean mode skips it (the convergence LOGIC above is identical).
+        if self._log_full:
+            self._w(self._fmt_orca_cycle_table(
+                it=it,
+                E=E_final.to(dtype=DTYPE),
+                rho=last_rho,
+                R=trust_r,
+                max_f=max_f, rms_f=rms_f,
+                max_dp=max_dp, rms_dp=rms_dp,
+                f_max_th=f_max_th, f_rms_th=f_rms_th,
+                dp_max_th=dp_max_th, dp_rms_th=dp_rms_th,
+                done=done
+            ))
 
         return done
 
@@ -1618,18 +1793,25 @@ class BatchPRFO:
             lo = hi - 1.0
             active = only & (~is_unc)
 
-            # bracket expansion (lockstep, <=60), push lo down until F(lo) <= R2
-            for _ in range(60):
+            # bracket expansion (lockstep, <=60), push lo down until F(lo) <= R2.
+            # [8] host early-exit check only every 4th pass (legacy: every pass =
+            # one device sync each). Extra passes after all rows are bracketed are
+            # exact no-ops (lo moves only where need is True), so the resulting
+            # bracket -- and everything downstream -- is bit-identical.
+            for _j in range(60):
                 Flo = Fvec(lo)
                 need = active & (Flo > R2)
-                if not bool(need.any()):
+                if (_j % 4 == 0) and not bool(need.any()):
                     break
                 step = torch.clamp(lo.abs() * 0.5, min=1.0)
                 lo = torch.where(need, lo - step, lo)
 
-            # flag un-bracketed-after-60 (clamp, don't crash)
+            # flag un-bracketed-after-60 (clamp, don't crash). [8] accumulate on-GPU
+            # (folded into self._mu_unbracketed at end of run()); no per-call sync.
             unbr = active & (Fvec(lo) > R2)
-            if bool(unbr.any()):
+            if self._mu_unbr_t is not None:
+                self._mu_unbr_t = self._mu_unbr_t + unbr.sum()
+            elif bool(unbr.any()):
                 self._mu_unbracketed += int(unbr.sum().item())
 
             # 60-iter lockstep bisection (F increasing in mu on mu < wt_min)
@@ -1811,60 +1993,55 @@ class BatchPRFO:
         upd_mask = (dq2 > step_tol**2) & (dg2 > grad_tol**2)
         if step_accepted is not None:
             upd_mask = upd_mask & step_accepted
-        
-        if not bool(upd_mask.any()):
-            return H
 
-        # Work on a copy; slice only the batches we will update
-        H_new = H.clone()
-        idx = upd_mask.nonzero(as_tuple=False).flatten()
+        # [8] MASKLESS batched form (A1-hostopt): the legacy body did
+        # `bool(upd_mask.any())` + `.nonzero()` + boolean row slicing -- 2-4 device
+        # syncs per outer iteration. The math below is the SAME per-row Bofill
+        # formula computed for ALL rows with sync-free where-guards: dead rows use
+        # a safe denominator (their result is discarded by the final where), live
+        # rows see bit-identical numerators/denominators. Row-wise reductions and
+        # einsums are independent per row, so full-batch vs sliced evaluation is
+        # the same computation.
+        upd3 = upd_mask.view(-1, 1, 1)
+        one = torch.ones((), dtype=DTYPE, device=H.device)
 
-        # Slice helpers
-        dq_m = dq[idx]                 # (M, n)
-        dg_m = dg[idx]                 # (M, n)
-        HH   = H_new[idx]              # (M, n, n)
+        # Z residual: Z = dg - H * dq (full batch)
+        Hdq = torch.einsum("bij,bj->bi", H, dq)
+        Z = dg - Hdq
 
-        # Z residual: Z = dg - H * dq
-        Hdq  = torch.einsum("mij,mj->mi", HH, dq_m)
-        Z    = dg_m - Hdq
+        dq2_s = dq2                                # (B,) dq.dq (already computed)
+        zz_s = (Z * Z).sum(-1)
+        qz_s = (dq * Z).sum(-1)
 
-        # Scalars
-        dq2_m = (dq_m * dq_m).sum(-1)
-        zz_m  = (Z * Z).sum(-1)
-        qz_m  = (dq_m * Z).sum(-1)
-
-        # ---- Build PSB increment ----
-        Z_dqT = torch.einsum("mi,mj->mij", Z,    dq_m) * mask_ij[idx]
-        dq_ZT = Z_dqT.transpose(-1, -2)                 # == einsum("mi,mj->mij", dq_m, Z)*mask_ij (mask_ij symmetric)
-        dq_dqT= torch.einsum("mi,mj->mij", dq_m, dq_m) * mask_ij[idx]
-        dH_PSB = (Z_dqT + dq_ZT) / dq2_m.view(-1,1,1) - (qz_m / (dq2_m * dq2_m)).view(-1,1,1) * dq_dqT
+        # ---- PSB increment (safe denominators; dead lanes discarded) ----
+        dq2_safe = torch.where(dq2_s > 0, dq2_s, one)
+        Z_dqT = torch.einsum("bi,bj->bij", Z, dq) * mask_ij
+        dq_ZT = Z_dqT.transpose(-1, -2)
+        dq_dqT = torch.einsum("bi,bj->bij", dq, dq) * mask_ij
+        dH_PSB = ((Z_dqT + dq_ZT) / dq2_safe.view(-1, 1, 1)
+                  - (qz_s / (dq2_safe * dq2_safe)).view(-1, 1, 1) * dq_dqT)
 
         # ---- SR1/MS term ----
-        use_sr1 = (qz_m.abs() > sr1_tol) & (zz_m > sr1_tol**2)
-        dH_SR1_full = torch.zeros_like(dH_PSB)
-        if bool(use_sr1.any()):
-            Z_ZT = torch.einsum("mi,mj->mij", Z[use_sr1], Z[use_sr1]) * mask_ij[idx][use_sr1]
-            dH_SR1 = Z_ZT / qz_m[use_sr1].view(-1,1,1)
-            dH_SR1_full[use_sr1] = dH_SR1
+        use_sr1 = (qz_s.abs() > sr1_tol) & (zz_s > sr1_tol**2)
+        qz_safe = torch.where(use_sr1, qz_s, one)
+        Z_ZT = torch.einsum("bi,bj->bij", Z, Z) * mask_ij
+        dH_SR1_full = torch.where(use_sr1.view(-1, 1, 1),
+                                  Z_ZT / qz_safe.view(-1, 1, 1),
+                                  torch.zeros((), dtype=DTYPE, device=H.device))
 
         # ---- Bofill mixing weight ----
-        phi = torch.ones_like(qz_m)
-        good_phi = (dq2_m > sr1_tol**2) & (zz_m > sr1_tol**2)
-        if bool(good_phi.any()):
-            ratio = (qz_m[good_phi] * qz_m[good_phi]) / (dq2_m[good_phi] * zz_m[good_phi])
-            phi_val = (1.0 - ratio).clamp(0.0, 1.0)
-            phi[good_phi] = phi_val
+        good_phi = (dq2_s > sr1_tol**2) & (zz_s > sr1_tol**2)
+        denom_phi = torch.where(good_phi, dq2_s * zz_s, one)
+        ratio = (qz_s * qz_s) / denom_phi
+        phi = torch.where(good_phi, (1.0 - ratio).clamp(0.0, 1.0),
+                          torch.ones_like(qz_s))
         phi = torch.where(use_sr1, phi, torch.ones_like(phi))
 
-        # ---- Combine increments ----
-        inc = (1.0 - phi).view(-1,1,1) * dH_SR1_full + phi.view(-1,1,1) * dH_PSB
-
-        # Apply and symmetrize
-        HH = HH + inc
+        # ---- Combine, apply, symmetrize; keep H verbatim on non-updated rows ----
+        inc = (1.0 - phi).view(-1, 1, 1) * dH_SR1_full + phi.view(-1, 1, 1) * dH_PSB
+        HH = H + inc
         HH = 0.5 * (HH + HH.transpose(-1, -2))
-        H_new[idx] = HH
-
-        return H_new
+        return torch.where(upd3, HH, H)
 
 
     # ===================================================
@@ -1881,7 +2058,10 @@ class BatchPRFO:
 
     def _w(self, s):
         self.log_fp.write(s)
-        self.log_fp.flush()
+        # [8] lean mode: buffered writes (flushed on _close_log); full mode keeps
+        # the legacy per-line flush (tail -f-able progress log).
+        if self._log_full:
+            self.log_fp.flush()
 
     def _init_xyz_paths(self, B_all):
         self.xyz_paths = [
