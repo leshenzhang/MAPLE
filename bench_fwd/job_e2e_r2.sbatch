@@ -8,6 +8,8 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd/out/fwd_e2e2_%j.out
 set -u
+set -o pipefail
+FAIL=0
 export PATH=/home/wangc0i/miniconda3/envs/cxtorch/bin:$PATH
 export PYTHONNOUSERSITE=1
 ROOT=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd
@@ -26,11 +28,19 @@ TICKER=$!
 trap "kill $TICKER 2>/dev/null" EXIT
 echo "===== R3-7 std-MACE byte-equality gate (model-free) ====="
 OUT=$ROOT/out/gate_r37.json $PY $ROOT/MAPLE/bench_fwd/gate_r37_stdmace.py
-echo "rc_r37=$?"
+rc=$?
+echo "rc_r37=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo "===== e2e arm fi (fast_inference=1) replicate 2 ====="
 FAST_INFERENCE=1 TAG=e2e_fi_r2 $PY $ROOT/MAPLE/bench_fwd/pipeline_e2e.py
-echo "rc_fi2=$?"
+rc=$?
+echo "rc_fi2=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo "===== e2e arm base (fast_inference=0) replicate 2 ====="
 FAST_INFERENCE=0 TAG=e2e_base_r2 $PY $ROOT/MAPLE/bench_fwd/pipeline_e2e.py
-echo "rc_base2=$?"
+rc=$?
+echo "rc_base2=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo FWD_E2E2_DONE
+if [ "$FAIL" -ne 0 ]; then echo "JOB_FAILED rc=$FAIL"; fi
+exit $FAIL

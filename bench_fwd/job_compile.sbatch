@@ -8,6 +8,8 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd/out/fwd_comp_%j.out
 set -u
+set -o pipefail
+FAIL=0
 export PATH=/home/wangc0i/miniconda3/envs/cxtorch/bin:$PATH
 export PYTHONNOUSERSITE=1
 ROOT=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd
@@ -24,5 +26,9 @@ TICKER=$!
 trap "kill $TICKER 2>/dev/null" EXIT
 echo "===== A3-fwd MACE-POL torch.compile / cudagraph arms ====="
 OUT=$ROOT/out/macepol_compile.json $PY $ROOT/MAPLE/bench_fwd/macepol_compile.py
-echo "rc_comp=$?"
+rc=$?
+echo "rc_comp=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo FWD_COMPILE_DONE
+if [ "$FAIL" -ne 0 ]; then echo "JOB_FAILED rc=$FAIL"; fi
+exit $FAIL

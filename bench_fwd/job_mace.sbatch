@@ -8,6 +8,8 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd/out/fwd_mace_%j.out
 set -u
+set -o pipefail
+FAIL=0
 export PATH=/home/wangc0i/miniconda3/envs/cxtorch/bin:$PATH
 export PYTHONNOUSERSITE=1
 ROOT=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd
@@ -23,8 +25,14 @@ TICKER=$!
 trap "kill $TICKER 2>/dev/null" EXIT
 echo "===== R3-7 std-MACE gate (byte-equality + REAL-forward tier2) ====="
 OUT=$ROOT/out/gate_r37.json $PY $ROOT/MAPLE/bench_fwd/gate_r37_stdmace.py
-echo "rc_r37=$?"
+rc=$?
+echo "rc_r37=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo "===== MACE micro: dtype/TF32 policy (candidate 6) ====="
 OUT=$ROOT/out/maceoff_micro.json $PY $ROOT/MAPLE/bench_fwd/maceoff_micro.py
-echo "rc_maceoff=$?"
+rc=$?
+echo "rc_maceoff=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo FWD_MACE_DONE
+if [ "$FAIL" -ne 0 ]; then echo "JOB_FAILED rc=$FAIL"; fi
+exit $FAIL

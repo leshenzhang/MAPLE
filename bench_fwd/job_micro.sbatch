@@ -8,6 +8,8 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd/out/fwd_micro_%j.out
 set -u
+set -o pipefail
+FAIL=0
 export PATH=/home/wangc0i/miniconda3/envs/cxtorch/bin:$PATH
 export PYTHONNOUSERSITE=1
 ROOT=/ibex/user/xiaox/zls/ai-gpu/opt2026/fwd
@@ -24,8 +26,14 @@ TICKER=$!
 trap "kill $TICKER 2>/dev/null" EXIT
 echo "===== A3-fwd UMA micro ====="
 OUT=$ROOT/out/fwd_micro_uma.json $PY $ROOT/MAPLE/bench_fwd/fwd_micro.py
-echo "rc_uma=$?"
+rc=$?
+echo "rc_uma=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo "===== A3-fwd MACEPOL micro ====="
 OUT=$ROOT/out/macepol_micro.json $PY $ROOT/MAPLE/bench_fwd/macepol_micro.py
-echo "rc_macepol=$?"
+rc=$?
+echo "rc_macepol=$rc"
+if [ "$rc" -ne 0 ]; then FAIL=$rc; fi
 echo FWD_MICRO_JOB_DONE
+if [ "$FAIL" -ne 0 ]; then echo "JOB_FAILED rc=$FAIL"; fi
+exit $FAIL
