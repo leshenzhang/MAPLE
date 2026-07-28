@@ -69,12 +69,20 @@ def canon_floor(build_fn, mols, with_hessian=True):
 
 
 def classify(value, threshold, escalate_factor=ESCALATE_FACTOR):
-    """(value, threshold) -> PASS | NUMERICALLY_DIFFERENT | REGRESSION | SKIP."""
+    """(value, threshold) -> PASS | NUMERICALLY_DIFFERENT | REGRESSION | SKIP.
+
+    NOTE the `_REL` slack on both band edges. Without it the boundary itself is
+    decided by floating-point round-off: `10.0 * 1e-6 == 9.999999999999999e-06`,
+    so a residual of exactly 10x the threshold was classified REGRESSION instead
+    of NUMERICALLY_DIFFERENT. _tier_self_test() caught this; the slack makes the
+    documented band edges inclusive as written.
+    """
+    _REL = 1e-9
     if value is None or threshold is None:
         return "SKIP"
-    if value <= threshold:
+    if value <= threshold * (1.0 + _REL):
         return "PASS"
-    if value <= escalate_factor * threshold:
+    if value <= escalate_factor * threshold * (1.0 + _REL):
         return "NUMERICALLY_DIFFERENT"
     return "REGRESSION"
 
