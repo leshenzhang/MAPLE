@@ -1489,7 +1489,10 @@ class BatchPRFO:
             self._lanczos_steps += 1
             if bool((rn < self.iter_gamma * lam.abs().clamp(min=1e-8)).all()):
                 break
-            w = (r @ T.transpose(-1, -2)) if T is not None else r
+            # BUG (caught by --probe synth): `r @ T.transpose(-1,-2)` with r (B,n) and
+            # T (B,n,n) does NOT batch-apply the preconditioner -- torch treats the 2-D
+            # operand as a single matrix and broadcasts it to (B,B,n). einsum is explicit.
+            w = torch.einsum("bij,bj->bi", T, r) if T is not None else r
             w = w * rm
             # orthogonalize w (and p) against x for a well-conditioned small problem
             w = w - (w * x).sum(-1, keepdim=True) * x
