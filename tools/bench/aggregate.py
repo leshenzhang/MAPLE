@@ -40,6 +40,39 @@ def spread_pct(vals):
     return float(100.0 * (v.max() - v.min()) / v.mean())
 
 
+def split_spread(vals, nodes):
+    """Separate run-to-run noise from node-to-node variation.
+
+    A spread computed over replicates that landed on DIFFERENT nodes is the SUM of
+    both effects. Reporting it as "the baseline noise" lets a candidate arm that
+    happens to win a fast node read as a real speedup -- fatal for this campaign,
+    where several conclusions live below 10% (B7 retrofit 3.2%, B6 allocator ~3%,
+    MACE-POL edge_mode 1-2%, torch.compile 'no gain').
+
+    Returns dict with
+      within_node : max spread among replicates SHARING a node (None if no node
+                    has >=2 replicates) -- the honest run-to-run noise
+      cross_node  : spread over all replicates (run-to-run + node-to-node)
+      node_groups : per-node values
+      dominant    : 'node' when cross_node >= 2x within_node
+    """
+    pairs = [(n, v) for n, v in zip(nodes, vals) if v is not None]
+    if len(pairs) < 2:
+        return dict(within_node=None, cross_node=None, node_groups={},
+                    n_nodes=len({n for n, _ in pairs}), dominant=None)
+    by = {}
+    for n, v in pairs:
+        by.setdefault(n or "unknown", []).append(float(v))
+    within = [spread_pct(v) for v in by.values() if len(v) >= 2]
+    within = max([w for w in within if w is not None], default=None)
+    cross = spread_pct([v for _, v in pairs])
+    dom = None
+    if within is not None and cross is not None:
+        dom = "node" if cross >= 2.0 * max(within, 1e-9) else "run"
+    return dict(within_node=within, cross_node=cross, node_groups=by,
+                n_nodes=len(by), dominant=dom)
+
+
 def gkey(r):
     mode = r.get("params", {}).get("mode") or r.get("params", {}).get("arm") or ""
     # FIX-1: hessian_mode is part of the identity of a group. grad-equivalents
@@ -80,16 +113,28 @@ def summarize(runs):
                    hessian_mode=k[5],
                    n_reps=len(g), reps=[r["rep"] for r in g],
                    nodes=[r["env"].get("node") for r in g],
+                   n_distinct_nodes=len({r["env"].get("node") for r in g}),
+                   same_node_comparison=(len({r["env"].get("node") for r in g}) == 1),
                    files=[r["_file"] for r in g])
         for m in METRICS:
-            vals = [r.get(m) for r in g if r.get(m) is not None]
+            pairs = [(r.get("env", {}).get("node"), r.get(m)) for r in g]
+            vals = [v for _, v in pairs if v is not None]
             row[m + "_mean"] = float(np.mean(vals)) if vals else None
             row[m + "_per_rep"] = vals
-            row[m + "_spread_pct"] = spread_pct(vals)
-        # a broken instrument must never look like a missing cell
-        row["counter_status"] = sorted({r.get("counter_status", "UNVERIFIED") for r in g})
-        row["grad_equiv_status"] = sorted({r.get("grad_equiv_status", "UNKNOWN") for r in g})
-        if any(st != "OK" for st in row["grad_equiv_status"]):
+            row[m + "_spread_pct"] = spread_pct(vals)          # == cross-node
+            sp = split_spread([v for _, v in pairs], [n for n, _ in pairs])
+            row[m + "_within_node_spread_pct"] = sp["within_node"]
+            row[m + "_cross_node_spread_pct"] = sp["cross_node"]
+            row[m + "_spread_dominant"] = sp["dominant"]
+            row[m + "_by_node"] = sp["node_groups"]
+        # a broken instrument must never look like a missing cell -- but a record
+        # written BEFORE inline certification existed is neither: it is LEGACY, and
+        # its s/grad-equiv is kept and flagged rather than destroyed (the counter
+        # for that revision is certified by its companion `counter` run instead).
+        row["counter_status"] = sorted({r.get("counter_status", "LEGACY(no inline certification)")
+                                        for r in g})
+        row["grad_equiv_status"] = sorted({r.get("grad_equiv_status", "LEGACY") for r in g})
+        if any(st not in ("OK", "LEGACY") for st in row["grad_equiv_status"]):
             row["s_per_grad_equiv_mean"] = None
             row["s_per_grad_equiv_spread_pct"] = None
             row["grad_equiv_total_mean"] = None
@@ -176,8 +221,10 @@ def compare(rows, baseline):
         # s_per_grad_equiv does NOT (different denominator definition).
         for m in ("wall_s", "forward_calls", "s_per_grad_equiv"):
             if m == "s_per_grad_equiv" and (
-                    any(st != "OK" for st in r.get("grad_equiv_status", ["UNKNOWN"]))
-                    or any(st != "OK" for st in b.get("grad_equiv_status", ["UNKNOWN"]))):
+                    any(st not in ("OK", "LEGACY")
+                        for st in r.get("grad_equiv_status", ["LEGACY"]))
+                    or any(st not in ("OK", "LEGACY")
+                           for st in b.get("grad_equiv_status", ["LEGACY"]))):
                 rec[m] = dict(verdict="UNAVAILABLE",
                               reason="GradCounter unverified on one side -- broken "
                                      "instrument, not a missing measurement")
@@ -199,9 +246,26 @@ def compare(rows, baseline):
                 rec[m] = dict(verdict="SKIP")
                 continue
             dpct = 100.0 * (cm - bm) / bm
-            v = ("WITHIN_SPREAD" if abs(dpct) <= max(sp, 1e-9)
+            within = b.get(m + "_within_node_spread_pct")
+            cross = b.get(m + "_cross_node_spread_pct") or sp
+            same_node = (r.get("nodes") and b.get("nodes")
+                         and set(r["nodes"]) == set(b["nodes"])
+                         and len(set(r["nodes"])) == 1)
+            band = (within if (same_node and within is not None) else cross)
+            band_kind = ("within_node" if (same_node and within is not None)
+                         else "cross_node")
+            v = ("WITHIN_SPREAD" if abs(dpct) <= max(band or 0.0, 1e-9)
                  else ("FASTER" if dpct < 0 else "SLOWER"))
-            rec[m] = dict(delta_pct=round(dpct, 2), baseline_spread_pct=sp, verdict=v)
+            rec[m] = dict(delta_pct=round(dpct, 2), band_pct=band, band_kind=band_kind,
+                          baseline_within_node_spread_pct=within,
+                          baseline_cross_node_spread_pct=cross,
+                          candidate_nodes=r.get("nodes"), baseline_nodes=b.get("nodes"),
+                          same_node_comparison=bool(same_node), verdict=v,
+                          caveat=(None if band_kind == "within_node" else
+                                  "CROSS-NODE comparison: the band includes "
+                                  "node-to-node variation, so a verdict outside it "
+                                  "may still be a node effect. Prefer same-node "
+                                  "(or same-job, back-to-back) arms."))
         out.append(rec)
     return out
 
@@ -220,7 +284,8 @@ def main():
     for r in rows:
         print(f"  {r['bench']:<15} {r['dispatcher']:<9} {r['backend']:<6} B={r['B']:<4} "
               f"{r['mode']:<10} hess={str(r['hessian_mode']):<10} reps={r['n_reps']} "
-              f"wall={r['wall_s_mean']} (spread {r['wall_s_spread_pct']}%) "
+              f"wall={r['wall_s_mean']} (within-node {r['wall_s_within_node_spread_pct']}% / "
+              f"cross-node {r['wall_s_cross_node_spread_pct']}%, {r['n_distinct_nodes']} node(s)) "
               f"s/gE={r['s_per_grad_equiv_mean'] if r['s_per_grad_equiv_mean'] is not None else r.get('grad_equiv_status')}")
     if b3:
         print(f"  [B3 paired] {json.dumps({k: v for k, v in b3.items() if k != 'note'})}")
@@ -228,8 +293,10 @@ def main():
         cols = ["bench", "dispatcher", "backend", "B", "mode", "hessian_mode", "n_reps",
                 "wall_s_mean", "wall_s_spread_pct", "s_per_grad_equiv_mean",
                 "s_per_grad_equiv_spread_pct", "grad_equiv_total_mean",
-                "forward_calls_mean", "counter_status", "grad_equiv_status",
-                "sampler_source",
+                "forward_calls_mean", "wall_s_within_node_spread_pct",
+                "wall_s_cross_node_spread_pct", "wall_s_spread_dominant",
+                "nodes", "n_distinct_nodes", "same_node_comparison",
+                "counter_status", "grad_equiv_status", "sampler_source",
                 "gpu_util_mean_mean", "gpu_util_peak_mean", "vram_reserved_MB_mean",
                 "sci_success_rate_mean", "sci_barrier_MAE_eV_mean",
                 "sci_median_TS_RMSD_A_mean", "sci_pct_1imag_mean"]
