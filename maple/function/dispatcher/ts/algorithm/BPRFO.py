@@ -152,6 +152,7 @@ class BatchPRFO:
                  hvp_source: str = "fd",              # [1] 'fd'(default)|'auto'|'autograd' HVP backend
                  iter_warm_start: bool = False,       # [8] seed Lanczos with the tracked mode
                  iter_solver: str = "lanczos",        # [9] 'lanczos'(default)|'lobpcg'
+                 iter_reorth: bool = False,           # [11] keep V orthonormal about the true mode
                  iter_lobpcg_max: int = 8,            # [9] max LOBPCG iterations (=HVPs)
                  iter_precond: str = "model",         # [9] 'model'(|H_work|^-1)|'none'
                  iter_precond_floor: float = 1e-2,    # [9] eigenvalue floor of the preconditioner
@@ -227,6 +228,9 @@ class BatchPRFO:
         if self.iter_solver not in {"lanczos", "lobpcg"}:
             raise ValueError("iter_solver must be 'lanczos' or 'lobpcg'.")
         self.iter_lobpcg_max = max(1, int(iter_lobpcg_max))
+        # [11] Keep the RS-P-RFO eigenbasis ORTHONORMAL after substituting the true
+        # leftmost mode (see _reorth_basis_about). Default OFF = legacy substitution.
+        self.iter_reorth = bool(iter_reorth)
         self.iter_precond = str(iter_precond).lower()
         if self.iter_precond not in {"model", "none"}:
             raise ValueError("iter_precond must be 'model' or 'none'.")
@@ -1211,11 +1215,26 @@ class BatchPRFO:
                 lam_lo, vec_lo = self._leftmost_eigpairs_mw(
                     calc, g_mw, g_cart, real_mask, self.iter_n_leftmost)
             n_lo = int(lam_lo.shape[1])
-            V = V.clone()
-            w = w.clone()
-            for p in range(n_lo):
-                V[:, :, p] = vec_lo[:, :, p]
-                w[:, p] = lam_lo[:, p]
+            if self.iter_reorth and n_lo == 1:
+                # [11] BUG FIX. Simply overwriting column 0 of the MODEL eigenbasis
+                # with the true leftmost eigenvector leaves V NON-ORTHOGONAL (the true
+                # mode is not an eigenvector of the model Hessian), yet the RS-P-RFO
+                # step below assumes an orthonormal eigenbasis: it forms gp = V^T g and
+                # transforms back with s_mw = V s_p, which is only inverse-consistent
+                # for orthogonal V. Instead build an ORTHONORMAL basis whose first
+                # column IS the true mode (Householder reflector mapping e_0 -> v,
+                # which acts as the identity on the pad subspace because v is zero
+                # there), rotate the model Hessian into the orthogonal complement and
+                # re-diagonalize that (n-1)x(n-1) block. This is the batched form of
+                # Sella's partial-Hessian diagonalization (10.1021/acs.jctc.9b00869).
+                V, w = self._reorth_basis_about(H_mw, vec_lo[:, :, 0], lam_lo[:, 0],
+                                                real_mask)
+            else:
+                V = V.clone()
+                w = w.clone()
+                for p in range(n_lo):
+                    V[:, :, p] = vec_lo[:, :, p]
+                    w[:, p] = lam_lo[:, p]
 
         gp = (V.transpose(-1, -2) @ g_mw.unsqueeze(-1)).squeeze(-1)
 
@@ -1357,6 +1376,46 @@ class BatchPRFO:
         g_plus = -F_plus.to(dtype=DTYPE) * rm
         Hu = ((g_plus - g0_cart) / eta) * un
         return Hu * rm
+
+    @torch.no_grad()
+    def _reorth_basis_about(self, H_mw, v, lam, real_mask):
+        """[11] Orthonormal basis whose FIRST column is the (exact) leftmost mode ``v``.
+
+        Householder reflector Q = I - 2 u u^T with u ~ (v - e_0) maps e_0 -> +/-v, so
+        Q is orthogonal, Q[:,0] = +/-v, and Q[:,1:] is an orthonormal basis of v's
+        orthogonal complement. The MODEL Hessian is rotated into that complement and
+        re-diagonalized, giving eigen-pairs that are orthogonal to the true reaction
+        mode. Returns (V (B,n,n) orthonormal with V[:,:,0]=v, w (B,n) ascending in the
+        complement with w[:,0]=lam). Pad DOFs are untouched: v is zero there, so u is
+        zero there and Q acts as the identity on the pad subspace.
+        """
+        B, n = v.shape
+        dev, dt = v.device, v.dtype
+        rm = real_mask.to(dt)
+        v = v * rm
+        v = v / torch.clamp(v.norm(dim=-1, keepdim=True), min=1e-30)
+        e0 = torch.zeros_like(v)
+        e0[:, 0] = 1.0
+        # sign choice avoids catastrophic cancellation when v ~ e_0
+        sgn = torch.where(v[:, :1] >= 0, torch.ones_like(v[:, :1]),
+                          -torch.ones_like(v[:, :1]))
+        u = v - sgn * e0
+        un = u.norm(dim=-1, keepdim=True)
+        degenerate = (un <= 1e-12).squeeze(-1)            # v already == +/- e_0
+        u = u / torch.clamp(un, min=1e-30)
+        eye = torch.eye(n, dtype=dt, device=dev).unsqueeze(0).expand(B, n, n)
+        Q = eye - 2.0 * u.unsqueeze(-1) * u.unsqueeze(-2)
+        Q = torch.where(degenerate.view(B, 1, 1), eye, Q)
+        # Q[:,:,0] == sgn*v ; fix the sign so column 0 is exactly v
+        Q = Q * sgn.view(B, 1, 1)      # column 0 becomes exactly +v
+        Qc = Q[:, :, 1:]                                   # (B,n,n-1) complement
+        Hc = Qc.transpose(-1, -2) @ H_mw @ Qc
+        Hc = 0.5 * (Hc + Hc.transpose(-1, -2))
+        wc, U = torch.linalg.eigh(Hc)
+        Vc = Qc @ U
+        V = torch.cat([v.unsqueeze(-1), Vc], dim=-1)
+        w = torch.cat([lam.unsqueeze(-1), wc], dim=-1)
+        return V, w
 
     @torch.no_grad()
     def _precond_op(self, H_mw, real_mask):

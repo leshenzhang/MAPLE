@@ -4,8 +4,8 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
-#SBATCH --time=02:00:00
+#SBATCH --mem=16G
+#SBATCH --time=00:50:00
 #SBATCH --output=/ibex/user/xiaox/zls/ai-gpu/opt2026/phess/logs/cfg_%j.out
 # Env contract: TAG (config name), REP (replicate), ARGS (extra phess_prod flags),
 #               NCASE (default 100), MAXIT (default 120)

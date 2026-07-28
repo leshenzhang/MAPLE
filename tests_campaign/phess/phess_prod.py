@@ -140,6 +140,7 @@ def main():
     ap.add_argument("--iter-solver", default="lanczos", choices=["lanczos", "lobpcg"])
     ap.add_argument("--lobpcg-max", type=int, default=6)
     ap.add_argument("--precond", default="model", choices=["model", "none"])
+    ap.add_argument("--reorth", action="store_true")
     ap.add_argument("--adapt", action="store_true")
     ap.add_argument("--quality", action="store_true")
     ap.add_argument("--quality-tol", type=float, default=0.5)
@@ -181,7 +182,7 @@ def main():
     if args.hessian_mode == "iterative":
         kw.update(iter_lanczos_m=args.lanczos_m, iter_warm_start=args.warm_start,
                   iter_solver=args.iter_solver, iter_lobpcg_max=args.lobpcg_max,
-                  iter_precond=args.precond)
+                  iter_precond=args.precond, iter_reorth=args.reorth)
     bp = BatchPRFO(**kw)
 
     if dev == "cuda":
@@ -221,7 +222,7 @@ def main():
                     hessian_mode=args.hessian_mode, fd_mode=args.fd_mode,
                     warm_start=args.warm_start, lanczos_m=args.lanczos_m,
                     iter_solver=args.iter_solver, lobpcg_max=args.lobpcg_max,
-                    precond=args.precond,
+                    precond=args.precond, reorth=args.reorth,
                     adapt=args.adapt, quality=args.quality,
                     quality_tol=args.quality_tol,
                     initial_hessian=args.initial_hessian,

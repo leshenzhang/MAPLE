@@ -428,6 +428,70 @@ def _summ_lanczos(rows):
                       flush=True)
 
 
+# --------------------------------------------------------------------------- probe: synth
+def probe_synth(args, cases, out):
+    """Solver-only unit check: EXACT matrix-vector products, no calculator.
+
+    Separates 'the eigensolver algebra is wrong' from 'the FD HVP is noisy' and
+    from 'the leftmost eigenvalue is hard for a Krylov space'. The synthetic
+    spectra mimic a mass-weighted molecular Hessian: ONE small negative
+    eigenvalue plus a positive bulk spanning ~3 decades.
+    """
+    from maple.function.dispatcher.ts.algorithm import BatchPRFO
+    dev = "cpu"
+    torch.manual_seed(7)
+    B, n = 8, 30
+    rows = []
+    for spread in args.synth_spreads:
+        lam = torch.zeros(B, n, dtype=torch.float64)
+        lam[:, 0] = -0.05
+        bulk = torch.logspace(np.log10(0.05), np.log10(0.05 * spread), n - 1,
+                              dtype=torch.float64)
+        lam[:, 1:] = bulk.unsqueeze(0)
+        Q = torch.linalg.qr(torch.randn(B, n, n, dtype=torch.float64))[0]
+        A = Q @ torch.diag_embed(lam) @ Q.transpose(-1, -2)
+        A = 0.5 * (A + A.transpose(-1, -2))
+        ev, V = torch.linalg.eigh(A)
+
+        for solver, m in ([("lanczos", m) for m in args.lanczos_m]
+                          + [("lobpcg", m) for m in args.lobpcg_iters]):
+            bp = BatchPRFO(output=os.path.join(args.out_dir, "synth.log"), device=dev,
+                           hessian_mode="iterative", iter_lanczos_m=m,
+                           iter_solver=solver, iter_lobpcg_max=m,
+                           iter_precond=args.precond, iter_gamma=args.lanczos_gamma)
+            bp._nmax = n
+            bp._arange_n = torch.arange(n)
+            bp._D = torch.ones(B, n, dtype=torch.float64)   # already mass-weighted
+            bp._real_mask = torch.ones(B, n, dtype=torch.bool)
+            bp._real_mask_f = bp._real_mask.to(torch.float64)
+            bp._B = B
+            bp._open_log()
+            # exact operator in place of the FD HVP
+            bp._hvp_cart = lambda calc, u, g0, rm, _A=A: torch.einsum("bij,bj->bi", _A, u)
+            rm = bp._real_mask
+            g = torch.zeros(B, n, dtype=torch.float64)
+            if solver == "lobpcg":
+                # preconditioner = a PERTURBED copy of A (what a stale model Hessian is)
+                Ap = A + 0.2 * torch.diag_embed(torch.rand(B, n, dtype=torch.float64))
+                lamx, vec = bp._leftmost_eigpair_lobpcg(None, g, g, rm, H_mw_model=Ap)
+            else:
+                lamx, vec = bp._leftmost_eigpairs_mw(None, g, g, rm, 1)
+            bp._close_log()
+            ovl = (vec[:, :, 0] * V[:, :, 0]).sum(-1).abs()
+            rows.append(dict(
+                solver=solver, m=m, spread=spread,
+                lam_ref=float(ev[0, 0]), lam_med=float(lamx[:, 0].median()),
+                rel_d_lam=float(((lamx[:, 0] - ev[:, 0]).abs()
+                                 / ev[:, 0].abs()).median()),
+                ovl_med=float(ovl.median()), ovl_min=float(ovl.min()),
+                hvps=int(bp._ge_hvp) if bp._ge_hvp else int(bp._lanczos_steps * B),
+            ))
+            print(f"[synth] spread={spread:>6.0f} {solver:>8} m={m:>2} "
+                  f"rel_dlam={rows[-1]['rel_d_lam']:.3e} ovl_med={rows[-1]['ovl_med']:.5f} "
+                  f"ovl_min={rows[-1]['ovl_min']:.5f}", flush=True)
+    out["synth"] = rows
+
+
 # --------------------------------------------------------------------------- probe: core
 def probe_core(args, cases, out):
     """Core-region (movable subset) partial Hessian vs the full Hessian, by radius."""
@@ -523,6 +587,7 @@ def main():
     ap.add_argument("--lanczos-m", nargs="+", type=int, default=[4, 8, 16])
     ap.add_argument("--lobpcg-iters", nargs="+", type=int, default=[2, 4, 8])
     ap.add_argument("--precond", default="model", choices=["model", "none"])
+    ap.add_argument("--synth-spreads", nargs="+", type=float, default=[10, 100, 1000])
     ap.add_argument("--lanczos-gamma", type=float, default=0.4)
     ap.add_argument("--lanczos-eta", type=float, default=1e-3)
     ap.add_argument("--lanczos-step", type=float, default=0.05)
@@ -545,8 +610,8 @@ def main():
                          argv=vars(args)))
     for p in args.probe:
         print(f"\n================= PROBE {p} =================", flush=True)
-        {"fd": probe_fd, "update": probe_update,
-         "lanczos": probe_lanczos, "core": probe_core}[p](args, cases, out)
+        {"fd": probe_fd, "update": probe_update, "lanczos": probe_lanczos,
+         "core": probe_core, "synth": probe_synth}[p](args, cases, out)
 
     path = os.path.join(args.out_dir, f"{args.tag}.json")
     json.dump(out, open(path, "w"), indent=1)
