@@ -2,8 +2,11 @@
 
 Metric conventions copied verbatim from bench_2026-07-14 (B_CLASS_BENCH) so all
 2026-07-28 numbers are directly comparable with the July baselines:
-  * grad-equiv: GradCounter wraps calc._forward and sums the batch dim -- one MLIP
-    forward over B structures == B single-gradient-equivalents (hardware-independent).
+  * grad-equiv: GradCounter wraps EVERY model-evaluation entry point the calculator
+    exposes (_predict_forces and/or _forward, re-entrancy-guarded so nesting counts
+    once) and sums the batch dim -- one MLIP forward over B structures == B
+    single-gradient-equivalents (hardware-independent). Hooking only `_forward`
+    silently missed UMA's whole FD-Hessian segment; see GradCounter's docstring.
   * GPU util/VRAM: nvidia-smi sampler (0.5 s), reported as auxiliary only.
   * VRAM: torch max_memory_reserved (primary), max_memory_allocated + smi as extras.
   * science sanity: success%(1imag & E>0), barrier MAE vs DFT (eV), median TS-RMSD (A).
@@ -21,30 +24,79 @@ HA2EV = 27.211386245988
 SCHEMA = "maple-bench-v1"
 
 
-class GradCounter:
-    """Exact DFT-gradient-equivalents via calc._forward (sums the batch dim)."""
+ENTRY_POINTS = ("_predict_forces", "_forward")
 
-    def __init__(self, calc):
-        self.orig = calc._forward
+
+class GradCounter:
+    """Exact DFT-gradient-equivalents: sums the batch dim of every model evaluation.
+
+    Hooks EVERY entry point in ENTRY_POINTS that the calculator exposes, and uses a
+    re-entrancy guard so a nested call is counted once, at the OUTERMOST hooked
+    frame. Rationale (the emission bug this fixes):
+
+      * `get_ef_gpu` -> `_forward` -> `_predict_forces`  (nested; counted once = B)
+      * UMA's optimized FD Hessian `_get_efh_numerical` builds the +/- displaced
+        replica chunks itself and calls `_predict_forces` DIRECTLY
+        (_uma_batch_calculator.py:895) -- it never passes through `_forward`.
+        Hooking only `_forward` therefore counted the ENTIRE Hessian segment as 0
+        (measured 2 instead of the analytic 122 for B=2, natoms 10+10).
+      * Backends without a `_predict_forces` (the generic base FD at
+        batch_calculator_base.py:516-518) displace through `_forward` and were
+        already counted correctly -- the guard leaves them unchanged.
+
+    Note UMA's own diagnostic `self._fwd_count` (_uma_batch_calculator.py:341, bumped
+    only at :493 inside `_forward`) has the SAME blind spot and also undercounts the
+    Hessian segment.
+    """
+
+    def __init__(self, calc, entry_points=ENTRY_POINTS):
+        self.calc = calc
         self.n = 0
         self.calls = 0
-        calc._forward = self._w
+        self._depth = 0
+        self.hooked = []
+        self._orig = {}
+        for name in entry_points:
+            fn = getattr(calc, name, None)
+            if fn is None or not callable(fn):
+                continue
+            self._orig[name] = fn
+            setattr(calc, name, self._make(name))
+            self.hooked.append(name)
+        if not self.hooked:
+            raise RuntimeError(
+                f"GradCounter: {type(calc).__name__} exposes none of {entry_points} "
+                "-- refusing to report grad-equivalents for an unhooked backend")
+        # kept for the record: which entry points were actually instrumented
+        self.orig = self._orig.get("_forward")
 
-    def _w(self, *a, **k):
-        out = self.orig(*a, **k)
-        E = out[0] if isinstance(out, (tuple, list)) else out
-        self.calls += 1
-        try:
-            self.n += int(E.shape[0])
-        except Exception:
-            self.n += 1
-        return out
+    def _make(self, name):
+        def wrapper(*a, **k):
+            outer = (self._depth == 0)
+            self._depth += 1
+            try:
+                out = self._orig[name](*a, **k)
+            finally:
+                self._depth -= 1
+            if outer:
+                E = out[0] if isinstance(out, (tuple, list)) else out
+                self.calls += 1
+                try:
+                    self.n += int(E.shape[0])
+                except Exception:
+                    self.n += 1
+            return out
+        return wrapper
 
     def take(self):
         n, c = self.n, self.calls
         self.n = 0
         self.calls = 0
         return n, c
+
+    def unhook(self):
+        for name, fn in self._orig.items():
+            setattr(self.calc, name, fn)
 
 
 def device_identity():
@@ -324,12 +376,15 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
              the measured value, which is exactly why mode-mixing is banned.
     """
     cases = []
+    hooked = None
 
     def sp_case(B):
         name = f"sp_B{B}"
         try:
             calc = build_fn()
             ctr = GradCounter(calc)
+            nonlocal hooked
+            hooked = list(ctr.hooked)
             mols = mols_fn(B)
             calc.prepare([m.copy() for m in mols])
             calc.get_ef_gpu()
@@ -404,7 +459,7 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
     st = [c["status"] for c in cases]
     verdict = "FAIL" if "FAIL" in st else ("SKIP" if all(s == "SKIP" for s in st) else "OK")
     return dict(name="counter_self_test", backend=backend_name, verdict=verdict,
-                cases=cases,
+                hooked_entry_points=hooked, cases=cases,
                 note=("counter verified against known answers; s/grad-equiv is "
                       "trustworthy for this backend" if verdict == "OK" else
                       "counter MISCOUNTS -> do NOT report s/grad-equiv for this backend"))
