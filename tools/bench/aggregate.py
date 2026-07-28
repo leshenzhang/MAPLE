@@ -86,6 +86,17 @@ def summarize(runs):
             row[m + "_mean"] = float(np.mean(vals)) if vals else None
             row[m + "_per_rep"] = vals
             row[m + "_spread_pct"] = spread_pct(vals)
+        # a broken instrument must never look like a missing cell
+        row["counter_status"] = sorted({r.get("counter_status", "UNVERIFIED") for r in g})
+        row["grad_equiv_status"] = sorted({r.get("grad_equiv_status", "UNKNOWN") for r in g})
+        if any(st != "OK" for st in row["grad_equiv_status"]):
+            row["s_per_grad_equiv_mean"] = None
+            row["s_per_grad_equiv_spread_pct"] = None
+            row["grad_equiv_total_mean"] = None
+            row["s_per_grad_equiv_note"] = (
+                "UNAVAILABLE -- the GradCounter is not verified for this backend "
+                "(see counter_status). This is a BROKEN INSTRUMENT, not a missing "
+                "measurement: wall_s and forward_calls in this row are still valid.")
         row["sampler_source"] = sorted({(r.get("gpu_sampler_source")
                                          or r.get("extra", {}).get("sampler_source")
                                          or "unknown") for r in g})
@@ -164,6 +175,13 @@ def compare(rows, baseline):
         # FIX-1: wall_s and forward_calls stay valid across Hessian modes;
         # s_per_grad_equiv does NOT (different denominator definition).
         for m in ("wall_s", "forward_calls", "s_per_grad_equiv"):
+            if m == "s_per_grad_equiv" and (
+                    any(st != "OK" for st in r.get("grad_equiv_status", ["UNKNOWN"]))
+                    or any(st != "OK" for st in b.get("grad_equiv_status", ["UNKNOWN"]))):
+                rec[m] = dict(verdict="UNAVAILABLE",
+                              reason="GradCounter unverified on one side -- broken "
+                                     "instrument, not a missing measurement")
+                continue
             if m == "s_per_grad_equiv" and not mode_match:
                 rec[m] = dict(verdict="INCOMPARABLE",
                               reason=("hessian_mode differs (%s vs baseline %s): a "
@@ -203,14 +221,15 @@ def main():
         print(f"  {r['bench']:<15} {r['dispatcher']:<9} {r['backend']:<6} B={r['B']:<4} "
               f"{r['mode']:<10} hess={str(r['hessian_mode']):<10} reps={r['n_reps']} "
               f"wall={r['wall_s_mean']} (spread {r['wall_s_spread_pct']}%) "
-              f"s/gE={r['s_per_grad_equiv_mean']}")
+              f"s/gE={r['s_per_grad_equiv_mean'] if r['s_per_grad_equiv_mean'] is not None else r.get('grad_equiv_status')}")
     if b3:
         print(f"  [B3 paired] {json.dumps({k: v for k, v in b3.items() if k != 'note'})}")
     if a.csv:
         cols = ["bench", "dispatcher", "backend", "B", "mode", "hessian_mode", "n_reps",
                 "wall_s_mean", "wall_s_spread_pct", "s_per_grad_equiv_mean",
                 "s_per_grad_equiv_spread_pct", "grad_equiv_total_mean",
-                "forward_calls_mean", "sampler_source",
+                "forward_calls_mean", "counter_status", "grad_equiv_status",
+                "sampler_source",
                 "gpu_util_mean_mean", "gpu_util_peak_mean", "vram_reserved_MB_mean",
                 "sci_success_rate_mean", "sci_barrier_MAE_eV_mean",
                 "sci_median_TS_RMSD_A_mean", "sci_pct_1imag_mean"]

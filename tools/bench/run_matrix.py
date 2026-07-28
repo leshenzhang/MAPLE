@@ -40,9 +40,23 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bench.core import (HA2EV, GPUSampler, GradCounter, build_backend,
+from bench.core import (HA2EV, GPUSampler, GradCounter, PathProbe, build_backend,
                         counter_self_test, dump, kabsch_rmsd, load_ts1x,
-                        n_imag_batch, run_record)
+                        n_imag_batch, run_record, stage_share_gate,
+                        verify_counter_inline)
+
+
+def _certify(args, needs_hessian):
+    """Per-run counter self-certification -> (status, detail). Cheap; every record
+    carries it so a broken instrument can never be mistaken for a missing cell."""
+    data = load_ts1x(args.pkl, 4)
+    base = [d["TS"] for d in data]
+    mols_fn = lambda B: [base[i % len(base)].copy() for i in range(B)]
+    build = lambda **kw: build_backend(args.backend, args.model, **kw)
+    st, det = verify_counter_inline(build, mols_fn, needs_hessian=needs_hessian)
+    print(f"[certify] backend={args.backend} needs_hessian={needs_hessian} "
+          f"counter={st} {det}", flush=True)
+    return st, det
 
 
 def _cuda_sync():
@@ -52,8 +66,16 @@ def _cuda_sync():
 
 
 def _reset_peak():
+    """Reset the peak counters AND release the cached pool.
+
+    Without empty_cache() the allocator pool from an earlier run in the SAME
+    process is still reserved, so max_memory_reserved() reports that high-water
+    mark instead of this run's own footprint (observed: every rep-2 forward run
+    reporting an identical 3740 MB inherited from rep-1's B=128).
+    """
     import torch
     if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
 
@@ -72,9 +94,11 @@ def run_pipeline(args, B, rep):
     from maple.function.dispatcher.ts.algorithm.neb import NEB
     from maple.function.utility.molecules import Molecules
 
+    cert_st, cert_det = _certify(args, needs_hessian=True)
     data = load_ts1x(args.pkl, args.N)
     calc = build_backend(args.backend, args.model)
     ctr = GradCounter(calc)
+    probe = PathProbe(calc)          # which Hessian implementation actually runs
     tag = f"{args.tag}_pipeline_{args.backend}_B{B}_r{rep}"
     nchunk = int(np.ceil(len(data) / B))
     neb = NEB(output=f"/dev/shm/{tag}_neb.out",
@@ -156,10 +180,16 @@ def run_pipeline(args, B, rep):
         n_imag_hist={str(k): int(sum(1 for x in nims if x == k)) for k in sorted(set(nims))},
         neb_converged=f"{neb_conv}/{len(data)}", prfo_converged=f"{prfo_conv}/{len(data)}")
     ge_tot = sum(ge_st.values())
+    share_gate = stage_share_gate(t_st, ge_st)
+    print(f"[{tag}] stage_share_gate = {share_gate['status']} "
+          f"{[(r['stage'], round(r['wall_share'],3), round(r['ge_share'],4), r['status']) for r in share_gate.get('stages',[])]}",
+          flush=True)
+    print(f"[{tag}] hessian path probe = {probe.report()}", flush=True)
     rec = run_record(
         bench="pipeline_ts", dispatcher="pipeline", backend=args.backend, B=B,
         N=len(data), rep=rep, tag=tag,
         hessian_mode=getattr(calc, "hessian_mode", "n/a"),
+        counter_status=cert_st, counter_detail=cert_det,
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     n_images=args.n_images, neb_maxiter=args.neb_maxiter,
                     dyneb=args.dyneb, recalc=args.recalc, n_chunks=nchunk,
@@ -171,8 +201,11 @@ def run_pipeline(args, B, rep):
         extra=dict(struct_per_s=len(data) / wall,
                    grad_equiv_per_rxn=ge_tot / len(data),
                    oom_halve_retries=int(getattr(calc, "_auto_chunk_retries", 0)),
+                   stage_share_gate=share_gate,
+                   hessian_path_probe=probe.report(),
                    rows=rows))
-    print(f"[{tag}] wall={wall:.1f}s gE={ge_tot} s/gE={wall/ge_tot:.5f} "
+    print(f"[{tag}] counter={cert_st} wall={wall:.1f}s gE={ge_tot} "
+          f"s/gE={(wall/ge_tot if cert_st == 'VERIFIED' and ge_tot else float('nan')):.5f} "
           f"succ={science['success_rate']*100:.1f}% MAE={science['barrier_MAE_eV']} "
           f"medRMSD={science['median_TS_RMSD_A']} util={gpu['util_mean']:.0f}%", flush=True)
     return dump(rec, args.outdir, tag)
@@ -180,6 +213,7 @@ def run_pipeline(args, B, rep):
 
 # --------------------------------------------------------------------- forward
 def run_forward(args, B, rep):
+    cert_st, cert_det = _certify(args, needs_hessian=False)
     data = load_ts1x(args.pkl, max(B, 16))
     mols = [d["TS"] for d in data][:B] if B <= len(data) else None
     if mols is None or len(mols) < B:
@@ -204,6 +238,7 @@ def run_forward(args, B, rep):
     rec = run_record(
         bench="raw_forward", dispatcher="forward", backend=args.backend, B=B,
         N=B, rep=rep, tag=tag, hessian_mode="none",
+        counter_status=cert_st, counter_detail=cert_det,
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     iters=args.iters, loop="prepare+get_ef_gpu (a3/B5 convention)",
                     geometry="ts1x DFT TS structures"),
@@ -218,6 +253,7 @@ def run_forward(args, B, rep):
 
 # --------------------------------------------------------------------- hessian
 def run_hessian(args, B, rep, mode):
+    cert_st, cert_det = _certify(args, needs_hessian=(mode not in ("autograd", "analytic")))
     data = load_ts1x(args.pkl, max(B, 16))
     base = [d["TS"] for d in data]
     mols = [base[i % len(base)].copy() for i in range(B)]
@@ -242,7 +278,8 @@ def run_hessian(args, B, rep, mode):
     except Exception as e:
         rec = run_record(bench="hessian_segment", dispatcher="hessian",
                          backend=args.backend, B=B, N=B, rep=rep, tag=tag,
-                         hessian_mode=mode,
+                         hessian_mode=mode, counter_status=cert_st,
+                         counter_detail=cert_det,
                          params=dict(mode=mode, error=f"{type(e).__name__}: {str(e)[:200]}"),
                          wall_s=0.0, grad_equiv_total=0, forward_calls=0,
                          extra=dict(status="FAILED"))
@@ -251,6 +288,7 @@ def run_hessian(args, B, rep, mode):
     rec = run_record(
         bench="hessian_segment", dispatcher="hessian", backend=args.backend, B=B,
         N=B, rep=rep, tag=tag, hessian_mode=mode,
+        counter_status=cert_st, counter_detail=cert_det,
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     mode=mode, iters=args.hess_iters,
                     note=("grad-equiv counts calc._forward only; the autograd Hessian's "
@@ -298,6 +336,7 @@ def run_autoneb(args, rep):
             self.results["forces"] = (F.detach().cpu().numpy()[0, :3 * n]
                                       .reshape(n, 3).astype(np.float64).copy())
 
+    cert_st, cert_det = _certify(args, needs_hessian=False)
     data = load_ts1x(args.pkl, args.rxn_count, start=args.rxn_start)
     calc = build_backend(args.backend, args.model)
     ctr = GradCounter(calc)
@@ -367,9 +406,33 @@ def run_autoneb(args, rep):
                 reactions.append([R, P])
             g0, c0 = ctr.n, ctr.calls
             t1 = time.time()
-            job = AutoNEBBatch("/dev/shm/aneb_batch.out", reactions, calc=calc,
-                               paras=paras)
-            res = job.run()
+            # A diverged band (|x| > 100 A) explodes the neighbour-list grid and
+            # OOMs the whole job (observed: radius_graph_pbc_v2 asking for 115.73
+            # GiB, job 49538528). Isolate it to its chunk instead of losing the run.
+            try:
+                job = AutoNEBBatch("/dev/shm/aneb_batch.out", reactions, calc=calc,
+                                   paras=paras)
+                res = job.run()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                dt = time.time() - t1
+                torch.cuda.empty_cache()
+                for d in chunk:
+                    rows.append(dict(idx=d["idx"], natoms=d["natoms"],
+                                     wall_s=dt / len(chunk), chunk_wall_s=dt,
+                                     grad_equiv=(ctr.n - g0) / len(chunk),
+                                     forward_calls=(ctr.calls - c0) / len(chunk),
+                                     barrier_Eh=None, ts_pos=None, n_images=None,
+                                     diverged=True, censored=True,
+                                     failure="OOM (diverged band blew up the "
+                                             "neighbour-list grid)"))
+                print(f"[{tag}] chunk {i//args.B_single}: OOM -> whole chunk censored "
+                      f"({len(chunk)} rxns), continuing", flush=True)
+                json.dump(rows, open(os.path.join(args.outdir,
+                                                  tag + "_rows.partial.json"), "w"),
+                          default=float)
+                continue
             dt = time.time() - t1
             for d, r in zip(chunk, res):
                 rows.append(dict(idx=d["idx"], natoms=d["natoms"],
@@ -395,7 +458,7 @@ def run_autoneb(args, rep):
     rec = run_record(
         bench="autoneb_B3", dispatcher="autoneb", backend=args.backend,
         B=(1 if args.arm == "serial" else args.B_single), N=len(data), rep=rep, tag=tag,
-        hessian_mode="none",
+        hessian_mode="none", counter_status=cert_st, counter_detail=cert_det,
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     arm=args.arm, rxn_start=args.rxn_start, rxn_count=args.rxn_count,
                     serial_budget_s=(args.serial_budget_s if args.arm == "serial" else None),

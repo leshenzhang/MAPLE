@@ -24,7 +24,20 @@ HA2EV = 27.211386245988
 SCHEMA = "maple-bench-v1"
 
 
-ENTRY_POINTS = ("_predict_forces", "_forward")
+# Per-backend model-evaluation choke points. NOT all backends call them `_forward`
+# -- each of these was found by reading the backend's own Hessian/FD path:
+#   UMA            _predict_forces   (_uma_batch_calculator.py:895 -- FD chunks call it
+#                                     directly; _forward itself calls it at :505)
+#   MACE traced    _forward_ef_      (_mace_batch_calculator.py:512-513 -- _efh_fd calls
+#                                     it per DOF; _forward is a thin wrapper at :326)
+#   MACE autograd  _model_energy     (_mace_autograd_batch_calculator.py:443 -- get_ef_gpu
+#                                     calls it directly; its own :407-409 docstring states
+#                                     that get_ef_gpu/_efh_fd/_efh_analytic/hvp* do NOT
+#                                     route through _forward)
+#   generic base   _forward          (batch_calculator_base.py:516-518)
+# The re-entrancy guard makes it safe to hook all of them at once: nested calls are
+# counted once, at the outermost hooked frame.
+ENTRY_POINTS = ("_predict_forces", "_forward_ef_", "_model_energy", "_forward")
 
 
 class GradCounter:
@@ -300,7 +313,8 @@ def env_info():
 def run_record(*, bench, dispatcher, backend, B, N, rep, tag, params, wall_s,
                grad_equiv_total, forward_calls, wall_stages=None, ge_stages=None,
                gpu=None, vram_reserved_MB=None, vram_alloc_MB=None,
-               science=None, extra=None, hessian_mode=None):
+               science=None, extra=None, hessian_mode=None,
+               counter_status="UNVERIFIED", counter_detail=None):
     """The unified maple-bench-v1 run record. wall ALWAYS paired with grad-equiv.
 
     FIX-1 `hessian_mode` is a TOP-LEVEL field because grad-equivalents are NOT
@@ -312,14 +326,23 @@ def run_record(*, bench, dispatcher, backend, B, N, rep, tag, params, wall_s,
     meaningless -> aggregate.py refuses it with INCOMPARABLE. `wall_s` and
     `forward_calls` remain valid across modes and must be used instead.
     """
+    # A broken counter must NOT emit a number, and must NOT emit a bare None
+    # either: None reads as "this cell has no data", while the truth is "the
+    # instrument for this cell is broken". grad_equiv_status carries that apart.
+    trustworthy = (counter_status == "VERIFIED")
+    ge_status = ("OK" if trustworthy else
+                 ("UNAVAILABLE(counter %s)" % counter_status))
     rec = dict(schema=SCHEMA, bench=bench, dispatcher=dispatcher, backend=backend,
                B=B, N=N, rep=rep, tag=tag, params=params, env=env_info(),
                hessian_mode=hessian_mode,
+               counter_status=counter_status, counter_detail=(counter_detail or {}),
+               grad_equiv_status=ge_status,
                wall_s=float(wall_s),
-               grad_equiv_total=int(grad_equiv_total),
+               grad_equiv_total=(int(grad_equiv_total) if trustworthy else None),
+               grad_equiv_measured_raw=int(grad_equiv_total),
                forward_calls=int(forward_calls),
-               s_per_grad_equiv=(float(wall_s) / grad_equiv_total
-                                 if grad_equiv_total else None),
+               s_per_grad_equiv=((float(wall_s) / grad_equiv_total)
+                                 if (trustworthy and grad_equiv_total) else None),
                wall_stages=wall_stages or {}, grad_equiv_stages=ge_stages or {},
                gpu_util_mean=(gpu or {}).get("util_mean"),
                gpu_util_peak=(gpu or {}).get("util_peak"),
@@ -341,6 +364,103 @@ def dump(rec, outdir, name):
     return p
 
 
+def verify_counter_inline(build_fn, mols_fn, needs_hessian=False):
+    """Cheap per-run self-certification of the counter (~0.1-2 s).
+
+    Every record must be able to say whether its own grad-equivalents are
+    trustworthy. Returns (status, detail) with status in:
+      VERIFIED  known answers hit (B=1 -> 1, B=2 -> 2, and the FD Hessian form
+                when needs_hessian)
+      BROKEN    the counter miscounts on THIS backend -> the caller must publish
+                grad_equiv as UNAVAILABLE, never as 0 and never as a plain None
+                (a None reads as 'no data'; this is 'the instrument is broken')
+      SKIP      the probe itself could not run (no model / no device)
+    """
+    detail = {}
+    try:
+        for B in (1, 2):
+            calc = build_fn()
+            ctr = GradCounter(calc)
+            detail.setdefault("hooked", list(ctr.hooked))
+            mols = mols_fn(B)
+            calc.prepare([m.copy() for m in mols])
+            calc.get_ef_gpu()
+            got, _ = ctr.take()
+            detail[f"sp_B{B}"] = dict(expected=B, measured=int(got))
+            if int(got) != B:
+                return "BROKEN", detail
+        if needs_hessian:
+            calc = build_fn()
+            ctr = GradCounter(calc)
+            mols = mols_fn(2)
+            nat = [len(m) for m in mols]
+            dof, nmax_a, B = 3 * sum(nat), max(nat), 2
+            calc.prepare([m.copy() for m in mols])
+            calc.get_efh_gpu()
+            got, _ = ctr.take()
+            forms = {"central_2xDOF": 2 * dof, "central_2xDOF_plus_base": 2 * dof + B,
+                     "forward_DOF_plus_base": dof + B,
+                     "central_padded_2x3xNmaxA_xB_plus_base": 2 * 3 * nmax_a * B + B}
+            match = [k for k, v in forms.items() if v == int(got)]
+            detail["fd_hessian"] = dict(measured=int(got), analytic_forms=forms,
+                                        matched_form=(match[0] if match else None))
+            if not match:
+                return "BROKEN", detail
+        return "VERIFIED", detail
+    except Exception as e:
+        detail["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+        return "SKIP", detail
+
+
+UNCOUNTED_WORK_FACTOR = 5.0
+
+
+def stage_share_gate(wall_stages, ge_stages, factor=UNCOUNTED_WORK_FACTOR,
+                     min_wall_share=0.02):
+    """STANDING EMISSION GATE: per-stage wall share vs grad-equivalent share.
+
+    For a forward-bound stage the two shares must be the same order of magnitude.
+    A stage that burns X% of the wall while reporting X/20 % of the gradient
+    equivalents is doing work the counter cannot see. This gate is what SHOULD
+    have caught the July freq-stage hole automatically:
+
+        NEB   43.0% wall / 87.5% gE  -> ratio 0.49  ok
+        P-RFO 48.7% wall / 12.1% gE  -> ratio 4.0   borderline
+        freq   8.3% wall /  0.41% gE -> ratio 20.3  UNCOUNTED_WORK_SUSPECTED
+
+    Stages under `min_wall_share` of the wall are SKIPped (too small to judge).
+    Returns PASS / UNCOUNTED_WORK_SUSPECTED / SKIP plus the per-stage table.
+    """
+    if not wall_stages or not ge_stages:
+        return dict(name="stage_share_gate", status="SKIP",
+                    note="no per-stage accounting for this dispatcher")
+    wtot = float(sum(wall_stages.values()))
+    gtot = float(sum(ge_stages.values()))
+    if wtot <= 0 or gtot <= 0:
+        return dict(name="stage_share_gate", status="SKIP", note="empty stage totals")
+    rows, flagged = [], []
+    for k in wall_stages:
+        ws = float(wall_stages[k]) / wtot
+        gs = float(ge_stages.get(k, 0)) / gtot
+        if ws < min_wall_share:
+            rows.append(dict(stage=k, wall_share=ws, ge_share=gs, ratio=None,
+                             status="SKIP", note="wall share below %.0f%%"
+                                                 % (100 * min_wall_share)))
+            continue
+        ratio = (ws / gs) if gs > 0 else float("inf")
+        st = "UNCOUNTED_WORK_SUSPECTED" if ratio >= factor else "PASS"
+        if st != "PASS":
+            flagged.append(k)
+        rows.append(dict(stage=k, wall_share=ws, ge_share=gs, ratio=ratio, status=st))
+    applicable = [r for r in rows if r["status"] != "SKIP"]
+    status = ("SKIP" if not applicable
+              else ("UNCOUNTED_WORK_SUSPECTED" if flagged else "PASS"))
+    return dict(name="stage_share_gate", status=status, factor=factor,
+                flagged_stages=flagged, stages=rows,
+                note=("a stage whose wall share exceeds its grad-equiv share by "
+                      ">=%gx is doing work the counter cannot see" % factor))
+
+
 def spread_pct(vals):
     """Full-range spread in % of the mean (D-253 convention: 2 reps differing 3.8%)."""
     v = np.asarray([x for x in vals if x is not None], float)
@@ -360,6 +480,55 @@ def spread_pct(vals):
 # broken. So we pin the counter against KNOWN-ANSWER cases before trusting any
 # normalized number.
 # ---------------------------------------------------------------------------
+class PathProbe:
+    """Records WHICH Hessian implementation actually executed.
+
+    Settles 'is the counter blind' (a) vs 'is it secretly running the double
+    backward' (b) by direct observation instead of arithmetic inference. Hooks the
+    numerical FD body, the VRAM-adaptive FD body, the legacy FD body and the
+    autograd body, and counts entries into each.
+    """
+
+    TARGETS = ("_get_efh_numerical", "_get_efh_numerical_auto",
+               "_get_efh_gpu_legacy", "_efh_gpu_autograd", "_efh_analytic",
+               "_efh_fd")
+
+    def __init__(self, calc):
+        self.calc = calc
+        self.counts = {}
+        self._orig = {}
+        for name in self.TARGETS:
+            fn = getattr(calc, name, None)
+            if fn is None or not callable(fn):
+                continue
+            self.counts[name] = 0
+            self._orig[name] = fn
+            setattr(calc, name, self._make(name))
+
+    def _make(self, name):
+        def wrapper(*a, **k):
+            self.counts[name] += 1
+            return self._orig[name](*a, **k)
+        return wrapper
+
+    def report(self):
+        fired = {k: v for k, v in self.counts.items() if v}
+        fd = sum(v for k, v in fired.items()
+                 if k in ("_get_efh_numerical", "_get_efh_numerical_auto",
+                          "_get_efh_gpu_legacy", "_efh_fd"))
+        ag = sum(v for k, v in fired.items()
+                 if k in ("_efh_gpu_autograd", "_efh_analytic"))
+        path = ("finite-difference" if fd and not ag else
+                "autograd/double-backward" if ag and not fd else
+                "mixed" if ag and fd else "none")
+        return dict(hooked=sorted(self.counts), fired=fired,
+                    fd_entries=fd, autograd_entries=ag, executed_path=path)
+
+    def unhook(self):
+        for name, fn in self._orig.items():
+            setattr(self.calc, name, fn)
+
+
 def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical",)):
     """Known-answer tests for GradCounter. Returns dict with per-case PASS/FAIL/SKIP.
 
@@ -404,6 +573,7 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
             kw = {"hessian_mode": mode} if backend_name == "uma" else {}
             calc = build_fn(**kw)
             ctr = GradCounter(calc)
+            probe = PathProbe(calc)
             B = 2
             mols = mols_fn(B)
             nat = [len(m) for m in mols]
@@ -411,13 +581,19 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
             calc.prepare([m.copy() for m in mols])
             calc.get_efh_gpu(mode=mode)
             got, calls = ctr.take()
+            path = probe.report()
+            nmax_a = max(nat)
             forms = {"central_2xDOF": 2 * dof,
                      "central_2xDOF_plus_base": 2 * dof + B,
-                     "forward_DOF_plus_base": dof + B}
+                     "forward_DOF_plus_base": dof + B,
+                     # MACE-style padded loop: `for k in range(3*nmax_atoms)` with
+                     # both +/- forwards covering ALL B structures each iteration
+                     "central_padded_2x3xNmaxA_xB_plus_base": 2 * 3 * nmax_a * B + B}
             match = [k for k, v in forms.items() if v == got]
             if mode in ("autograd", "analytic"):
                 cases.append(dict(name=name, status="SKIP", measured=int(got),
                                   forward_calls=int(calls), analytic_forms=forms,
+                                  executed_path=path,
                                   note=("double-backward work is invisible to a "
                                         "forward counter -> no known answer; this is "
                                         "why s/grad-equiv is INCOMPARABLE across modes")))
@@ -426,7 +602,8 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
                                   status=("PASS" if match else "FAIL"),
                                   measured=int(got), forward_calls=int(calls),
                                   matched_form=(match[0] if match else None),
-                                  analytic_forms=forms, natoms=nat, dof=dof))
+                                  analytic_forms=forms, natoms=nat, dof=dof,
+                                  executed_path=path))
         except Exception as e:
             cases.append(dict(name=name, status="SKIP",
                               note=f"{type(e).__name__}: {str(e)[:140]}"))
@@ -443,9 +620,11 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
         calc.prepare([m.copy() for m in mols])
         calc.get_efh_gpu(movable_masks=mov)
         got, calls = ctr.take()
+        nmov_max = max(len(m) for m in mov)
         forms = {"central_2xDOFmov": 2 * dof_mov,
                  "central_2xDOFmov_plus_base": 2 * dof_mov + B,
-                 "forward_DOFmov_plus_base": dof_mov + B}
+                 "forward_DOFmov_plus_base": dof_mov + B,
+                 "central_padded_2x3xNmovMax_xB_plus_base": 2 * 3 * nmov_max * B + B}
         match = [k for k, v in forms.items() if v == got]
         cases.append(dict(name="hess_partial_movable",
                           status=("PASS" if match else "FAIL"),
