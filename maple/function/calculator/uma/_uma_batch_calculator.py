@@ -423,7 +423,7 @@ class UMABatchCalc(BatchCalcABC):
         # error. The PERIODIC path is exempt here (it rebuilds the AtomicData from
         # current coords each forward) but its Hessian paths are NOT -> guarded in
         # get_efh_gpu/hvp.
-        if self._r_edges and not self._periodic:
+        if getattr(self, "_r_edges", False) and not self._periodic:
             raise NotImplementedError(
                 "UMABatchCalc: this predictor resolved external_graph_gen=True, i.e. "
                 "edges are precomputed on the AtomicData at prepare() time. The batched "
@@ -783,7 +783,7 @@ class UMABatchCalc(BatchCalcABC):
         # external_graph_gen=True the baked edges would be STALE at the perturbed/
         # current geometry -> silently wrong H. Only reachable for a PERIODIC batch
         # (the molecular case already raised at prepare()).
-        if self._r_edges:
+        if getattr(self, "_r_edges", False):
             raise NotImplementedError(
                 "UMABatchCalc.get_efh_gpu: external_graph_gen=True bakes edges into "
                 "the prepare-time AtomicData templates; the batched Hessian paths "
@@ -1263,7 +1263,7 @@ class UMABatchCalc(BatchCalcABC):
         assert self._prepared, "call prepare() first"
         # R3-1 GUARD: _forward_fall_graph clones the prepare-time template and
         # overwrites pos only -> stale baked edges under external_graph_gen=True.
-        if self._r_edges:
+        if getattr(self, "_r_edges", False):
             raise NotImplementedError(
                 "UMABatchCalc.hvp: external_graph_gen=True bakes edges into the "
                 "prepare-time AtomicData template (stale at the current geometry -- "
