@@ -32,6 +32,26 @@ import traceback
 
 import torch
 
+# --- broken-torchvision workaround (cxtorch: torchvision C-ext built against a
+# different torch -> unpickling a mace-package checkpoint dies with
+# "RuntimeError: operator torchvision::nms does not exist"). torchvision is only
+# pulled in TRANSITIVELY by the unpickle import chain; nothing here uses it. Stub
+# it in sys.modules before torch.load, mirroring the ray.serve stub the UMA calc
+# already uses. Only applied when the real import is genuinely broken.
+import sys as _sys, types as _types
+try:
+    import torchvision as _tv_real  # noqa: F401
+except Exception as _tv_exc:        # broken -> install a stub so imports succeed
+    _tv = _types.ModuleType("torchvision")
+    _tv.__version__ = "0.0.0-stub"
+    _tv._maple_stub = True
+    _tvops = _types.ModuleType("torchvision.ops")
+    _tv.ops = _tvops
+    _sys.modules.setdefault("torchvision", _tv)
+    _sys.modules.setdefault("torchvision.ops", _tvops)
+    print(f"[env] torchvision import broken ({type(_tv_exc).__name__}); "
+          f"installed a sys.modules stub for the unpickle path", flush=True)
+
 OUT = os.environ.get("OUT", "gate_r37.json")
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 DT = torch.float64
@@ -241,6 +261,11 @@ def main():
         RES["pass"] = bool(RES.get("pass")) and bool(t2.get("bit_identical"))
     json.dump(RES, open(OUT, "w"), indent=1)
     print("R37_GATE_PASS" if RES.get("pass") else "R37_GATE_FAIL", flush=True)
+    if t2.get("ckpt_exists") and "error" in t2:
+        print("WARNING: tier-2 (real-model parity) could NOT run; tier-1 byte-equality "
+              "only. Reason: " + t2["error"].strip().splitlines()[-1][:160], flush=True)
+    if not RES.get("pass"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
