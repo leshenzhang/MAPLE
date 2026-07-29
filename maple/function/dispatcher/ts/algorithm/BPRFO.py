@@ -20,12 +20,20 @@ Literature each upgrade is grounded in (cited again at each method):
       products (Sella). Hermes, Sargent, Head-Gordon, Slavicek?  -- actually:
       Hermes, E. D.; Sargsyan, K.; Najm, H. N.; Zador, J. "Accelerated
       Saddle Point Refinement through Full Exploitation of Partial Hessian
-      Diagonalization", J. Chem. Theory Comput. 2019, 15, 6536.
+      Diagonalization", J. Chem. Theory Comput. 2019, 15, 6536-6549.
       DOI: 10.1021/acs.jctc.9b00869  and the Sella follow-up
       "Sella, an Open-Source Automation-Friendly Molecular Saddle Point
-      Optimizer", J. Chem. Theory Comput. 2022, 18, 2.
-      DOI: 10.1021/acs.jctc.2c00395
-      => hessian_mode='iterative' (vs default 'full').
+      Optimizer", J. Chem. Theory Comput. 2022, 18, 6974-6988.
+      DOI: 10.1021/acs.jctc.2c00395   (pages CrossRef-verified 2026-07-28;
+      the previous "18, 2" in this header was wrong.)
+      => hessian_mode='iterative' (vs default 'full'), + iter_warm_start.
+      [8] Lanczos warm start (A2-phess 2026-07-28): seed the Krylov space with
+      the previously tracked leftmost mode instead of a fixed random vector.
+      Quasi-Newton update formulas used between exact Hessians:
+      Bofill (MS/SR1 + PSB mix) J. Comput. Chem. 1994, 15, 1-11,
+      DOI: 10.1002/jcc.540150102 ; MS/SR1 limit Murtagh & Sargent, Comput. J.
+      1970, 13, 185-194, DOI: 10.1093/comjnl/13.2.185 ; PSB limit Powell 1971
+      (Powell-symmetric-Broyden) => hessian_update='bofill'|'psb'|'sr1'|'bfgs'.
   [2] Trust-radius controller. Nocedal & Wright, "Numerical Optimization",
       2nd ed., Springer 2006, Ch. 4, Algorithm 4.1.
       => trust_mode='nw' (vs default 'legacy').
@@ -142,6 +150,12 @@ class BatchPRFO:
                  iter_gamma: float = 0.4,             # [1] loose conv: ||r|| < gamma*|lambda|
                  iter_fd_eta: float = 1e-3,           # [1] finite-diff HVP step (Angstrom)
                  hvp_source: str = "fd",              # [1] 'fd'(default)|'auto'|'autograd' HVP backend
+                 iter_warm_start: bool = False,       # [8] seed Lanczos with the tracked mode
+                 iter_solver: str = "lanczos",        # [9] 'lanczos'(default)|'lobpcg'
+                 iter_reorth: bool = False,           # [11] keep V orthonormal about the true mode
+                 iter_lobpcg_max: int = 8,            # [9] max LOBPCG iterations (=HVPs)
+                 iter_precond: str = "model",         # [9] 'model'(|H_work|^-1)|'none'
+                 iter_precond_floor: float = 1e-2,    # [9] eigenvalue floor of the preconditioner
                  trust_mode: str = "legacy",          # [2] 'legacy'(default)|'nw'
                  nw_eta_accept: float = 0.10,         # [2] accept step if rho > this
                  nw_rho_lo: float = 0.25,             # [2] rho<lo -> trust x1/4
@@ -152,6 +166,9 @@ class BatchPRFO:
                  initial_hessian: str = "identity",   # [5] 'identity'(default)|'lindh'
                  hessian_recalc_adapt: bool = False,  # [6] recalc when ||g|| < ||g0||/n
                  recalc_adapt_n: float = 10.0,        # [6] the 'n'
+                 hessian_recalc_quality: bool = False,  # [10] recalc on measured staleness (OFF: D-261 null)
+                 recalc_quality_tol: float = 0.5,     # [10] median ||y-Hs||/||y|| trigger
+                 recalc_quality_max: int = 64,        # [10] hard cadence cap for [10]
                  conv_check_interval: int = 1,        # [7] check convergence + verbose-log every K iters
                  log_mode: Optional[str] = None,      # [8] 'lean'(default)|'full' legacy log
                  traj_mode: Optional[str] = None,     # [8] 'endpoints'(default)|'full' legacy xyz
@@ -167,8 +184,12 @@ class BatchPRFO:
         self.device = torch.device(device)
         self.recalc = max(1, int(recalc))
         self.hessian_update = str(hessian_update).lower()
-        if self.hessian_update not in {"bofill", "bfgs"}:
-            raise ValueError("hessian_update must be 'bofill' or 'bfgs'.")
+        # 'bofill' = MS/SR1 + PSB mixed by phi (Bofill, J. Comput. Chem. 1994, 15, 1,
+        # DOI 10.1002/jcc.540150102). 'psb'/'sr1' are the two PURE limits of the SAME
+        # batched kernel (phi forced to 1 / 0) -- exposed so the mixing weight itself
+        # can be ablated against the exact Hessian; 'bfgs' is the minimization update.
+        if self.hessian_update not in {"bofill", "bfgs", "psb", "sr1"}:
+            raise ValueError("hessian_update must be 'bofill', 'psb', 'sr1' or 'bfgs'.")
 
         # ---- OPT-IN upgrade config ----
         self.hessian_mode = str(hessian_mode).lower()
@@ -188,6 +209,36 @@ class BatchPRFO:
         self.hvp_source = str(hvp_source).lower()
         if self.hvp_source not in {"fd", "auto", "autograd"}:
             raise ValueError("hvp_source must be 'fd', 'auto' or 'autograd'.")
+        # [8] Lanczos warm start (A2-phess). The leftmost eigenvector of the TRUE
+        # Hessian moves slowly between consecutive P-RFO iterations, so seeding the
+        # Krylov space with the previously tracked mode (instead of a fixed random
+        # vector) puts most of the Ritz weight in the first step and lets the
+        # ||r|| < gamma*|lambda| test fire several steps earlier. Each saved Lanczos
+        # step is ONE batched forward = B gradient-equivalents. Default OFF = legacy
+        # random start (the parity oracle).
+        self.iter_warm_start = bool(iter_warm_start)
+        # [9] Leftmost-eigenpair solver (A2-phess 2026-07-28). A Krylov/Lanczos method
+        # converges first to the eigenvalues that are EXTREMAL IN MAGNITUDE. For a
+        # molecular Hessian the reaction mode |lam_min| ~ 1e-2..1e-1 is tiny next to
+        # the stiff X-H stretches lam_max ~ 1e0..1e1, so the leftmost Ritz pair is the
+        # LAST thing a short Krylov space resolves -- and a spectral shift cannot fix
+        # that (K(A,v) == K(sigma*I - A, v): the Krylov space is shift-invariant).
+        # 'lobpcg' instead MINIMIZES the Rayleigh quotient, so it targets the
+        # algebraically smallest eigenvalue by construction, and it accepts a
+        # preconditioner: with T = |H_work|^-1 (the model Hessian the optimizer
+        # already carries, absolute-value-shifted to SPD) the stiff subspace is
+        # compressed and the reaction mode converges in a few HVPs.
+        self.iter_solver = str(iter_solver).lower()
+        if self.iter_solver not in {"lanczos", "lobpcg"}:
+            raise ValueError("iter_solver must be 'lanczos' or 'lobpcg'.")
+        self.iter_lobpcg_max = max(1, int(iter_lobpcg_max))
+        # [11] Keep the RS-P-RFO eigenbasis ORTHONORMAL after substituting the true
+        # leftmost mode (see _reorth_basis_about). Default OFF = legacy substitution.
+        self.iter_reorth = bool(iter_reorth)
+        self.iter_precond = str(iter_precond).lower()
+        if self.iter_precond not in {"model", "none"}:
+            raise ValueError("iter_precond must be 'model' or 'none'.")
+        self.iter_precond_floor = float(iter_precond_floor)
         self.trust_mode = str(trust_mode).lower()
         if self.trust_mode not in {"legacy", "nw"}:
             raise ValueError("trust_mode must be 'legacy' or 'nw'.")
@@ -202,6 +253,21 @@ class BatchPRFO:
             raise ValueError("initial_hessian must be 'identity' or 'lindh'.")
         self.hessian_recalc_adapt = bool(hessian_recalc_adapt)
         self.recalc_adapt_n = float(recalc_adapt_n)
+        # [10] Quality-driven recalc (A2-phess 2026-07-28). A FIXED RecalcFC cadence
+        # spends 6n+1 force evaluations per structure whether or not the quasi-Newton
+        # Hessian has actually gone stale. The secant residual
+        #     q = ||y - H s|| / ||y||,   y = g_new - g_prev,  s = accepted step
+        # is the amount of curvature the working Hessian FAILED to predict over the
+        # step just taken; it is built from quantities the update already computes, so
+        # evaluating it costs ZERO force evaluations. Fire an exact recalc when the
+        # batch median q exceeds recalc_quality_tol (with recalc_quality_max as a hard
+        # cadence ceiling so a pathological batch still re-seeds). Default OFF.
+        self.hessian_recalc_quality = bool(hessian_recalc_quality)
+        self.recalc_quality_tol = float(recalc_quality_tol)
+        self.recalc_quality_max = max(1, int(recalc_quality_max))
+        self._last_qres = None          # (B,) secant residual of the last accepted step
+        self._qres_hist = []            # diagnostics: batch-median q per iteration
+        self._iters_since_recalc = 0
         self.conv_check_interval = max(1, int(conv_check_interval))
         # ---- [8] host-side diagnostics policy (A1-hostopt 2026-07-28). Default
         # LEAN: skip the per-attempt iteration-head line, the per-iter ORCA cycle
@@ -355,6 +421,15 @@ class BatchPRFO:
         # (g is already carried by self._g_cart_prev = -F_committed*mask.)
         self._reuse_E = None
 
+        # --- gradient-equivalent (GE) accounting (A2-phess, diagnostics only) ---
+        # 1 GE = ONE per-structure force evaluation. A batched forward over B
+        # structures = B GE. A central-FD Hessian recalc on structure i = 6*n_i
+        # replica forces + 1 base forward; forward-FD = 3*n_i + 1. An FD HVP =
+        # 1 batched forward = B GE. Counters NEVER touch the math.
+        self._ge_iter = 0     # EF/trial forwards in the outer/inner loop
+        self._ge_hess = 0     # FD-Hessian recalc forwards
+        self._ge_hvp = 0      # FD HVP forwards (iterative mode)
+
 
     # ===================================================
     # PUBLIC RUN
@@ -420,7 +495,8 @@ class BatchPRFO:
         if self.hessian_mode == "iterative":
             self._w(f"# iterative eigensolver: n_leftmost={self.iter_n_leftmost} "
                     f"lanczos_m<={self.iter_lanczos_m} gamma={self.iter_gamma} "
-                    f"fd_eta={self.iter_fd_eta} hvp_source={self.hvp_source}\n")
+                    f"fd_eta={self.iter_fd_eta} hvp_source={self.hvp_source} "
+                    f"warm_start={self.iter_warm_start}\n")
         # reset adaptive-recalc + iterative diagnostics for this run
         self._g0_norm_mean = None
         self._adapt_level = 0
@@ -440,6 +516,12 @@ class BatchPRFO:
         self._audit_max_dF = 0.0
         self._fwd_calls = 0
         self._fwd_reused = 0
+        self._ge_iter = 0
+        self._ge_hess = 0
+        self._ge_hvp = 0
+        self._last_qres = None
+        self._qres_hist = []
+        self._iters_since_recalc = 0
 
         self._init_xyz_paths(B0)
         self._symbols_per_batch = _symbols_flat(atoms_list)
@@ -447,6 +529,7 @@ class BatchPRFO:
         # === First prepare to fix nmax ===
         calc.prepare(atoms_list)
         self._fwd_calls += 1
+        self._ge_iter += len(atoms_list)
         _, F0 = calc.get_ef_gpu()
         self._nmax = int(F0.shape[1])
         self._arange_n = torch.arange(self._nmax, device=device)
@@ -542,12 +625,32 @@ class BatchPRFO:
                         self._w(f"[Iter {outer_it}] adaptive recalc: <|g|>={cur:.3e} < "
                                 f"g0/n^{self._adapt_level} ({thr:.3e})\n")
 
-                if self.hessian_recalc_adapt:
+                # [10] quality-driven recalc: fire when the working Hessian failed to
+                # predict the curvature of the last accepted step (median secant
+                # residual over the batch), with a hard cadence ceiling.
+                qual_fire = False
+                if self.hessian_recalc_quality and self._last_qres is not None:
+                    qmed = float(self._last_qres.median().item())
+                    self._qres_hist.append(qmed)
+                    qual_fire = ((qmed > self.recalc_quality_tol)
+                                 or (self._iters_since_recalc >= self.recalc_quality_max))
+                    if qual_fire:
+                        self._w(f"[Iter {outer_it}] quality recalc: median ||y-Hs||/||y||"
+                                f"={qmed:.3f} (tol={self.recalc_quality_tol}, "
+                                f"iters_since={self._iters_since_recalc})\n")
+
+                # cadence_due is consumed by the [9] partial-refill guard below, so it
+                # must stay defined on every path.
+                if self.hessian_recalc_quality:
+                    cadence_due = ((outer_it == 1) or qual_fire)
+                elif self.hessian_recalc_adapt:
                     cadence_due = ((outer_it == 1) or adapt_fire)
                 else:
                     cadence_due = ((outer_it == 1)
                                    or ((outer_it - 1) % self.recalc == 0))
                 need_recalc = cadence_due or forced
+                self._iters_since_recalc = (0 if need_recalc
+                                            else self._iters_since_recalc + 1)
 
             if E_old_is_set:
                 pass  # iterative path already produced E_old / H_cart / g_cart above
@@ -578,6 +681,18 @@ class BatchPRFO:
                 self._recalc_full_pending = False
 
                 self._fwd_calls += 1
+                # GE accounting: central FD = 6*n_i replicas/structure, forward
+                # FD = 3*n_i, autograd Hessian counted as 3*n_i backward columns;
+                # +1 base forward per structure (the returned E/F).
+                # Under a [9] partial refill only the _kpart newcomers get FD columns,
+                # so the column term must be restricted to them; the base forward is
+                # still evaluated for the whole batch.
+                _n_at = (self._L_vec // 3)
+                _n_col = _n_at[-_kpart:] if _kpart > 0 else _n_at
+                _fdm = str(getattr(calc, "_fd_mode", "central")).lower()
+                _hmode = str(getattr(calc, "hessian_mode", "numerical")).lower()
+                _per_col = 3 if (_hmode == "autograd" or _fdm == "forward") else 6
+                self._ge_hess += int(_n_col.sum().item()) * _per_col + int(_n_at.numel())
                 if _kpart > 0:
                     _nsurv = len(atoms_list) - _kpart
                     _mv = ([[] for _ in range(_nsurv)]
@@ -690,30 +805,53 @@ class BatchPRFO:
             # Thread the committed E forward for FIX #1 (FORWARD-A of the next iter).
             self._reuse_E = E_fin
 
-            # Bofill update: apply ONLY if we didn't just recalculate AND at least one
-            # step was accepted. [8] The batched update functions no-op rows outside
-            # their update mask (maskless where-guarded math), so the host-side
-            # `step_accepted.any()` gate is only needed to skip the call entirely; in
-            # lean mode call unconditionally (identical H, one device sync less).
+            # [10] Secant residual q = ||y - H s|| / ||y|| of the step just taken,
+            # measured BEFORE the update is applied (that is the staleness the step
+            # actually exposed). Zero force evaluations. Structures that did not move
+            # keep their previous q (a rejected step reveals nothing new).
+            # Gated by the flag so that with hessian_recalc_quality=False NOT ONE extra
+            # op runs -> the legacy configs stay byte- and timing-identical.
+            if self.hessian_recalc_quality and self._H_work is not None \
+                    and self._g_cart_prev is not None:
+                _s = last_step * self._real_mask_f
+                _y = (g_new_cart - self._g_cart_prev) * self._real_mask_f
+                _Hs = torch.einsum("bij,bj->bi", self._H_work, _s)
+                _q = (_y - _Hs).norm(dim=-1) / _y.norm(dim=-1).clamp(min=1e-12)
+                _moved = (_s.norm(dim=-1) > 1e-10) & step_accepted
+                if self._last_qres is None or self._last_qres.shape != _q.shape:
+                    self._last_qres = torch.where(_moved, _q, torch.zeros_like(_q))
+                else:
+                    self._last_qres = torch.where(_moved, _q, self._last_qres)
+
+            # Bofill/PSB/SR1 update: only if we did not just recalculate and at least
+            # one step was accepted. [8] the batched update functions no-op rows outside
+            # their mask, so in lean mode we skip the host-side .any() sync entirely.
             if not need_recalc and (self._log_full is False or step_accepted.any()):
                 if self._log_full:
                     self._w(
                         f"[Iter {outer_it}] Applying {self.hessian_update.upper()} "
                         f"update to {step_accepted.sum().item()} batches\n"
                     )
-                update_fn = (
-                    self._bfgs_update_batched
-                    if self.hessian_update == "bfgs"
-                    else self._bofill_update_batched
-                )
-                self._H_work = update_fn(
-                    H=self._H_work,
-                    s_cart=last_step,
-                    g_prev=self._g_cart_prev,
-                    g_new=g_new_cart,
-                    real_mask=real_mask,
-                    step_accepted=step_accepted
-                )
+                if self.hessian_update == "bfgs":
+                    self._H_work = self._bfgs_update_batched(
+                        H=self._H_work,
+                        s_cart=last_step,
+                        g_prev=self._g_cart_prev,
+                        g_new=g_new_cart,
+                        real_mask=real_mask,
+                        step_accepted=step_accepted,
+                    )
+                else:
+                    phi_ov = {"bofill": None, "psb": 1.0, "sr1": 0.0}[self.hessian_update]
+                    self._H_work = self._bofill_update_batched(
+                        H=self._H_work,
+                        s_cart=last_step,
+                        g_prev=self._g_cart_prev,
+                        g_new=g_new_cart,
+                        real_mask=real_mask,
+                        step_accepted=step_accepted,
+                        phi_override=phi_ov,
+                    )
 
             # Always update gradient buffer for next iteration
             self._g_cart_prev = g_new_cart.clone()
@@ -864,6 +1002,9 @@ class BatchPRFO:
                     self._H_work = self._H_work[survive_local]
                 if self._g_cart_prev is not None:
                     self._g_cart_prev = self._g_cart_prev[survive_local]
+                # [10] keep the secant-residual buffer in lockstep with the batch
+                if self._last_qres is not None:
+                    self._last_qres = self._last_qres[survive_local]
                 # FIX #1: keep the threaded committed-E aligned with the shrunk batch
                 # (survivors' geometry is unchanged, so the sliced value stays valid
                 # for the next FORWARD-A). A refill below sets _force_recalc_next=True,
@@ -1039,6 +1180,13 @@ class BatchPRFO:
         # FIX #1/#2 forward accounting: real forwards executed vs reuses eliminated.
         self._w(f"# forward_reuse: reuse_forward={self._reuse_forward} "
                 f"fwd_calls={self._fwd_calls} fwd_reused={self._fwd_reused}\n")
+        # A2-phess GE accounting: 1 GE = one per-structure force evaluation.
+        self._w(f"# grad_equiv: ge_iter={self._ge_iter} ge_hess={self._ge_hess} "
+                f"ge_hvp={self._ge_hvp} "
+                f"ge_total={self._ge_iter + self._ge_hess + self._ge_hvp}\n")
+        if self._qres_hist:
+            _qh = ",".join(f"{q:.3f}" for q in self._qres_hist)
+            self._w(f"# secant_residual_median_per_iter: {_qh}\n")
         if self._audit_reuse:
             self._w(f"# forward_reuse_audit: max|dE|={self._audit_max_dE:.3e} Ha "
                     f"max|dg|={self._audit_max_dF:.3e} Ha/A\n")
@@ -1209,14 +1357,35 @@ class BatchPRFO:
         #        Hermes et al. JCTC 2022 (10.1021/acs.jctc.2c00395).
         if (self.hessian_mode == "iterative" and calc is not None
                 and g_cart is not None and real_mask is not None):
-            lam_lo, vec_lo = self._leftmost_eigpairs_mw(
-                calc, g_mw, g_cart, real_mask, self.iter_n_leftmost)
+            if self.iter_solver == "lobpcg":
+                # [9] Rayleigh-quotient minimization preconditioned by the model
+                # Hessian (H_mw here IS the mass-weighted working/model Hessian).
+                lam_lo, vec_lo = self._leftmost_eigpair_lobpcg(
+                    calc, g_mw, g_cart, real_mask, H_mw_model=H_mw)
+            else:
+                lam_lo, vec_lo = self._leftmost_eigpairs_mw(
+                    calc, g_mw, g_cart, real_mask, self.iter_n_leftmost)
             n_lo = int(lam_lo.shape[1])
-            V = V.clone()
-            w = w.clone()
-            for p in range(n_lo):
-                V[:, :, p] = vec_lo[:, :, p]
-                w[:, p] = lam_lo[:, p]
+            if self.iter_reorth and n_lo == 1:
+                # [11] BUG FIX. Simply overwriting column 0 of the MODEL eigenbasis
+                # with the true leftmost eigenvector leaves V NON-ORTHOGONAL (the true
+                # mode is not an eigenvector of the model Hessian), yet the RS-P-RFO
+                # step below assumes an orthonormal eigenbasis: it forms gp = V^T g and
+                # transforms back with s_mw = V s_p, which is only inverse-consistent
+                # for orthogonal V. Instead build an ORTHONORMAL basis whose first
+                # column IS the true mode (Householder reflector mapping e_0 -> v,
+                # which acts as the identity on the pad subspace because v is zero
+                # there), rotate the model Hessian into the orthogonal complement and
+                # re-diagonalize that (n-1)x(n-1) block. This is the batched form of
+                # Sella's partial-Hessian diagonalization (10.1021/acs.jctc.9b00869).
+                V, w = self._reorth_basis_about(H_mw, vec_lo[:, :, 0], lam_lo[:, 0],
+                                                real_mask)
+            else:
+                V = V.clone()
+                w = w.clone()
+                for p in range(n_lo):
+                    V[:, :, p] = vec_lo[:, :, p]
+                    w[:, p] = lam_lo[:, p]
 
         gp = (V.transpose(-1, -2) @ g_mw.unsqueeze(-1)).squeeze(-1)
 
@@ -1342,6 +1511,7 @@ class BatchPRFO:
         self._hvp_calls += 1
         if self._hvp_kind in ("hvp", "hvp_batch"):
             try:
+                self._ge_hvp += int(u.shape[0])
                 out = (calc.hvp(u) if self._hvp_kind == "hvp" else calc.hvp_batch(u))
                 Hu = out[0] if isinstance(out, (tuple, list)) else out
                 return Hu.to(dtype=DTYPE) * rm
@@ -1356,11 +1526,170 @@ class BatchPRFO:
         coord = _get_coord_gpu(calc)
         save = coord.clone()
         calc.step_cart_(d)
+        self._ge_hvp += int(u.shape[0])
         _, F_plus = calc.get_ef_gpu()
         coord.copy_(save)
         g_plus = -F_plus.to(dtype=DTYPE) * rm
         Hu = ((g_plus - g0_cart) / eta) * un
         return Hu * rm
+
+    @torch.no_grad()
+    def _reorth_basis_about(self, H_mw, v, lam, real_mask):
+        """[11] Orthonormal basis whose FIRST column is the (exact) leftmost mode ``v``.
+
+        Householder reflector Q = I - 2 u u^T with u ~ (v - e_0) maps e_0 -> +/-v, so
+        Q is orthogonal, Q[:,0] = +/-v, and Q[:,1:] is an orthonormal basis of v's
+        orthogonal complement. The MODEL Hessian is rotated into that complement and
+        re-diagonalized, giving eigen-pairs that are orthogonal to the true reaction
+        mode. Returns (V (B,n,n) orthonormal with V[:,:,0]=v, w (B,n) ascending in the
+        complement with w[:,0]=lam). Pad DOFs are untouched: v is zero there, so u is
+        zero there and Q acts as the identity on the pad subspace.
+        """
+        B, n = v.shape
+        dev, dt = v.device, v.dtype
+        rm = real_mask.to(dt)
+        v = v * rm
+        v = v / torch.clamp(v.norm(dim=-1, keepdim=True), min=1e-30)
+        e0 = torch.zeros_like(v)
+        e0[:, 0] = 1.0
+        # sign choice avoids catastrophic cancellation when v ~ e_0
+        sgn = torch.where(v[:, :1] >= 0, torch.ones_like(v[:, :1]),
+                          -torch.ones_like(v[:, :1]))
+        u = v - sgn * e0
+        un = u.norm(dim=-1, keepdim=True)
+        degenerate = (un <= 1e-12).squeeze(-1)            # v already == +/- e_0
+        u = u / torch.clamp(un, min=1e-30)
+        eye = torch.eye(n, dtype=dt, device=dev).unsqueeze(0).expand(B, n, n)
+        Q = eye - 2.0 * u.unsqueeze(-1) * u.unsqueeze(-2)
+        Q = torch.where(degenerate.view(B, 1, 1), eye, Q)
+        # Q[:,:,0] == sgn*v ; fix the sign so column 0 is exactly v
+        Q = Q * sgn.view(B, 1, 1)      # column 0 becomes exactly +v
+        Qc = Q[:, :, 1:]                                   # (B,n,n-1) complement
+        Hc = Qc.transpose(-1, -2) @ H_mw @ Qc
+        Hc = 0.5 * (Hc + Hc.transpose(-1, -2))
+        wc, U = torch.linalg.eigh(Hc)
+        Vc = Qc @ U
+        V = torch.cat([v.unsqueeze(-1), Vc], dim=-1)
+        w = torch.cat([lam.unsqueeze(-1), wc], dim=-1)
+        return V, w
+
+    @torch.no_grad()
+    def _precond_op(self, H_mw, real_mask):
+        """[9] Preconditioner T ~ |H_model_mw|^-1 as a dense (B,n,n) operator.
+
+        The model (working) Hessian is INDEFINITE at a saddle, so its inverse is not
+        a valid preconditioner; the standard fix is the absolute-value shift
+        T = V diag(1/max(|w|,floor)) V^T, which keeps T SPD while still shrinking the
+        stiff subspace (large |w| -> small weight). Pad DOFs (eigenvalue ~ BIG) get
+        weight ~0 automatically because floor <= |BIG|. NO force evaluations.
+        """
+        w, V = torch.linalg.eigh(H_mw)
+        inv = 1.0 / torch.clamp(w.abs(), min=self.iter_precond_floor)
+        T = (V * inv.unsqueeze(-2)) @ V.transpose(-1, -2)
+        rm = real_mask.to(DTYPE)
+        return T * (rm.unsqueeze(-1) * rm.unsqueeze(-2))
+
+    @torch.no_grad()
+    def _leftmost_eigpair_lobpcg(self, calc, g_mw, g_cart, real_mask, H_mw_model=None):
+        """[9] Algebraically-smallest eigenpair of the mass-weighted TRUE Hessian by
+        batched single-vector LOBPCG (Knyazev's locally optimal preconditioned
+        Rayleigh-quotient minimization), ONE HVP per iteration.
+
+        Search space per iteration: S = span{x, T r, p} with r = A x - lam x the
+        residual, T the |model Hessian|^-1 preconditioner and p the previous
+        conjugate direction. A|S is maintained by the SAME linear combinations that
+        build S, so only ``A w`` needs a fresh HVP each iteration (=1 batched forward
+        = B gradient-equivalents). Unlike Lanczos this minimizes the Rayleigh
+        quotient, hence it converges to the LEFTMOST eigenvalue even when |lam_min|
+        is far from extremal in magnitude -- the failure mode of the Krylov path on
+        molecular Hessians.
+
+        Returns (lam (B,1), vec (B,n,1)) matching ``_leftmost_eigpairs_mw``.
+        """
+        device = g_mw.device
+        B, n = g_mw.shape
+        rm = real_mask.to(DTYPE)
+
+        def A_mw(v):
+            v = v * rm
+            Hu = self._hvp_cart(calc, self._D * v, g_cart, real_mask)
+            return (self._D * Hu) * rm
+
+        def nrm(v):
+            return v / torch.clamp(v.norm(dim=-1, keepdim=True), min=1e-30)
+
+        # ---- start vector: warm (tracked mode) else random ----
+        gen = torch.Generator(device=device)
+        gen.manual_seed(1234)
+        x = torch.randn(B, n, generator=gen, dtype=DTYPE, device=device) * rm
+        if self.iter_warm_start and self.tracked_mode_vec_mw is not None \
+                and self.tracked_mode_vec_mw.shape == (B, n):
+            v0 = self.tracked_mode_vec_mw * rm
+            x = torch.where(v0.norm(dim=-1, keepdim=True) > 1e-12, v0, x)
+        x = nrm(x)
+
+        T = None
+        if self.iter_precond == "model" and H_mw_model is not None:
+            T = self._precond_op(H_mw_model, real_mask)
+
+        Ax = A_mw(x)
+        lam = (x * Ax).sum(-1)
+        P = torch.zeros_like(x)
+        AP = torch.zeros_like(x)
+        has_p = False
+        self._lanczos_calls += 1
+
+        for it in range(self.iter_lobpcg_max):
+            r = (Ax - lam.unsqueeze(-1) * x) * rm
+            rn = r.norm(dim=-1)
+            self._lanczos_steps += 1
+            if bool((rn < self.iter_gamma * lam.abs().clamp(min=1e-8)).all()):
+                break
+            # BUG (caught by --probe synth): `r @ T.transpose(-1,-2)` with r (B,n) and
+            # T (B,n,n) does NOT batch-apply the preconditioner -- torch treats the 2-D
+            # operand as a single matrix and broadcasts it to (B,B,n). einsum is explicit.
+            w = torch.einsum("bij,bj->bi", T, r) if T is not None else r
+            w = w * rm
+            # orthogonalize w (and p) against x for a well-conditioned small problem
+            w = w - (w * x).sum(-1, keepdim=True) * x
+            w = nrm(w)
+            Aw = A_mw(w)                       # the ONLY force evaluation of this iter
+            if has_p:
+                S = torch.stack([x, w, P], dim=-1)          # (B,n,3)
+                AS = torch.stack([Ax, Aw, AP], dim=-1)
+            else:
+                S = torch.stack([x, w], dim=-1)
+                AS = torch.stack([Ax, Aw], dim=-1)
+            G = S.transpose(-1, -2) @ S                      # (B,k,k) overlap
+            Hs = S.transpose(-1, -2) @ AS
+            Hs = 0.5 * (Hs + Hs.transpose(-1, -2))
+            # symmetric orthogonalization of the (tiny) basis, then standard eigh
+            gw, gv = torch.linalg.eigh(G)
+            gwi = torch.where(gw > 1e-12, gw.clamp(min=1e-12).rsqrt(),
+                              torch.zeros_like(gw))
+            Gm = (gv * gwi.unsqueeze(-2)) @ gv.transpose(-1, -2)
+            Hh = Gm @ Hs @ Gm
+            Hh = 0.5 * (Hh + Hh.transpose(-1, -2))
+            th, C = torch.linalg.eigh(Hh)
+            c = (Gm @ C[..., :1]).squeeze(-1)                # coeffs of the lowest Ritz
+            x_new = (S @ c.unsqueeze(-1)).squeeze(-1)
+            Ax_new = (AS @ c.unsqueeze(-1)).squeeze(-1)
+            nx = torch.clamp(x_new.norm(dim=-1, keepdim=True), min=1e-30)
+            x_new = x_new / nx
+            Ax_new = Ax_new / nx
+            # conjugate direction = the new vector minus its x component
+            c_np = c.clone()
+            c_np[:, 0] = 0.0
+            P = (S @ c_np.unsqueeze(-1)).squeeze(-1) / nx
+            AP = (AS @ c_np.unsqueeze(-1)).squeeze(-1) / nx
+            has_p = True
+            x, Ax = x_new * rm, Ax_new * rm
+            lam = (x * Ax).sum(-1)
+
+        r = (Ax - lam.unsqueeze(-1) * x) * rm
+        self._lanczos_unconverged += int(
+            (r.norm(dim=-1) >= self.iter_gamma * lam.abs().clamp(min=1e-8)).sum().item())
+        return lam.unsqueeze(-1), (x * rm).unsqueeze(-1)
 
     @torch.no_grad()
     def _leftmost_eigpairs_mw(self, calc, g_mw, g_cart, real_mask, n_lo):
@@ -1389,6 +1718,16 @@ class BatchPRFO:
         gen = torch.Generator(device=device)
         gen.manual_seed(1234)
         v = torch.randn(B, n, generator=gen, dtype=DTYPE, device=device) * rm
+        # [8] WARM START: replace the random seed by the previously tracked leftmost
+        # mode wherever one exists and is non-degenerate (rows whose tracked vector is
+        # all-zero -- pool newcomers -- keep the random seed). Only the STARTING vector
+        # of the Krylov space changes; the operator, reorthogonalization and stopping
+        # test are untouched, so a converged Ritz pair is the same eigenpair.
+        if self.iter_warm_start and self.tracked_mode_vec_mw is not None \
+                and self.tracked_mode_vec_mw.shape == (B, n):
+            v0 = self.tracked_mode_vec_mw * rm
+            has = v0.norm(dim=-1, keepdim=True) > 1e-12
+            v = torch.where(has, v0, v)
         v = v / torch.clamp(v.norm(dim=-1, keepdim=True), min=1e-30)
 
         Vk = []
@@ -1451,6 +1790,7 @@ class BatchPRFO:
         """calc.get_ef_gpu() with a forward counter (diagnostics / forward-count
         parity gate). Every REAL forward in the run loop goes through here."""
         self._fwd_calls += 1
+        self._ge_iter += int(self._B)
         return calc.get_ef_gpu()
 
     @torch.no_grad()
@@ -1582,6 +1922,7 @@ class BatchPRFO:
             calc.backup_coords()
             calc.step_cart_(s_try)
             self._fwd_calls += 1
+            self._ge_iter += int(B)
             E_new, F_trial = calc.get_ef_gpu()
             E_new = E_new.to(dtype=DTYPE)
             F_trial = F_trial.to(dtype=DTYPE)
@@ -1962,9 +2303,10 @@ class BatchPRFO:
     def _bofill_update_batched(
         H, s_cart, g_prev, g_new, real_mask,
         step_accepted=None,  # NEW: mask of which batches actually took a step
-        step_tol: float = 1e-8, 
-        grad_tol: float = 1e-8, 
-        sr1_tol: float = 1e-8  # CHANGED: from 1e-10 to 1e-8
+        step_tol: float = 1e-8,
+        grad_tol: float = 1e-8,
+        sr1_tol: float = 1e-8,  # CHANGED: from 1e-10 to 1e-8
+        phi_override=None,      # None = Bofill mixing; 1.0 = pure PSB; 0.0 = pure SR1/MS
     ):
         """
         Bofill update (Cartesian, batched) with Gaussian-style logic:
@@ -2036,6 +2378,12 @@ class BatchPRFO:
         phi = torch.where(good_phi, (1.0 - ratio).clamp(0.0, 1.0),
                           torch.ones_like(qz_s))
         phi = torch.where(use_sr1, phi, torch.ones_like(phi))
+        if phi_override is not None:
+            # Pure-limit ablation: phi=1 -> PSB only, phi=0 -> SR1/MS only. The SR1
+            # limit still respects use_sr1 (a vanishing dq.Z denominator falls back to
+            # PSB), so the kernel can never divide by ~0.
+            po = float(phi_override)
+            phi = torch.where(use_sr1, torch.full_like(phi, po), torch.ones_like(phi))
 
         # ---- Combine, apply, symmetrize; keep H verbatim on non-updated rows ----
         inc = (1.0 - phi).view(-1, 1, 1) * dH_SR1_full + phi.view(-1, 1, 1) * dH_PSB
