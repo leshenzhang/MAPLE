@@ -618,7 +618,13 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
         mov = [list(range(max(1, n // 2))) for n in nat]
         dof_mov = 3 * sum(len(m) for m in mov)
         calc.prepare([m.copy() for m in mols])
-        calc.get_efh_gpu(movable_masks=mov)
+        # Pass the SAME mode the full-Hessian case used. With mode=None some backends
+        # auto-select the seeded analytic Hessian (traced MACE does when the model can
+        # double-backward), which is one forward + a double backward -- no known answer
+        # for a forward counter, so comparing it against the FD forms below reports a
+        # spurious FAIL. See D-269.
+        _mode = hessian_modes[0] if hessian_modes else "numerical"
+        calc.get_efh_gpu(movable_masks=mov, mode=_mode)
         got, calls = ctr.take()
         nmov_max = max(len(m) for m in mov)
         forms = {"central_2xDOFmov": 2 * dof_mov,
@@ -630,7 +636,8 @@ def counter_self_test(build_fn, mols_fn, backend_name, hessian_modes=("numerical
                           status=("PASS" if match else "FAIL"),
                           measured=int(got), forward_calls=int(calls),
                           matched_form=(match[0] if match else None),
-                          analytic_forms=forms, movable_atoms=[len(m) for m in mov]))
+                          analytic_forms=forms, movable_atoms=[len(m) for m in mov],
+                          hessian_mode=_mode))
     except Exception as e:
         cases.append(dict(name="hess_partial_movable", status="SKIP",
                           note=f"{type(e).__name__}: {str(e)[:140]}"))
