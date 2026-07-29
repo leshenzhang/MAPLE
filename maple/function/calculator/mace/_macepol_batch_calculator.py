@@ -123,13 +123,16 @@ class MACEPolBatchCalc(BatchCalcABC):
                  implicit: str = "none",
                  solvent: str = "none",
                  coupling_mode: str = "raise",
-                 isolation_tol: float = 1e-4):
+                 isolation_tol: float = 1e-4,
+                 edge_mode: str = "radius"):
         if str(solvent).lower() not in ("none", "", "vacuum", "gas"):
             raise ValueError(
                 f"MACEPolBatchCalc is gas-phase ONLY (no GBSA in batch); "
                 f"got solvent={solvent!r}.")
         if coupling_mode not in ("raise", "sequential", "approx"):
             raise ValueError("coupling_mode must be 'raise'|'sequential'|'approx'")
+        if edge_mode not in ("radius", "full"):
+            raise ValueError("edge_mode must be 'radius'|'full'")
 
         # base.__init__ resolves device (torch.device) + dtype and inits the generic
         # prepared-state (_prepared/_atoms_B/_ptr/numbers/mol_idx/_local_atom/_n_b/
@@ -139,6 +142,22 @@ class MACEPolBatchCalc(BatchCalcABC):
         self.mdtype = torch.float32                  # traced MACE-POL is f32
         self.coupling_mode = coupling_mode
         self.isolation_tol = float(isolation_tol)
+        # edge_mode (opt campaign 2026-07-28, R3-3 enabler; OPT-IN, default 'radius'
+        # = byte-identical oracle):
+        #   'radius' -- per-forward radius filter over the cached candidate pairs
+        #               (variable edge COUNT each step -> dynamic shapes).
+        #   'full'   -- feed the FULL bidirectional candidate-pair set every forward
+        #               (edge_index/shifts CONSTANT tensors cached at prepare()).
+        #               Mathematically exact iff the model's radial cutoff envelope
+        #               is exactly zero (value AND derivative) for r >= r_max, so
+        #               out-of-range edges contribute exactly-0 messages. This is
+        #               NOT assumed: the runtime parity gate (bench) must show
+        #               full-vs-radius E/F within the radius-mode self-spread before
+        #               'full' may be used. Payoff: STATIC shapes -> no recompile /
+        #               CUDA-graph-capturable forward (the R3-3 fixed-capacity edge
+        #               buffer). O(n^2) edges per molecule -- small-molecule batches
+        #               only.
+        self.edge_mode = edge_mode
         self._model_name = model
 
         if model_path is None:
@@ -278,6 +297,21 @@ class MACEPolBatchCalc(BatchCalcABC):
         self.cand_i = torch.cat(ci) if ci else torch.zeros((0,), dtype=torch.int64, device=device)
         self.cand_j = torch.cat(cj) if cj else torch.zeros((0,), dtype=torch.int64, device=device)
 
+        # edge_mode='full' (R3-3 enabler): cache the CONSTANT full bidirectional
+        # candidate edge set + zero shifts ONCE. _build_edges then returns these
+        # cached tensors every forward -> static shapes, zero per-step edge work.
+        if self.edge_mode == "full" and self.cand_i.numel() > 0:
+            src = torch.cat([self.cand_i, self.cand_j], dim=0)
+            dst = torch.cat([self.cand_j, self.cand_i], dim=0)
+            self._full_ei = torch.stack([src, dst], dim=0)
+            self._full_sh = torch.zeros((self._full_ei.size(1), 3),
+                                        dtype=self.mdtype, device=device)
+            self._full_us = torch.zeros_like(self._full_sh)
+        else:
+            self._full_ei = None
+            self._full_sh = None
+            self._full_us = None
+
         # R3-5 opt: hoist the 7 loop-invariant tensors consumed by the per-step
         # _forward_single_graph model call out of the hot path (batch/ptr/cell are
         # geometry-invariant; tc/ts derive from the fixed total_charge/total_spin;
@@ -301,12 +335,19 @@ class MACEPolBatchCalc(BatchCalcABC):
     def _build_edges(self, coord_f32: torch.Tensor):
         """Block-diagonal radius graph from precomputed intra-mol candidate pairs.
         EXACT squared distance (NOT cdist). Note: this isolates the *message-passing*
-        edges; the model's internal Coulomb head still couples molecules globally."""
+        edges; the model's internal Coulomb head still couples molecules globally.
+
+        edge_mode='full' (R3-3 enabler): return the CONSTANT cached full candidate
+        edge set (no per-step distance filter -> static shapes). Exactness rests on
+        the model's cutoff envelope zeroing r >= r_max edges; gated at bench time,
+        never assumed (see __init__ docstring)."""
         device = self.device
         if self.cand_i.numel() == 0:
             ei = torch.zeros((2, 0), dtype=torch.int64, device=device)
             sh = torch.zeros((0, 3), dtype=self.mdtype, device=device)
             return ei, sh, sh.clone()
+        if self.edge_mode == "full":
+            return self._full_ei, self._full_sh, self._full_us
         rij = coord_f32[self.cand_i] - coord_f32[self.cand_j]
         d2 = (rij * rij).sum(dim=-1)
         keep = d2 <= (self.r_max + 1e-12) ** 2

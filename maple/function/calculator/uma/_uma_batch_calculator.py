@@ -410,6 +410,29 @@ class UMABatchCalc(BatchCalcABC):
                     "compile_model=False for periodic NVT.")
                 self._warned_pbc_compile = True
 
+        # R3-1 GUARD (stale neighbor list, opt campaign 2026-07-28): when the
+        # predictor resolved ``external_graph_gen=True`` (checkpoint default with
+        # inference_settings=None/InferenceSettings(external_graph_gen=True/None)),
+        # ``_a2g`` bakes the edge list INTO the AtomicData at build time
+        # (``r_edges=True``). The MOLECULAR fast path below then D2D-clones that
+        # prepare-time template and overwrites ONLY ``pos`` every forward, so the
+        # baked edges go STALE as the optimizer/MD moves atoms -> silently wrong
+        # E/F (the R3-1 trap). Both fairchem presets ('default'/'turbo') set
+        # external_graph_gen=False, so this raise is unreachable on the supported
+        # configs; it exists to turn a silent-wrong-number config into a loud
+        # error. The PERIODIC path is exempt here (it rebuilds the AtomicData from
+        # current coords each forward) but its Hessian paths are NOT -> guarded in
+        # get_efh_gpu/hvp.
+        if getattr(self, "_r_edges", False) and not self._periodic:
+            raise NotImplementedError(
+                "UMABatchCalc: this predictor resolved external_graph_gen=True, i.e. "
+                "edges are precomputed on the AtomicData at prepare() time. The batched "
+                "molecular fast path reuses that template and overwrites positions only, "
+                "so the precomputed edges would go STALE as geometries move (silently "
+                "wrong E/F -- R3-1). Rebuild the predictor with "
+                "InferenceSettings(external_graph_gen=False) (both fairchem presets "
+                "'default' and 'turbo' already do).")
+
         # Per-molecule AtomicData templates + reusable device-resident batched template.
         # PBC: keep the per-replica UMA-convention ASE atoms (cell+pbc preserved by
         # ASE ``copy()``) so the periodic forward can REBUILD the batch with fresh edges
@@ -754,6 +777,20 @@ class UMABatchCalc(BatchCalcABC):
             how many isolated replicas share a forward, never a force value
             (parity-preserving by construction).
         """
+        # R3-1 GUARD (see _build_topology): every Hessian path below (FD plan
+        # containers, legacy chunks, autograd _clone_batch) reuses prepare-time
+        # AtomicData templates and overwrites ``pos`` only. With
+        # external_graph_gen=True the baked edges would be STALE at the perturbed/
+        # current geometry -> silently wrong H. Only reachable for a PERIODIC batch
+        # (the molecular case already raised at prepare()).
+        if getattr(self, "_r_edges", False):
+            raise NotImplementedError(
+                "UMABatchCalc.get_efh_gpu: external_graph_gen=True bakes edges into "
+                "the prepare-time AtomicData templates; the batched Hessian paths "
+                "overwrite positions only, so those edges would be STALE (silently "
+                "wrong Hessian -- R3-1). Rebuild the predictor with "
+                "InferenceSettings(external_graph_gen=False).")
+
         # Per-call overrides of the ctor knobs. Both are components of the
         # Hessian-plan cache key, so a change correctly invalidates the cached plan.
         if delta is not None:
@@ -1224,6 +1261,14 @@ class UMABatchCalc(BatchCalcABC):
         DOI 10.1038/s41467-024-52481-5.
         """
         assert self._prepared, "call prepare() first"
+        # R3-1 GUARD: _forward_fall_graph clones the prepare-time template and
+        # overwrites pos only -> stale baked edges under external_graph_gen=True.
+        if getattr(self, "_r_edges", False):
+            raise NotImplementedError(
+                "UMABatchCalc.hvp: external_graph_gen=True bakes edges into the "
+                "prepare-time AtomicData template (stale at the current geometry -- "
+                "R3-1). Rebuild the predictor with "
+                "InferenceSettings(external_graph_gen=False).")
         self._warn_autograd_once()
         B = self._atoms_B
         device, dtype = self.device, self.dtype
