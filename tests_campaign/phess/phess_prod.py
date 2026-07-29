@@ -150,6 +150,9 @@ def main():
     ap.add_argument("--skip-saddle", action="store_true")
     # integrated-stack knobs (A3 forward accel + A1 streaming pool)
     ap.add_argument("--fast-inference", action="store_true")
+    ap.add_argument("--chunk", type=int, default=0,
+                    help="0 = one batch of --n (legacy). >0 = split the N structures "
+                         "into sequential chunks of this size, i.e. the batch axis B.")
     ap.add_argument("--pool", type=int, default=0, help="0=off; >0 = pool target batch")
     ap.add_argument("--refill-min", type=int, default=1)
     ap.add_argument("--no-refill-partial", action="store_true")
@@ -210,22 +213,48 @@ def main():
     if _dropped:
         print(f"[prod] fork does not accept {_dropped} -> dropped", flush=True)
         kw = {k: v for k, v in kw.items() if k in _accepted}
-    bp = BatchPRFO(**kw)
+    # --chunk B: run the N structures as ceil(N/B) sequential batches of size B.
+    # Without it the harness puts all --n structures in ONE batch (B = n), which is
+    # what every earlier number in this campaign used -- see D-274. Chunking is what
+    # makes a batch-size sweep possible at a FIXED workload.
+    if args.chunk and args.chunk > 0:
+        idx_chunks = [list(range(i, min(i + args.chunk, len(atoms))))
+                      for i in range(0, len(atoms), args.chunk)]
+    else:
+        idx_chunks = [list(range(len(atoms)))]
+    print(f"[prod] chunks: {len(idx_chunks)} x B<={args.chunk or len(atoms)}", flush=True)
 
     if dev == "cuda":
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
-    t0 = time.time()
-    bp.run(mols)
-    if dev == "cuda":
-        torch.cuda.synchronize()
-    wall = time.time() - t0
+    wall = 0.0
+    logs, geoms = [], [None] * len(atoms)
+    for ci, idx in enumerate(idx_chunks):
+        cdir = odir if len(idx_chunks) == 1 else os.path.join(odir, f"chunk{ci}")
+        os.makedirs(cdir, exist_ok=True)
+        ckw = dict(kw); ckw["output"] = os.path.join(cdir, "run.out")
+        bp = BatchPRFO(**ckw)
+        cmols = Molecules([atoms[i] for i in idx]); cmols.calc = calc
+        t0 = time.time()
+        bp.run(cmols)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        wall += time.time() - t0
+        logs.append(parse_log(os.path.join(cdir, "run.out")))
+        for b, i in enumerate(idx):
+            geoms[i] = read_traj_last(os.path.join(cdir, f"ts_batch{b + 1}.xyz"))
     peak = torch.cuda.max_memory_allocated() / 1e6 if dev == "cuda" else 0.0
     print(f"[prod] run {wall:.1f}s peakMB={peak:.0f}", flush=True)
 
-    log = parse_log(os.path.join(odir, "run.out"))
-    geoms = [read_traj_last(os.path.join(odir, f"ts_batch{b + 1}.xyz"))
-             for b in range(len(cases))]
+    # merge per-chunk logs: counters add, conv_step maps merge
+    log = {}
+    for k in ("ge_iter", "ge_hess", "ge_hvp", "ge_total", "n_converged",
+              "n_evicted", "n_maxiter", "fwd_calls", "fwd_reused"):
+        vals = [l.get(k) for l in logs if isinstance(l.get(k), (int, float))]
+        if vals:
+            log[k] = sum(vals)
+    log["n_chunks"] = len(idx_chunks)
+    log["B"] = args.chunk or len(atoms)
 
     sad = []
     t_sad = 0.0
