@@ -202,6 +202,14 @@ def main():
                   iter_precond=args.precond, iter_reorth=args.reorth)
     if args.pool > 0:
         kw.update(pool_queue=pool_queue, B_target=args.pool)
+    # The baseline fork predates the opt-in knobs, so pass only what its signature
+    # accepts; a dropped knob is reported, never silently ignored.
+    import inspect
+    _accepted = set(inspect.signature(BatchPRFO.__init__).parameters)
+    _dropped = sorted(k for k in kw if k not in _accepted)
+    if _dropped:
+        print(f"[prod] fork does not accept {_dropped} -> dropped", flush=True)
+        kw = {k: v for k, v in kw.items() if k in _accepted}
     bp = BatchPRFO(**kw)
 
     if dev == "cuda":
