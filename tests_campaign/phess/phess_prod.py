@@ -148,6 +148,11 @@ def main():
     ap.add_argument("--ts-inject", action="store_true")
     ap.add_argument("--replicate", type=int, default=1)
     ap.add_argument("--skip-saddle", action="store_true")
+    # integrated-stack knobs (A3 forward accel + A1 streaming pool)
+    ap.add_argument("--fast-inference", action="store_true")
+    ap.add_argument("--pool", type=int, default=0, help="0=off; >0 = pool target batch")
+    ap.add_argument("--refill-min", type=int, default=1)
+    ap.add_argument("--no-refill-partial", action="store_true")
     args = ap.parse_args()
 
     sys.path.insert(0, args.fork)
@@ -164,10 +169,20 @@ def main():
           f"fd={args.fd_mode} warm={args.warm_start}", flush=True)
 
     calc = UMABatchCalc(args.model, device=dev, dtype=torch.float64, task="omol",
-                        fd_mode=args.fd_mode, hessian_delta=2e-3)
+                        fd_mode=args.fd_mode, hessian_delta=2e-3,
+                        fast_inference=args.fast_inference)
     odir = os.path.join(args.out_dir, f"{args.tag}_r{args.replicate}")
     os.makedirs(odir, exist_ok=True)
     atoms = [Atoms(numbers=c["Z"], positions=starts[b].copy()) for b, c in enumerate(cases)]
+    pool_queue = None
+    if args.pool > 0:
+        # streaming pool: keep the first --pool structures active, queue the rest.
+        # The largest molecule must sit in the first batch (fixed nmax padding
+        # silently drops 3n > nmax queue entries -- see OPT_A1 report section 3).
+        order = sorted(range(len(atoms)), key=lambda i: -len(atoms[i]))
+        atoms = [atoms[i] for i in order]
+        cases = [cases[i] for i in order]
+        pool_queue, atoms = atoms[args.pool:], atoms[:args.pool]
     mols = Molecules(atoms)
     mols.calc = calc
 
@@ -178,11 +193,15 @@ def main():
               ts_hessian_inject=args.ts_inject,
               hessian_recalc_adapt=args.adapt,
               hessian_recalc_quality=args.quality,
-              recalc_quality_tol=args.quality_tol)
+              recalc_quality_tol=args.quality_tol,
+              refill_min=args.refill_min,
+              refill_partial_hessian=(not args.no_refill_partial))
     if args.hessian_mode == "iterative":
         kw.update(iter_lanczos_m=args.lanczos_m, iter_warm_start=args.warm_start,
                   iter_solver=args.iter_solver, iter_lobpcg_max=args.lobpcg_max,
                   iter_precond=args.precond, iter_reorth=args.reorth)
+    if args.pool > 0:
+        kw.update(pool_queue=pool_queue, B_target=args.pool)
     bp = BatchPRFO(**kw)
 
     if dev == "cuda":
