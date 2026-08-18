@@ -160,7 +160,21 @@ def run_pipeline(args, B, rep):
         prfo_conv += sum(1 for s in pr._final_status if s == "converged")
 
         t0 = time.time()
-        nim = n_imag_batch(calc, ts_chunk, [d["Z"] for d in chunk])
+        # D-280: the n_imag CLASSIFICATION must not inherit the search's FD mode.
+        # forward-FD leaves the geometry untouched (median |dRMSD| vs central =
+        # 1e-4 A) but its O(delta) error pushes the near-zero translational/
+        # rotational modes negative -> 86/87 index-1 saddles get re-labelled as
+        # 2-4 imaginary. The freq stage is ~8% of wall, so validating it with
+        # central FD costs almost nothing. --freq-fd-mode same reproduces the
+        # pre-D-280 records byte-for-byte.
+        _fd_saved = getattr(calc, "_fd_mode", None)
+        if args.freq_fd_mode != "same" and _fd_saved is not None:
+            calc._fd_mode = args.freq_fd_mode
+        try:
+            nim = n_imag_batch(calc, ts_chunk, [d["Z"] for d in chunk])
+        finally:
+            if _fd_saved is not None:
+                calc._fd_mode = _fd_saved
         calc.prepare(ts_chunk)
         E_ts = calc.get_ef_gpu()[0].detach().cpu().numpy().astype(float)
         t_st["freq"] += time.time() - t0
@@ -206,7 +220,8 @@ def run_pipeline(args, B, rep):
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     n_images=args.n_images, neb_maxiter=args.neb_maxiter,
                     dyneb=args.dyneb, recalc=args.recalc, n_chunks=nchunk,
-                    fd_mode=args.fd_mode, fast_inference=int(args.fast_inference),
+                    fd_mode=args.fd_mode, freq_fd_mode=args.freq_fd_mode,
+                    fast_inference=int(args.fast_inference),
                     natoms_tier=[args.natoms_min, args.natoms_max],
                     natoms_mean=float(np.mean([d["natoms"] for d in data])),
                     natoms_min=min(d["natoms"] for d in data),
@@ -587,6 +602,9 @@ def main():
     p.add_argument("--natoms-max", type=int, default=None)
     p.add_argument("--fd-mode", default="central", choices=["central", "forward"],
                    help="pipeline: numerical-Hessian finite-difference mode (F factor)")
+    p.add_argument("--freq-fd-mode", default="same", choices=["same", "central", "forward"],
+                   help="pipeline: FD mode for the freq/n_imag stage only (D-280: "
+                        "'central' keeps TS validation honest while the search runs forward-FD)")
     p.add_argument("--fast-inference", type=int, default=0,
                    help="pipeline: UMA activation-checkpointing off (I factor); VRAM ~2.96x")
     # forward/hessian knobs
