@@ -283,7 +283,7 @@ def build_backend(name, model_path, device="cuda", dtype="float64", task="omol",
     if name == "uma":
         from maple.function.calculator.uma._uma_batch_calculator import UMABatchCalc
         return UMABatchCalc(model_path, device=device, dtype=dt, task=task,
-                            fast_inference=False, **kw)
+                            fast_inference=bool(kw.pop("fast_inference", False)), **kw)
     if name == "mace_traced":
         from maple.function.calculator.mace._mace_batch_calculator import MACEBatchCalc
         return MACEBatchCalc(device=device, model="maceomol", model_path=model_path,

@@ -46,13 +46,17 @@ from bench.core import (HA2EV, GPUSampler, GradCounter, PathProbe, build_backend
                         verify_counter_inline)
 
 
-def _certify(args, needs_hessian):
+def _certify(args, needs_hessian, **calc_kw):
     """Per-run counter self-certification -> (status, detail). Cheap; every record
-    carries it so a broken instrument can never be mistaken for a missing cell."""
+    carries it so a broken instrument can never be mistaken for a missing cell.
+
+    calc_kw is the SAME calculator configuration the run itself uses (D-273: a
+    counter case pinned to a different mode than the real case reports a fake
+    FAIL/PASS)."""
     data = load_ts1x(args.pkl, 4)
     base = [d["TS"] for d in data]
     mols_fn = lambda B: [base[i % len(base)].copy() for i in range(B)]
-    build = lambda **kw: build_backend(args.backend, args.model, **kw)
+    build = lambda **kw: build_backend(args.backend, args.model, **dict(calc_kw, **kw))
     st, det = verify_counter_inline(build, mols_fn, needs_hessian=needs_hessian)
     print(f"[certify] backend={args.backend} needs_hessian={needs_hessian} "
           f"counter={st} {det}", flush=True)
@@ -94,9 +98,18 @@ def run_pipeline(args, B, rep):
     from maple.function.dispatcher.ts.algorithm.neb import NEB
     from maple.function.utility.molecules import Molecules
 
-    cert_st, cert_det = _certify(args, needs_hessian=True)
+    if args.backend != "uma" and (args.fd_mode != "central" or args.fast_inference):
+        raise SystemExit(f"--fd-mode/--fast-inference are UMA-only knobs; "
+                         f"backend={args.backend} would silently ignore them")
+    cert_st, cert_det = _certify(args, needs_hessian=True, fd_mode=args.fd_mode,
+                                 fast_inference=args.fast_inference)
     data = load_ts1x(args.pkl, args.N)
-    calc = build_backend(args.backend, args.model)
+    # (e) end-to-end arm knobs: the same three factors the P-RFO+freq campaign
+    # swept (D-275), now applied to the WHOLE pipeline so the CI-NEB segment is
+    # inside the measured wall. fd_mode/fast_inference live on the calculator,
+    # recalc on BatchPRFO (already exposed).
+    calc = build_backend(args.backend, args.model,
+                         fd_mode=args.fd_mode, fast_inference=args.fast_inference)
     ctr = GradCounter(calc)
     probe = PathProbe(calc)          # which Hessian implementation actually runs
     tag = f"{args.tag}_pipeline_{args.backend}_B{B}_r{rep}"
@@ -193,6 +206,7 @@ def run_pipeline(args, B, rep):
         params=dict(model=os.path.basename(args.model), dtype="float64", task="omol",
                     n_images=args.n_images, neb_maxiter=args.neb_maxiter,
                     dyneb=args.dyneb, recalc=args.recalc, n_chunks=nchunk,
+                    fd_mode=args.fd_mode, fast_inference=int(args.fast_inference),
                     natoms_min=min(d["natoms"] for d in data),
                     natoms_max=max(d["natoms"] for d in data)),
         wall_s=wall, grad_equiv_total=ge_tot, forward_calls=calls,
@@ -566,6 +580,10 @@ def main():
     p.add_argument("--neb-maxiter", type=int, default=150)
     p.add_argument("--dyneb", type=int, default=1)
     p.add_argument("--recalc", type=int, default=8)
+    p.add_argument("--fd-mode", default="central", choices=["central", "forward"],
+                   help="pipeline: numerical-Hessian finite-difference mode (F factor)")
+    p.add_argument("--fast-inference", type=int, default=0,
+                   help="pipeline: UMA activation-checkpointing off (I factor); VRAM ~2.96x")
     # forward/hessian knobs
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--hess-iters", type=int, default=3)
