@@ -241,10 +241,20 @@ def kabsch_rmsd(P, Q):
     return float(np.sqrt(((Pc @ (U @ np.diag([1, 1, d]) @ Vt) - Qc) ** 2).sum(1).mean()))
 
 
-def load_ts1x(pkl, n, start=0):
-    """ts1x records -> list of dicts (R/P/ts ase.Atoms + DFT energies)."""
+def load_ts1x(pkl, n, start=0, nat_min=None, nat_max=None):
+    """ts1x records -> list of dicts (R/P/ts ase.Atoms + DFT energies).
+
+    nat_min/nat_max select a system-size tier BEFORE slicing (dimension (d)):
+    without them the behaviour is the plain contiguous [start:start+n] slice, so
+    every earlier record stays reproducible.
+    """
     from ase import Atoms
-    recs = pickle.load(open(pkl, "rb"))[start:start + n]
+    recs = pickle.load(open(pkl, "rb"))
+    if nat_min is not None or nat_max is not None:
+        lo = -1 if nat_min is None else int(nat_min)
+        hi = 10 ** 9 if nat_max is None else int(nat_max)
+        recs = [r for r in recs if lo <= int(r["natoms"]) <= hi]
+    recs = recs[start:start + n]
     out = []
     for r in recs:
         Z = np.asarray(r["atomic_numbers"]).astype(int)

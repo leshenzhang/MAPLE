@@ -103,7 +103,7 @@ def run_pipeline(args, B, rep):
                          f"backend={args.backend} would silently ignore them")
     cert_st, cert_det = _certify(args, needs_hessian=True, fd_mode=args.fd_mode,
                                  fast_inference=args.fast_inference)
-    data = load_ts1x(args.pkl, args.N)
+    data = load_ts1x(args.pkl, args.N, nat_min=args.natoms_min, nat_max=args.natoms_max)
     # (e) end-to-end arm knobs: the same three factors the P-RFO+freq campaign
     # swept (D-275), now applied to the WHOLE pipeline so the CI-NEB segment is
     # inside the measured wall. fd_mode/fast_inference live on the calculator,
@@ -207,6 +207,8 @@ def run_pipeline(args, B, rep):
                     n_images=args.n_images, neb_maxiter=args.neb_maxiter,
                     dyneb=args.dyneb, recalc=args.recalc, n_chunks=nchunk,
                     fd_mode=args.fd_mode, fast_inference=int(args.fast_inference),
+                    natoms_tier=[args.natoms_min, args.natoms_max],
+                    natoms_mean=float(np.mean([d["natoms"] for d in data])),
                     natoms_min=min(d["natoms"] for d in data),
                     natoms_max=max(d["natoms"] for d in data)),
         wall_s=wall, grad_equiv_total=ge_tot, forward_calls=calls,
@@ -580,6 +582,9 @@ def main():
     p.add_argument("--neb-maxiter", type=int, default=150)
     p.add_argument("--dyneb", type=int, default=1)
     p.add_argument("--recalc", type=int, default=8)
+    p.add_argument("--natoms-min", type=int, default=None,
+                   help="pipeline: system-size tier lower bound (dimension (d))")
+    p.add_argument("--natoms-max", type=int, default=None)
     p.add_argument("--fd-mode", default="central", choices=["central", "forward"],
                    help="pipeline: numerical-Hessian finite-difference mode (F factor)")
     p.add_argument("--fast-inference", type=int, default=0,
