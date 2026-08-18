@@ -78,8 +78,16 @@ def gkey(r):
     # FIX-1: hessian_mode is part of the identity of a group. grad-equivalents
     # are not commensurable across Hessian modes, so runs that differ in it must
     # never land in the same group (and never be ratioed against each other).
+    # FIX-3: the arm knobs are part of the identity too. Without them the (e)
+    # end-to-end arms (f000/f001/f111) collapse into ONE group and the campaign
+    # reports a single meaningless mean. Defaults are normalised so records
+    # written before the knobs existed still group with an all-off arm.
+    pr = r.get("params", {})
+    arm = (str(pr.get("fd_mode") or "central"),
+           int(pr.get("fast_inference") or 0),
+           pr.get("recalc"))
     return (r["bench"], r["dispatcher"], r["backend"], r["B"], mode,
-            r.get("hessian_mode"))
+            r.get("hessian_mode"), arm)
 
 
 def collect(rundir):
