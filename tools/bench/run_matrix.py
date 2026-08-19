@@ -103,7 +103,8 @@ def run_pipeline(args, B, rep):
                          f"backend={args.backend} would silently ignore them")
     cert_st, cert_det = _certify(args, needs_hessian=True, fd_mode=args.fd_mode,
                                  fast_inference=args.fast_inference)
-    data = load_ts1x(args.pkl, args.N, nat_min=args.natoms_min, nat_max=args.natoms_max)
+    data = load_ts1x(args.pkl, args.N, nat_min=args.natoms_min, nat_max=args.natoms_max,
+                     tier_sample=args.tier_sample)
     # (e) end-to-end arm knobs: the same three factors the P-RFO+freq campaign
     # swept (D-275), now applied to the WHOLE pipeline so the CI-NEB segment is
     # inside the measured wall. fd_mode/fast_inference live on the calculator,
@@ -223,6 +224,7 @@ def run_pipeline(args, B, rep):
                     fd_mode=args.fd_mode, freq_fd_mode=args.freq_fd_mode,
                     fast_inference=int(args.fast_inference),
                     natoms_tier=[args.natoms_min, args.natoms_max],
+                    tier_sample=args.tier_sample,
                     natoms_mean=float(np.mean([d["natoms"] for d in data])),
                     natoms_min=min(d["natoms"] for d in data),
                     natoms_max=max(d["natoms"] for d in data)),
@@ -600,6 +602,9 @@ def main():
     p.add_argument("--natoms-min", type=int, default=None,
                    help="pipeline: system-size tier lower bound (dimension (d))")
     p.add_argument("--natoms-max", type=int, default=None)
+    p.add_argument("--tier-sample", default="head", choices=["head", "spread"],
+                   help="pipeline: how to draw N records from a natoms tier (D-283: "
+                        "'head' returns the tier's lower edge because ts1x is size-ordered)")
     p.add_argument("--fd-mode", default="central", choices=["central", "forward"],
                    help="pipeline: numerical-Hessian finite-difference mode (F factor)")
     p.add_argument("--freq-fd-mode", default="same", choices=["same", "central", "forward"],

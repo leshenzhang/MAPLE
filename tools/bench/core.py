@@ -241,7 +241,7 @@ def kabsch_rmsd(P, Q):
     return float(np.sqrt(((Pc @ (U @ np.diag([1, 1, d]) @ Vt) - Qc) ** 2).sum(1).mean()))
 
 
-def load_ts1x(pkl, n, start=0, nat_min=None, nat_max=None):
+def load_ts1x(pkl, n, start=0, nat_min=None, nat_max=None, tier_sample="head"):
     """ts1x records -> list of dicts (R/P/ts ase.Atoms + DFT energies).
 
     nat_min/nat_max select a system-size tier BEFORE slicing (dimension (d)):
@@ -254,6 +254,13 @@ def load_ts1x(pkl, n, start=0, nat_min=None, nat_max=None):
         lo = -1 if nat_min is None else int(nat_min)
         hi = 10 ** 9 if nat_max is None else int(nat_max)
         recs = [r for r in recs if lo <= int(r["natoms"]) <= hi]
+        # D-283: ts1x_data_all is ordered by size, so the plain head slice of a
+        # filtered tier returns only its LOWER EDGE (tier 17-23 came back as
+        # natoms 17 only). 'spread' takes an evenly strided sample so the tier
+        # actually spans its range. 'head' reproduces the earlier records.
+        if tier_sample == "spread" and len(recs) > n > 0:
+            step = len(recs) / float(n)
+            recs = [recs[min(len(recs) - 1, int(i * step))] for i in range(n)]
     recs = recs[start:start + n]
     out = []
     for r in recs:
