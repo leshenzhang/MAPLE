@@ -46,7 +46,7 @@ from bench.core import (HA2EV, GPUSampler, GradCounter, PathProbe, build_backend
                         verify_counter_inline)
 
 
-def _certify(args, needs_hessian, **calc_kw):
+def _certify(args, needs_hessian, hessian_mode=None, **calc_kw):
     """Per-run counter self-certification -> (status, detail). Cheap; every record
     carries it so a broken instrument can never be mistaken for a missing cell.
 
@@ -57,7 +57,8 @@ def _certify(args, needs_hessian, **calc_kw):
     base = [d["TS"] for d in data]
     mols_fn = lambda B: [base[i % len(base)].copy() for i in range(B)]
     build = lambda **kw: build_backend(args.backend, args.model, **dict(calc_kw, **kw))
-    st, det = verify_counter_inline(build, mols_fn, needs_hessian=needs_hessian)
+    st, det = verify_counter_inline(build, mols_fn, needs_hessian=needs_hessian,
+                                    hessian_mode=hessian_mode)
     print(f"[certify] backend={args.backend} needs_hessian={needs_hessian} "
           f"counter={st} {det}", flush=True)
     return st, det
@@ -286,7 +287,9 @@ def run_forward(args, B, rep):
 
 # --------------------------------------------------------------------- hessian
 def run_hessian(args, B, rep, mode):
-    cert_st, cert_det = _certify(args, needs_hessian=(mode not in ("autograd", "analytic")))
+    cert_st, cert_det = _certify(args, needs_hessian=(mode not in ("autograd", "analytic")),
+                                 hessian_mode=mode,
+                                 **(dict(hessian_mode=mode) if args.backend == "uma" else {}))
     data = load_ts1x(args.pkl, max(B, 16))
     base = [d["TS"] for d in data]
     mols = [base[i % len(base)].copy() for i in range(B)]

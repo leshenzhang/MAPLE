@@ -303,11 +303,17 @@ def build_backend(name, model_path, device="cuda", dtype="float64", task="omol",
                             fast_inference=bool(kw.pop("fast_inference", False)), **kw)
     if name == "mace_traced":
         from maple.function.calculator.mace._mace_batch_calculator import MACEBatchCalc
+        if kw:
+            raise TypeError(f"backend 'mace_traced' cannot consume {sorted(kw)}; "
+                            "passing them silently would fake a configured run")
         return MACEBatchCalc(device=device, model="maceomol", model_path=model_path,
                              dtype=dt)
     if name == "mace_autograd":
         from maple.function.calculator.mace._mace_autograd_batch_calculator import (
             MACEAutogradBatchCalc)
+        if kw:
+            raise TypeError(f"backend 'mace_autograd' cannot consume {sorted(kw)}; "
+                            "passing them silently would fake a configured run")
         return MACEAutogradBatchCalc(model_path=model_path, model="maceoff23s",
                                      device=device, dtype=dt)
     raise ValueError(f"unknown backend '{name}' (registry: uma, mace_traced, mace_autograd)")
@@ -381,7 +387,7 @@ def dump(rec, outdir, name):
     return p
 
 
-def verify_counter_inline(build_fn, mols_fn, needs_hessian=False):
+def verify_counter_inline(build_fn, mols_fn, needs_hessian=False, hessian_mode=None):
     """Cheap per-run self-certification of the counter (~0.1-2 s).
 
     Every record must be able to say whether its own grad-equivalents are
@@ -413,7 +419,11 @@ def verify_counter_inline(build_fn, mols_fn, needs_hessian=False):
             nat = [len(m) for m in mols]
             dof, nmax_a, B = 3 * sum(nat), max(nat), 2
             calc.prepare([m.copy() for m in mols])
-            calc.get_efh_gpu()
+            # D-287: pin the SAME Hessian mode the run uses. get_efh_gpu(mode=None)
+            # is auto-select: on a double-backward-capable backend it silently takes
+            # the analytic path (2 grad-equivalents), which matches no FD form and
+            # reports BROKEN for a perfectly healthy numerical run.
+            calc.get_efh_gpu(**({"mode": hessian_mode} if hessian_mode else {}))
             got, _ = ctr.take()
             forms = {"central_2xDOF": 2 * dof, "central_2xDOF_plus_base": 2 * dof + B,
                      "forward_DOF_plus_base": dof + B,
