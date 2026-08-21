@@ -104,8 +104,11 @@ def run_pipeline(args, B, rep):
                          f"backend={args.backend} would silently ignore them")
     cert_st, cert_det = _certify(args, needs_hessian=True, fd_mode=args.fd_mode,
                                  fast_inference=args.fast_inference)
-    data = load_ts1x(args.pkl, args.N, nat_min=args.natoms_min, nat_max=args.natoms_max,
-                     tier_sample=args.tier_sample)
+    # --start makes concurrent processes take DISJOINT slices. Without it every
+    # process reads [0:N] and a "same total work" comparison silently becomes
+    # "one process does N reactions, K processes each redo the same N".
+    data = load_ts1x(args.pkl, args.N, start=args.start, nat_min=args.natoms_min,
+                     nat_max=args.natoms_max, tier_sample=args.tier_sample)
     # (e) end-to-end arm knobs: the same three factors the P-RFO+freq campaign
     # swept (D-275), now applied to the WHOLE pipeline so the CI-NEB segment is
     # inside the measured wall. fd_mode/fast_inference live on the calculator,
@@ -224,6 +227,7 @@ def run_pipeline(args, B, rep):
                     dyneb=args.dyneb, recalc=args.recalc, n_chunks=nchunk,
                     fd_mode=args.fd_mode, freq_fd_mode=args.freq_fd_mode,
                     fast_inference=int(args.fast_inference),
+                    start=args.start,
                     natoms_tier=[args.natoms_min, args.natoms_max],
                     tier_sample=args.tier_sample,
                     natoms_mean=float(np.mean([d["natoms"] for d in data])),
@@ -605,6 +609,8 @@ def main():
     p.add_argument("--neb-maxiter", type=int, default=150)
     p.add_argument("--dyneb", type=int, default=1)
     p.add_argument("--recalc", type=int, default=8)
+    p.add_argument("--start", type=int, default=0,
+                   help="pipeline: first record of the slice (disjoint work for concurrent runs)")
     p.add_argument("--natoms-min", type=int, default=None,
                    help="pipeline: system-size tier lower bound (dimension (d))")
     p.add_argument("--natoms-max", type=int, default=None)
