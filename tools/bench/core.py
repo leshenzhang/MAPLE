@@ -293,10 +293,20 @@ def n_imag_batch(calc, atoms_list, Z_list):
     return res
 
 
+# Knobs only UMA implements, with the value that means "not configured". A caller that
+# passes the default is not asking for anything, so handing it to another backend hides
+# nothing; a caller that passes anything else must be refused rather than silently ignored.
+_UMA_ONLY_DEFAULTS = {"fd_mode": "central", "fast_inference": False, "hessian_mode": None}
+
+
 def build_backend(name, model_path, device="cuda", dtype="float64", task="omol", **kw):
     """Backend registry. Unknown/unavailable backend -> raise (caller records SKIP)."""
     import torch
     dt = getattr(torch, dtype)
+    if name != "uma":
+        for k, default in _UMA_ONLY_DEFAULTS.items():
+            if k in kw and bool(kw[k]) == bool(default) and kw[k] == default:
+                kw.pop(k)
     if name == "uma":
         from maple.function.calculator.uma._uma_batch_calculator import UMABatchCalc
         return UMABatchCalc(model_path, device=device, dtype=dt, task=task,
